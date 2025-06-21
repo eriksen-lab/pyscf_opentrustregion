@@ -1,0 +1,11 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# IDEs
+.vscode/
+
+# OS files
+.DS_Store
+
+# Environment files
+.python-version
