@@ -222,15 +222,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     ) -> float:
         if dm is not None:
             if isinstance(dm, str):
-                print(f"OpenTrustRegion solver reads density matrix from chkfile {dm}")
+                lib.logger.debug(
+                    self, 
+                    f"OpenTrustRegion solver reads density matrix from chkfile {dm}",
+                )
                 dm = self.from_chk(dm)
 
         elif mo_coeff is not None and mo_occ is None:
-            print(
+            lib.logger.warn(
+                self, 
                 "Newton solver expects mo_coeff with mo_occ as initial guess but "
-                "mo_occ is not found in the arguments."
+                "mo_occ is not found in the arguments.",
             )
-            print("The given argument is treated as density matrix.")
+            lib.logger.warn(self, "The given argument is treated as density matrix.")
             dm = mo_coeff
             mo_coeff = mo_occ = None
 
@@ -260,9 +264,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         else:
             if dm is None:
-                print(
+                lib.logger.debug(
+                    self,
                     "Initial guess density matrix is not given. Generating initial "
-                    f"guess from {self.init_guess}"
+                    f"guess from {self.init_guess}",
                 )
                 dm = self.get_init_guess(self._scf.mol, self.init_guess)
             vhf = self._scf.get_veff(mol, dm)
