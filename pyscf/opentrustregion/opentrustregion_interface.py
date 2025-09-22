@@ -11,7 +11,7 @@ from functools import reduce
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
-from pyopentrustregion import solver_py_interface, stability_check_py_interface
+from pyopentrustregion import solver, stability_check
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -99,7 +99,7 @@ class BoysOTR(OTR, lo.Boys):
         self.mo_coeff = self.mo_coeff @ u0
 
         # call solver
-        solver_py_interface(
+        solver(
             self.func,
             self.update_orbs,
             self.n_param,
@@ -126,11 +126,11 @@ class BoysOTR(OTR, lo.Boys):
         return self.mo_coeff
 
     # stability check function
-    def stability_check(self) -> Tuple[bool, np.ndarray]:
+    def stability(self) -> Tuple[bool, np.ndarray]:
         _, _, h_diag, hess_x = self.update_orbs(
             np.zeros(self.n_param, dtype=np.float64)
         )
-        return stability_check_py_interface(
+        return stability_check(
             h_diag,
             hess_x,
             self.n_param,
@@ -290,7 +290,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.n_param = np.count_nonzero(self.mask_symm)
 
         # call solver
-        solver_py_interface(
+        solver(
             self.func,
             self.update_orbs,
             self.n_param,
@@ -332,11 +332,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         return self.e_tot
 
     # stability check function
-    def stability_check(self) -> Tuple[bool, np.ndarray]:
+    def stability(self) -> Tuple[bool, np.ndarray]:
         _, _, h_diag, hess_x = self.update_orbs(
             np.zeros(self.n_param, dtype=np.float64)
         )
-        return stability_check_py_interface(
+        return stability_check(
             h_diag,
             hess_x,
             self.n_param,
@@ -554,7 +554,7 @@ class CASSCFOTR(newton_casscf.CASSCF):
         self.n_param = self.n_param_orb + self.n_param_ci
 
         # call solver
-        solver_py_interface(
+        solver(
             self.func,
             self.update_orbs,
             self.n_param,
@@ -607,11 +607,11 @@ class CASSCFOTR(newton_casscf.CASSCF):
             self.mo_energy,
         )
 
-    def stability_check(self):
+    def stability(self):
         _, _, h_diag, hess_x = self.update_orbs(
             np.zeros(self.n_param, dtype=np.float64)
         )
-        return stability_check_py_interface(
+        return stability_check(
             h_diag,
             hess_x,
             self.n_param,
