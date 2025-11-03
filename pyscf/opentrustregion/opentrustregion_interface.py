@@ -7,37 +7,47 @@
 from __future__ import annotations
 
 import numpy as np
-from functools import reduce
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
-from pyopentrustregion import solver, stability_check
+from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
+from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Tuple, Callable, Optional, Union
 
 
+solver_setting_fields = [
+    field[0] for field in SolverSettingsC._fields_ if field[0] != "initialized"
+]
+stability_setting_fields = [
+    field[0] for field in StabilitySettingsC._fields_ if field[0] != "initialized"
+]
+
+
 class OTR:
-    _keys = {
-        "precond",
-        "conv_check",
-        "stability",
-        "line_search",
-        "davidson",
-        "jacobi_davidson",
-        "prefer_jacobi_davidson",
-        "conv_tol",
-        "n_random_trial_vectors",
-        "start_trust_radius",
-        "n_macro",
-        "n_micro",
-        "global_red_factor",
-        "local_red_factor",
-        "seed",
-        "verbose",
-        "logger",
-    }
+    _keys = set(solver_setting_fields + stability_setting_fields)
+
+    # stability check function
+    def stability_check(self) -> Tuple[bool, np.ndarray]:
+        # get Hessian diagonal and linear transformation at current point
+        kappa = np.zeros(self.n_param, dtype=np.float64)
+        grad = np.empty(self.n_param, dtype=np.float64)
+        h_diag = np.empty(self.n_param, dtype=np.float64)
+        _, hess_x = self.update_orbs(kappa, grad, h_diag)
+
+        # initialize settings
+        settings = StabilitySettings()
+        for setting in stability_setting_fields:
+            if hasattr(self, setting):
+                setattr(settings, setting, getattr(self, setting))
+
+        # run stability check
+        direction = np.empty(self.n_param, dtype=np.float64)
+        stable = stability_check(h_diag, hess_x, self.n_param, settings, direction)
+
+        return stable, direction
 
 
 class BoysOTR(OTR, lo.Boys):
@@ -60,14 +70,19 @@ class BoysOTR(OTR, lo.Boys):
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
     # function
     def update_orbs(
-        self, kappa: np.ndarray
+        self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
         u = ciah.expmat(self.unpack(kappa))
         func = self.cost_function(u)
-        grad, hess_x, hdiag = self.gen_g_hop(u)
+        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
+        grad[:] = 2 * grad_full
+        h_diag[:] = 2 * h_diag_full
         self.mo_coeff = self.mo_coeff @ u
-        
-        return func, 2 * grad, 2 * hdiag, lambda x: 2 * hess_x(x)
+
+        def hess_x(x, hx):
+            hx[:] = 2 * hess_x_full(x)
+
+        return func, hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -98,51 +113,19 @@ class BoysOTR(OTR, lo.Boys):
             u0 = self.get_init_guess(None)
         self.mo_coeff = self.mo_coeff @ u0
 
+        # initialize settings
+        settings = SolverSettings()
+        for setting in solver_setting_fields:
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
+                setattr(settings, setting, getattr(self, setting))
+
         # call solver
-        solver(
-            self.func,
-            self.update_orbs,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_check=getattr(self, "conv_check", None),
-            conv_tol=getattr(self, "conv_tol", None),
-            stability=getattr(self, "stability", None),
-            hess_symm=True,
-            line_search=getattr(self, "line_search", None),
-            davidson=getattr(self, "davidson", None),
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),
-            prefer_jacobi_davidson=getattr(self, "prefer_jacobi_davidson", None),
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            start_trust_radius=getattr(self, "start_trust_radius", None),
-            n_macro=getattr(self, "n_macro", None),
-            n_micro=getattr(self, "n_micro", None),
-            global_red_factor=getattr(self, "global_red_factor", None),
-            local_red_factor=getattr(self, "local_red_factor", None),
-            seed=getattr(self, "seed", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
-        )
+        solver(self.func, self.update_orbs, self.n_param, settings)
 
         return self.mo_coeff
-
-    # stability check function
-    def stability(self) -> Tuple[bool, np.ndarray]:
-        _, _, h_diag, hess_x = self.update_orbs(
-            np.zeros(self.n_param, dtype=np.float64)
-        )
-        return stability_check(
-            h_diag,
-            hess_x,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_tol=getattr(self, "conv_tol", None),
-            hess_symm=True,
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),  
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            n_iter=getattr(self, "n_iter", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
-        )
 
 
 class PipekMezeyOTR(lo.PipekMezey, BoysOTR):
@@ -155,21 +138,38 @@ class PipekMezeyOTR(lo.PipekMezey, BoysOTR):
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
     # function
     def update_orbs(
-        self, kappa: np.ndarray
-    ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+        self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
         u = ciah.expmat(self.unpack(kappa))
         func = self.cost_function(u)
-        grad, hess_x, hdiag = self.gen_g_hop(u)
+        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
+        grad[:] = 2 * grad_full
+        h_diag[:] = 2 * h_diag_full
         self.mo_coeff = self.mo_coeff @ u
-        return -func, 2 * grad, 2 * hdiag, lambda x: 2 * hess_x(x)
+
+        def hess_x(x, hx):
+            hx[:] = 2 * hess_x_full(x)
+
+        return -func, hess_x
 
 
 class EdmistonRuedenbergOTR(lo.EdmistonRuedenberg, PipekMezeyOTR):
     pass
 
 
-class FourthMomentOTR(lo.FourthMoment, BoysOTR):
-    pass
+if hasattr(lo, "FourthMoment"):
+
+    class FourthMomentOTR(lo.FourthMoment, BoysOTR):
+        pass
+
+else:
+
+    class FourthMomentOTR:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "FourthMomentOTR requires PySCF with lo.FourthMoment. "
+                "Please install a compatible PySCF version."
+            )
 
 
 class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
@@ -193,27 +193,26 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(
-        self, kappa: np.ndarray
-    ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+        self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
         u = ciah.expmat(self.unpack(kappa))
         self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
         self.dm, self.vhf = dm, vhf
         fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
-        grad, hess_x, h_diag = self.gen_g_hop(self.mo_coeff, self.mo_occ, fock)
+        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(
+            self.mo_coeff, self.mo_occ, fock
+        )
+        grad[:] = 2 * grad_full[self.mask_symm]
+        h_diag[:] = 2 * h_diag_full[self.mask_symm]
 
-        def hess_x_symm(x):
+        def hess_x_symm(x, hx):
             x_full = np.zeros_like(self.mask_symm, dtype=np.float64)
             x_full[self.mask_symm] = x
-            return 2 * hess_x(x_full)[self.mask_symm]
+            hx[:] = 2 * hess_x_full(x_full)[self.mask_symm]
 
-        return (
-            self._scf.energy_tot(dm, self.h1e, vhf),
-            2 * grad[self.mask_symm],
-            2 * h_diag[self.mask_symm],
-            hess_x_symm,
-        )
+        return self._scf.energy_tot(dm, self.h1e, vhf), hess_x_symm
 
     # kernel function
     def kernel(
@@ -289,32 +288,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # number of parameters
         self.n_param = np.count_nonzero(self.mask_symm)
 
+        # initialize settings
+        settings = SolverSettings()
+        for setting in solver_setting_fields:
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
+                setattr(settings, setting, getattr(self, setting))
+
         # call solver
-        solver(
-            self.func,
-            self.update_orbs,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_check=getattr(self, "conv_check", None) 
-            if not isinstance(getattr(self, "conv_check", None), bool) 
-            else None,
-            conv_tol=getattr(self, "conv_tol", None),
-            stability=getattr(self, "stability", None),
-            hess_symm=True,
-            line_search=getattr(self, "line_search", None),
-            davidson=getattr(self, "davidson", None),
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),
-            prefer_jacobi_davidson=getattr(self, "prefer_jacobi_davidson", None),
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            start_trust_radius=getattr(self, "start_trust_radius", None),
-            n_macro=getattr(self, "n_macro", None),
-            n_micro=getattr(self, "n_micro", None),
-            global_red_factor=getattr(self, "global_red_factor", None),
-            local_red_factor=getattr(self, "local_red_factor", None),
-            seed=getattr(self, "seed", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
-        )
+        solver(self.func, self.update_orbs, self.n_param, settings)
 
         # get canonical orbitals
         self.converged = True
@@ -330,25 +314,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._finalize()
 
         return self.e_tot
-
-    # stability check function
-    def stability(self) -> Tuple[bool, np.ndarray]:
-        _, _, h_diag, hess_x = self.update_orbs(
-            np.zeros(self.n_param, dtype=np.float64)
-        )
-        return stability_check(
-            h_diag,
-            hess_x,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_tol=getattr(self, "conv_tol", None),
-            hess_symm=True,
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            n_iter=getattr(self, "n_iter", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
-        )
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
@@ -446,7 +411,7 @@ def mf_to_otr(mf):
     return mf
 
 
-class CASSCFOTR(newton_casscf.CASSCF):
+class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
     def __init__(
         self,
@@ -489,7 +454,7 @@ class CASSCFOTR(newton_casscf.CASSCF):
         return self.casci(rot_mo_coeff, ci, eris)[0]
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(self, x):
+    def update_orbs(self, x, grad, h_diag):
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
         self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
         eris = self.ao2mo(self.mo_coeff)
@@ -509,14 +474,16 @@ class CASSCFOTR(newton_casscf.CASSCF):
             self.ci = ci
             ci = [c.ravel() for c in ci]
 
-        grad, _, hess_x, h_diag = newton_casscf.gen_g_hop(self, self.mo_coeff, ci, eris)
-
-        return (
-            self.casci(self.mo_coeff, self.ci, eris)[0],
-            2 * grad,
-            2 * h_diag,
-            lambda x: 2 * hess_x(x),
+        grad_full, _, hess_x_full, h_diag_full = newton_casscf.gen_g_hop(
+            self, self.mo_coeff, ci, eris
         )
+        grad[:] = 2 * grad_full
+        h_diag[:] = 2 * h_diag_full
+
+        def hess_x(x, hx):
+            hx[:] = 2 * hess_x_full(x)
+
+        return self.casci(self.mo_coeff, self.ci, eris)[0], hess_x
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         if mo_coeff is None:
@@ -553,30 +520,17 @@ class CASSCFOTR(newton_casscf.CASSCF):
         # number of parameters
         self.n_param = self.n_param_orb + self.n_param_ci
 
+        # initialize settings
+        settings = SolverSettings()
+        for setting in solver_setting_fields:
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
+                setattr(settings, setting, getattr(self, setting))
+
         # call solver
-        solver(
-            self.func,
-            self.update_orbs,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_check=getattr(self, "conv_check", None),
-            conv_tol=getattr(self, "conv_tol", None),
-            stability=getattr(self, "stability", None),
-            hess_symm=True,
-            line_search=getattr(self, "line_search", None),
-            davidson=getattr(self, "davidson", None),
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),
-            prefer_jacobi_davidson=getattr(self, "prefer_jacobi_davidson", None),
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            start_trust_radius=getattr(self, "start_trust_radius", None),
-            n_macro=getattr(self, "n_macro", None),
-            n_micro=getattr(self, "n_micro", None),
-            global_red_factor=getattr(self, "global_red_factor", None),
-            local_red_factor=getattr(self, "local_red_factor", None),
-            seed=getattr(self, "seed", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
-        )
+        solver(self.func, self.update_orbs, self.n_param, settings)
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
@@ -605,24 +559,6 @@ class CASSCFOTR(newton_casscf.CASSCF):
             self.ci,
             self.mo_coeff,
             self.mo_energy,
-        )
-
-    def stability(self):
-        _, _, h_diag, hess_x = self.update_orbs(
-            np.zeros(self.n_param, dtype=np.float64)
-        )
-        return stability_check(
-            h_diag,
-            hess_x,
-            self.n_param,
-            precond=getattr(self, "precond", None),
-            conv_tol=getattr(self, "conv_tol", None),
-            hess_symm=True,
-            jacobi_davidson=getattr(self, "jacobi_davidson", None),
-            n_random_trial_vectors=getattr(self, "n_random_trial_vectors", None),
-            n_iter=getattr(self, "n_iter", None),
-            verbose=getattr(self, "verbose", None),
-            logger=getattr(self, "logger", None),
         )
 
 

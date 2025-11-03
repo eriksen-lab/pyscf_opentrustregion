@@ -17,3 +17,6 @@ mf = scf.RHF(mol).run()
 # run CASSCF calculation
 mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
+
+# call stability check
+stable, direction = mc.stability_check()
