@@ -31,6 +31,7 @@ for mo_coeff in orbs:
     loc.line_search = True
 
     loc.kernel()
+    stable, direction = loc.stability_check()
 
 ### Foster-Boys localization
 
@@ -40,6 +41,7 @@ for mo_coeff in orbs:
     loc.line_search = True
 
     loc.kernel()
+    stable, direction = loc.stability_check()
 
 ### Edmiston-Ruedenberg
 
@@ -49,3 +51,4 @@ for mo_coeff in orbs:
     loc.line_search = True
 
     loc.kernel()
+    stable, direction = loc.stability_check()
