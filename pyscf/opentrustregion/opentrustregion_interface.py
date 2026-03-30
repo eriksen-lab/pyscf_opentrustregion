@@ -280,7 +280,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             vhf = self._scf.get_veff(mol, dm, dm_last=self.dm, vhf_last=self.vhf)
             self.dm, self.vhf = dm, vhf
 
-        self.mo_coeff, self.mo_occ = mo_coeff, mo_occ
+        self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
+
+        # fix phases of MO coefficient to improve deterministic behavior
+        self.fix_phase()
 
         # get indices of all mixed occupation combinations
         self.mask, self.mask_symm = self.get_indices()
@@ -318,15 +321,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
-    # get indices of all mixed occupation combinations
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
-        occidxa = self.mo_occ > 0
-        occidxb = self.mo_occ == 2
-        viridxa = ~occidxa
-        viridxb = ~occidxb
-        mask = (viridxa[:, None] & occidxa) | (viridxb[:, None] & occidxb)
-
-        mask_symm = mask[mask]
+    # fix phases of MO coefficient to improve deterministic behavior
+    def fix_phase(self):
+        abs_mo_coeff = np.abs(self.mo_coeff)
+        max_mo_coeff = np.max(abs_mo_coeff, axis=0)
+        mask = np.isclose(abs_mo_coeff, max_mo_coeff, atol=1e-12)
+        idx = np.argmax(mask, axis=0)
+        cols = np.arange(self.mo_coeff.shape[1])
+        vals = self.mo_coeff[idx, cols]
+        signs = np.sign(vals)
+        signs[signs == 0] = 1
+        self.mo_coeff *= signs[np.newaxis, :]
         if self._scf.mol.symmetry:
             orbsym = self.get_orbsym(self.mo_coeff)
             sym_allow = orbsym[:, None] == orbsym
@@ -344,11 +349,23 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
 class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
-    get_indices = RHFOTR.get_indices
+    fix_phase = RHFOTR.fix_phase
     unpack = RHFOTR.unpack
 
 
 class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
+    # fix phases of MO coefficient to improve deterministic behavior
+    def fix_phase(self):
+        abs_mo_coeff = np.abs(self.mo_coeff)
+        max_mo_coeff = np.max(abs_mo_coeff, axis=1)
+        for i in range(2):
+            mask = np.isclose(abs_mo_coeff[i], max_mo_coeff[i], atol=1e-12)
+            idx = np.argmax(mask, axis=0)
+            cols = np.arange(self.mo_coeff.shape[2])
+            vals = self.mo_coeff[i, idx, cols]
+            signs = np.sign(vals)
+            signs[signs == 0] = 1
+            self.mo_coeff[i] *= signs[np.newaxis, :]
 
     # get indices of all mixed occupation combinations
     def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
