@@ -185,7 +185,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
-        u = ciah.expmat(self.unpack(kappa))
+        u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
@@ -338,7 +338,9 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             mask_symm = sym_allow[mask]
             mask[mask] = mask_symm
 
-        return mask, mask_symm
+    # function to compute exponential of anti-symmetric matrix
+    def exp_mat(self, matrix):
+        return ciah.expmat(matrix)
 
     # unpack matrix
     def unpack(self, kappa):
@@ -350,6 +352,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
     fix_phase = RHFOTR.fix_phase
+    exp_mat = RHFOTR.exp_mat
     unpack = RHFOTR.unpack
 
 
@@ -381,19 +384,9 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             sym_allowa = orbsyma[:, None] == orbsyma
             sym_allowb = orbsymb[:, None] == orbsymb
             sym_allow = np.stack((sym_allowa, sym_allowb))
-            mask_symm = sym_allow[mask]
-            mask[mask] = mask_symm
-
-        return mask, mask_symm
-
-    def rotate_mo(self, mo_coeff, u):
-        return super().rotate_mo(
-            mo_coeff,
-            (
-                u[: self.mol.nao, : self.mol.nao],
-                u[self.mol.nao :, self.mol.nao :],
-            ),
-        )
+    # function to compute exponential of anti-symmetric matrix
+    def exp_mat(self, matrix):
+        return [ciah.expmat(matrix[0]), ciah.expmat(matrix[1])]
 
     # unpack matrix
     def unpack(self, kappa):
