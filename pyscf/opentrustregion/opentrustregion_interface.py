@@ -224,14 +224,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if dm is not None:
             if isinstance(dm, str):
                 lib.logger.debug(
-                    self, 
+                    self,
                     f"OpenTrustRegion solver reads density matrix from chkfile {dm}",
                 )
                 dm = self.from_chk(dm)
 
         elif mo_coeff is not None and mo_occ is None:
             lib.logger.warn(
-                self, 
+                self,
                 "Newton solver expects mo_coeff with mo_occ as initial guess but "
                 "mo_occ is not found in the arguments.",
             )
@@ -565,7 +565,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 def casscf_to_otr(casscf):
     if isinstance(casscf, CASSCFOTR):
         return casscf
-    
+
     if not isinstance(casscf, newton_casscf.CASSCF):
         casscf = casscf.newton()
 
