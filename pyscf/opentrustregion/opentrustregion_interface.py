@@ -319,9 +319,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.fix_phase()
 
         # get indices of all mixed occupation combinations
-        self.mask, self.mask_symm = self.get_indices()
+        self.get_indices()
 
         # number of parameters
+        self.n_param = np.count_nonzero(self.kappa_mask)
         if hasattr(self, "arh") and self.arh:
             # number of particles for ARH
             n_particle = 1 if isinstance(self, RHFOTR) else 2
