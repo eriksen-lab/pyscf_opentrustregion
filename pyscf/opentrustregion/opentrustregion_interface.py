@@ -11,8 +11,13 @@ import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
-from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
-from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
+from pyopentrustregion import solver, stability_check
+from pyopentrustregion.python_interface import (
+    SolverSettings,
+    StabilitySettings,
+    SolverSettingsC,
+    StabilitySettingsC,
+)
 from pyopentrustregion.extensions.quasi_newton import (
     QNSettings,
     update_orbs_qn_factory,
@@ -596,8 +601,33 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             combined_rot_vo = combined_rot[np.ix_(self.virt_idx, self.occ_idx)]
             combined_rot_vv = combined_rot[np.ix_(self.virt_idx, self.virt_idx)]
 
+            # # perform sine cosine decomposition of combined rotation matrix
+            # n_occ = np.count_nonzero(self.occ_idx)
+            # n_virt = np.count_nonzero(self.virt_idx)
+            # rank = min(n_occ, self.mol.nao - n_occ)
+            # ((u1, u2), theta, (v1h, v2h)) = sc.linalg.cossin(
+            #     [combined_rot_oo, combined_rot_ov, combined_rot_vo, combined_rot_vv],
+            #     separate=True,
+            # )
+            # lower_kappa = np.zeros((n_virt, n_occ), dtype=np.float64)
+            # lower_kappa[n_virt - rank :, n_occ - rank :] = np.diag(theta)
+            # kappa[i, :] = (u2 @ lower_kappa @ u1.T).ravel()
+
+            # # get rotation matrices to new basis
+            # rot_occ = (u1 @ v1h).T
+            # rot_virt = (u2 @ v2h).T
+
+            # test gauge transformation
+            # U_new = self.exp_mat(self.unpack(kappa[i, :]))
+            # U_new[np.ix_(self.occ_idx, self.occ_idx)] = U_new[np.ix_(self.occ_idx, self.occ_idx)] @ rot_occ.T
+            # U_new[np.ix_(self.occ_idx, self.virt_idx)] = U_new[np.ix_(self.occ_idx, self.virt_idx)] @ rot_virt.T
+            # U_new[np.ix_(self.virt_idx, self.occ_idx)] = U_new[np.ix_(self.virt_idx, self.occ_idx)] @ rot_occ.T
+            # U_new[np.ix_(self.virt_idx, self.virt_idx)] = U_new[np.ix_(self.virt_idx, self.virt_idx)] @ rot_virt.T
+            # print("kappa_diff", np.linalg.norm(combined_rot - U_new))
+
             # perform SVD of occupied block
             u, s, vh = sc.linalg.svd(combined_rot_oo)
+            # u2, s2, v2h = sc.linalg.svd(combined_rot_vv)
 
             # get rotation matrix to make occupied-occupied block vanish
             rot_occ = u @ vh  # vh.T @ u.T
@@ -605,12 +635,21 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
                 combined_rot_vv
                 - combined_rot_vo @ (vh.T / (s + 1)) @ u.T @ combined_rot_ov
             )
+            # rot_virt = v2h.T @ u2.T
 
             # get combined rotation matrix with vanishing oo and vv blocks
             scos = np.ones_like(s)
             mask = np.abs(1 - s) > np.sqrt(np.finfo(float).eps)
             scos[mask] = np.arccos(s[mask]) / np.sqrt(1 - s[mask] ** 2)
             kappa[i, :] = self.pack_vo(combined_rot_vo @ (vh.T * scos) @ u.T)
+
+            # # test gauge transformation
+            # U_new = self.exp_mat(self.unpack(kappa[i, :]))
+            # U_new[np.ix_(self.occ_idx, self.occ_idx)] = U_new[np.ix_(self.occ_idx, self.occ_idx)] @ rot_occ.T
+            # U_new[np.ix_(self.occ_idx, self.virt_idx)] = U_new[np.ix_(self.occ_idx, self.virt_idx)] @ rot_virt.T
+            # U_new[np.ix_(self.virt_idx, self.occ_idx)] = U_new[np.ix_(self.virt_idx, self.occ_idx)] @ rot_occ.T
+            # U_new[np.ix_(self.virt_idx, self.virt_idx)] = U_new[np.ix_(self.virt_idx, self.virt_idx)] @ rot_virt.T
+            # print("kappa_diff", np.linalg.norm(combined_rot - U_new))
 
             # transform local gradients to new orbitals
             n_occ = rot_occ.shape[0]
@@ -624,6 +663,16 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
                 if not virt_unit:
                     local_grad_2d = rot_virt.T @ local_grad_2d
                 local_grad[i, :] = self.pack_vo(local_grad_2d)
+
+            # # test gradient transformation
+            # rot = self.exp_mat(self.unpack(kappa[i, :]))
+            # mo_coeff = self.rotate_mo(self.mo_coeff, rot)
+            # dm = self.make_rdm1(mo_coeff, self.mo_occ)
+            # vhf = self._scf.get_veff(self._scf.mol, dm)
+            # fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
+            # grad_full, _, _ = self.gen_g_hop(mo_coeff, self.mo_occ, fock)
+            # grad_test = 2 * grad_full[self.kappa_mask]
+            # print("local_grad_diff", np.linalg.norm(grad_test - local_grad[i, :]))
 
             # transform gradients to new reference
             u, s, vh = sc.linalg.svd(self.unpack_vo(kappa[i, :]), full_matrices=False)
@@ -998,6 +1047,11 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
     def pack_vo(self, matrix):
         return np.concatenate((matrix[0].ravel(), matrix[1].ravel()))[self.kappa_mask]
 
+    # # Fock matrix function from density matrix
+    # def get_energy_fock(self, dm: np.ndarray, fock: np.ndarray) -> float:
+    #     vhf = self._scf.get_veff(self._scf.mol, dm)
+    #     fock[:, :] = self.get_fock(self.h1e, self.s1e, vhf, dm)
+    #     return self._scf.energy_tot(dm, self.h1e, vhf)
 
     # Fock matrix function from density matrix
     def get_energy_fock_jk(
