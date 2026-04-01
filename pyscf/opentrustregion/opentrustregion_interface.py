@@ -11,13 +11,8 @@ import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
-from pyopentrustregion import solver, stability_check
-from pyopentrustregion.python_interface import (
-    SolverSettings,
-    StabilitySettings,
-    SolverSettingsC,
-    StabilitySettingsC,
-)
+from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
+from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
 from pyopentrustregion.extensions.quasi_newton import (
     QNSettings,
     update_orbs_qn_factory,
