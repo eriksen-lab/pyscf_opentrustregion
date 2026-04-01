@@ -367,6 +367,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 dm_per_spin_ao = self.dm
             arh_settings = ARHSettings()
             arh_settings.restricted = restricted
+            if hasattr(self, "symm_arh"):
+                arh_settings.symm_arh = self.symm_arh
             func, update_orbs, settings.project = arh_factory(
                 dm_per_spin_ao,
                 self.s1e,
