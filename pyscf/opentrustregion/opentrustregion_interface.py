@@ -368,7 +368,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             arh_settings = ARHSettings()
             arh_settings.restricted = restricted
             if hasattr(self, "symm_arh"):
-                arh_settings.symm_arh = self.symm_arh
+                arh_settings.symm_arh = settings.hess_symm = self.symm_arh
+            else:
+                settings.hess_symm = True
             func, update_orbs, settings.project = arh_factory(
                 dm_per_spin_ao,
                 self.s1e,
@@ -382,7 +384,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 ),
                 arh_settings,
             )
-            settings.hess_symm = False
         elif hasattr(self, "s_gek") and self.s_gek:
             if self.pseudo_canonicalization:
                 raise RuntimeError(
