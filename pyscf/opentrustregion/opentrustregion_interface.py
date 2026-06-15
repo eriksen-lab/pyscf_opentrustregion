@@ -67,7 +67,10 @@ class OTR:
         # initialize settings
         settings = StabilitySettings()
         for setting in stability_setting_fields:
-            if hasattr(self, setting):
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
                 setattr(settings, setting, getattr(self, setting))
 
         # run stability check
@@ -148,6 +151,12 @@ class BoysOTR(OTR, lo.Boys):
                 or not isinstance(getattr(self, "conv_check", None), bool)
             ):
                 setattr(settings, setting, getattr(self, setting))
+        for setting in stability_setting_fields:
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
+                setattr(settings.stability_settings, setting, getattr(self, setting))
 
         # call solver
         solver(self.func, self.update_orbs, self.n_param, settings)
@@ -336,7 +345,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             ) or (setting == "modify_step" and self.pseudo_canonicalization):
                 setattr(settings, setting, getattr(self, setting))
         for setting in stability_setting_fields:
-            if hasattr(self, setting):
+            if hasattr(self, setting) and (
+                setting != "conv_check"
+                or not isinstance(getattr(self, "conv_check", None), bool)
+            ):
                 setattr(settings.stability_settings, setting, getattr(self, setting))
 
         # set default values for OTR extensions
@@ -398,8 +410,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 raise RuntimeError("Pseudo-canonicalization is not supported for ARH.")
             arh_settings = ARHSettings()
             arh_settings.restricted = restricted
-            if hasattr(self, "symm_arh"):
-                arh_settings.symm_arh = settings.hess_symm = self.symm_arh
+            if hasattr(self, "arh_type"):
+                arh_settings.arh_type = self.arh_type
+                settings.hess_symm = not self.arh_type == "standard"
             else:
                 settings.hess_symm = True
             self.func, self.approx_update_orbs, settings.project = arh_factory(
@@ -648,6 +661,18 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             )
 
         return
+
+    # Hessian initialization
+    def init_hess(self, vector: np.ndarray):
+        mo_coeff_occ = self.mo_coeff[:, self.occ_idx]
+        mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
+
+        fock_oo = mo_coeff_occ.T @ self.fock @ mo_coeff_occ
+        fock_vv = mo_coeff_virt.T @ self.fock @ mo_coeff_virt
+
+        x_vo = self.unpack_vo(vector)
+        x_vo = 2 * (fock_vv @ x_vo - x_vo @ fock_oo)
+        vector[:] = self.pack_vo(x_vo)
 
     # change of reference
     def change_reference(
