@@ -25,6 +25,8 @@ from pyopentrustregion.extensions.s_gek import (
     update_orbs_s_gek_factory,
     update_orbs_s_gek_deconstructor,
 )
+from pyopentrustregion.extensions.oao.python_interface import OAOSettingsC
+from pyopentrustregion.extensions.arh.python_interface import ARHSettingsC
 from pyopentrustregion.extensions.quasi_newton.python_interface import QNSettingsC
 from pyopentrustregion.extensions.s_gek.python_interface import SGEKSettingsC
 from typing import TYPE_CHECKING
@@ -39,6 +41,12 @@ solver_setting_fields = [
 stability_setting_fields = [
     field[0] for field in StabilitySettingsC._fields_ if field[0] != "initialized"
 ]
+oao_setting_fields = [
+    field[0] for field in OAOSettingsC._fields_ if field[0] != "initialized"
+]
+arh_setting_fields = [
+    field[0] for field in ARHSettingsC._fields_ if field[0] != "initialized"
+]
 qn_setting_fields = [
     field[0] for field in QNSettingsC._fields_ if field[0] != "initialized"
 ]
@@ -51,6 +59,8 @@ class OTR:
     _keys = set(
         solver_setting_fields
         + stability_setting_fields
+        + oao_setting_fields
+        + arh_setting_fields
         + qn_setting_fields
         + s_gek_setting_fields
         + ["oao", "arh", "s_gek", "pseudo_canonicalization"]
