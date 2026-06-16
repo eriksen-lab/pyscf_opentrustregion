@@ -66,6 +66,10 @@ class OTR:
         + ["oao", "arh", "s_gek", "pseudo_canonicalization"]
     )
 
+    def __init__(self, *args, **kwargs):
+        self.n_update_orbs = 0
+        self.n_hess_x = 0
+
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         # get Hessian diagonal and linear transformation at current point
@@ -118,9 +122,11 @@ class BoysOTR(OTR, lo.Boys):
         grad[:] = 2 * grad_full
         h_diag[:] = 2 * h_diag_full
         self.mo_coeff = self.mo_coeff @ u
+        self.n_update_orbs += 1
 
         def hess_x(x, hx):
             hx[:] = 2 * hess_x_full(x)
+            self.n_hess_x += 1
 
         return func, hess_x
 
@@ -192,9 +198,11 @@ class PipekMezeyOTR(lo.PipekMezey, BoysOTR):
         grad[:] = 2 * grad_full
         h_diag[:] = 2 * h_diag_full
         self.mo_coeff = self.mo_coeff @ u
+        self.n_update_orbs += 1
 
         def hess_x(x, hx):
             hx[:] = 2 * hess_x_full(x)
+            self.n_hess_x += 1
 
         return -func, hess_x
 
@@ -259,11 +267,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         )
         grad[:] = 2 * grad_full[self.kappa_mask]
         h_diag[:] = 2 * h_diag_full[self.kappa_mask]
+        self.n_update_orbs += 1
 
         def hess_x_symm(x, hx):
             x_full = np.zeros_like(self.kappa_mask, dtype=np.float64)
             x_full[self.kappa_mask] = x
             hx[:] = 2 * hess_x_full(x_full)[self.kappa_mask]
+            self.n_hess_x += 1
 
         return self._scf.energy_tot(self.dm, self.h1e, self.vhf), hess_x_symm
 
@@ -1500,9 +1510,11 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         )
         grad[:] = 2 * grad_full
         h_diag[:] = 2 * h_diag_full
+        self.n_update_orbs += 1
 
         def hess_x(x, hx):
             hx[:] = 2 * hess_x_full(x)
+            self.n_hess_x += 1
 
         return self.casci(self.mo_coeff, self.ci, eris)[0], hess_x
 
