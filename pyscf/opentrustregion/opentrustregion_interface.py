@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import atexit
 import numpy as np
 import scipy as sc
 from pyscf import gto, scf, lo, lib
@@ -19,7 +20,7 @@ from pyopentrustregion.extensions.quasi_newton import (
     update_orbs_qn_deconstructor,
 )
 from pyopentrustregion.extensions.oao import OAOSettings, oao_factory, oao_deconstructor
-from pyopentrustregion.extensions.arh import ARHSettings, arh_factory
+from pyopentrustregion.extensions.arh import ARHSettings, arh_factory, arh_deconstructor
 from pyopentrustregion.extensions.s_gek import (
     SGEKSettings,
     update_orbs_s_gek_factory,
@@ -234,6 +235,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     vhf: np.ndarray
 
     def __init__(self, mf: scf.SCF):
+        # Register the cleanup immediately upon initialization
+        atexit.register(self.close)
+
         self.__dict__.update(mf.__dict__)
         self._scf = mf
         self.update = None
@@ -512,15 +516,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             settings,
         )
 
-        # call deconstructor
-        if self.hess_update_scheme is not None:
-            update_orbs_qn_deconstructor()
-        elif self.oao:
-            oao_deconstructor(self.dm)
-        elif self.s_gek:
-            update_orbs_s_gek_deconstructor()
-
         # get canonical orbitals
+        if self.oao:
+            self.dm = 2 * dm_per_spin_ao if isinstance(self, RHFOTR) else dm_per_spin_ao
         self.converged = True
         if self.oao:
             self.mo_occ, self.mo_coeff = self.get_orth_mo_coeff()
@@ -534,7 +532,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._finalize()
 
         return self.e_tot
-
+    
+    def close(self):
+        # call deconstructor
+        if self.arh:
+            arh_deconstructor()
+        elif self.hess_update_scheme is not None:
+            update_orbs_qn_deconstructor()
+        elif self.s_gek:
+            update_orbs_s_gek_deconstructor()
+        elif self.oao:
+            oao_deconstructor()
+        atexit.unregister(self.close)
+    
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
@@ -821,7 +831,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         eigvals_s, eigvecs_s = np.linalg.eigh(self.s1e)
         s_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.T
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
-        dm_orth = s_sqrt @ (2.0 * self.dm) @ s_sqrt
+        dm_orth = s_sqrt @ self.dm @ s_sqrt
         mo_occ, mo_coeff_oao = np.linalg.eigh(dm_orth)
         mo_occ = np.rint(mo_occ)
         mo_coeff = s_inv_sqrt @ mo_coeff_oao
