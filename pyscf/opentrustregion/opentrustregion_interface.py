@@ -64,10 +64,26 @@ class OTR:
         + arh_setting_fields
         + qn_setting_fields
         + s_gek_setting_fields
-        + ["oao", "arh", "s_gek", "pseudo_canonicalization"]
+        + [
+            "saved_func",
+            "saved_grad",
+            "saved_h_diag",
+            "saved_hess_x",
+            "n_update_orbs",
+            "n_hess_x",
+            "oao",
+            "oao_update_orbs_called",
+            "arh",
+            "s_gek",
+            "pseudo_canonicalization",
+        ]
     )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
+        self.saved_func = None
+        self.saved_grad = None
+        self.saved_h_diag = None
+        self.saved_hess_x = None
         self.n_update_orbs = 0
         self.n_hess_x = 0
 
@@ -117,19 +133,28 @@ class BoysOTR(OTR, lo.Boys):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
-        u = ciah.expmat(self.unpack(kappa))
-        func = self.cost_function(u)
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
-        self.mo_coeff = self.mo_coeff @ u
-        self.n_update_orbs += 1
+        if (
+            np.sum(np.abs(kappa)) > 0.0
+            or self.saved_func is None
+            or self.saved_grad is None
+            or self.saved_h_diag is None
+            or self.saved_hess_x is None
+        ):
+            u = ciah.expmat(self.unpack(kappa))
+            self.mo_coeff = self.mo_coeff @ u
+            self.saved_func = self.cost_function(u)
+            self.saved_grad, self.saved_hess_x, self.saved_h_diag = self.gen_g_hop(u)
 
-        def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
+            self.n_update_orbs += 1
+
+        grad[:] = 2 * self.saved_grad
+        h_diag[:] = 2 * self.saved_h_diag
+
+        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
+            hx[:] = 2 * self.saved_hess_x(x)
             self.n_hess_x += 1
 
-        return func, hess_x
+        return self.saved_func, hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -192,20 +217,29 @@ class PipekMezeyOTR(lo.PipekMezey, BoysOTR):
     # function
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        u = ciah.expmat(self.unpack(kappa))
-        func = self.cost_function(u)
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
-        self.mo_coeff = self.mo_coeff @ u
-        self.n_update_orbs += 1
+    ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+        if (
+            np.sum(np.abs(kappa)) > 0.0
+            or self.saved_func is None
+            or self.saved_grad is None
+            or self.saved_h_diag is None
+            or self.saved_hess_x is None
+        ):
+            u = ciah.expmat(self.unpack(kappa))
+            self.mo_coeff = self.mo_coeff @ u
+            self.saved_func = self.cost_function(u)
+            self.saved_grad, self.saved_hess_x, self.saved_h_diag = self.gen_g_hop(u)
 
-        def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
+            self.n_update_orbs += 1
+
+        grad[:] = 2 * self.saved_grad
+        h_diag[:] = 2 * self.saved_h_diag
+
+        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
+            hx[:] = 2 * self.saved_hess_x(x)
             self.n_hess_x += 1
 
-        return -func, hess_x
+        return -self.saved_func, hess_x
 
 
 class EdmistonRuedenbergOTR(lo.EdmistonRuedenberg, PipekMezeyOTR):
@@ -235,15 +269,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     vhf: np.ndarray
 
     def __init__(self, mf: scf.SCF):
-        # Register the cleanup immediately upon initialization
+        OTR.__init__(self)
+
         atexit.register(self.close)
 
         self.__dict__.update(mf.__dict__)
         self._scf = mf
-        self.update = None
-        self.arh = False
-        self.s_gek = False
         self.pseudo_canonicalization = False
+        self.oao_update_orbs_called = False
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
@@ -257,29 +290,38 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        # perform orbital rotation and get new fock matrix if not already done in step
-        # modification function
-        if not self.pseudo_canonicalization:
-            u = self.exp_mat(self.unpack(kappa))
-            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-            self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-            self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
-            self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
+        if (
+            np.sum(np.abs(kappa)) > 0.0
+            or self.saved_func is None
+            or self.saved_grad is None
+            or self.saved_h_diag is None
+            or self.saved_hess_x is None
+        ):
+            # perform orbital rotation and get new fock matrix if not already done in
+            # step modification function
+            if not self.pseudo_canonicalization:
+                u = self.exp_mat(self.unpack(kappa))
+                self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+                self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
+                self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
+                self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
+            self.saved_func = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
+            self.saved_grad, self.saved_hess_x, self.saved_h_diag = self.gen_g_hop(
+                self.mo_coeff, self.mo_occ, self.fock
+            )
 
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(
-            self.mo_coeff, self.mo_occ, self.fock
-        )
-        grad[:] = 2 * grad_full[self.kappa_mask]
-        h_diag[:] = 2 * h_diag_full[self.kappa_mask]
-        self.n_update_orbs += 1
+            self.n_update_orbs += 1
 
-        def hess_x_symm(x, hx):
+        grad[:] = 2 * self.saved_grad[self.kappa_mask]
+        h_diag[:] = 2 * self.saved_h_diag[self.kappa_mask]
+
+        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             x_full = np.zeros_like(self.kappa_mask, dtype=np.float64)
             x_full[self.kappa_mask] = x
-            hx[:] = 2 * hess_x_full(x_full)[self.kappa_mask]
+            hx[:] = 2 * self.saved_hess_x(x_full)[self.kappa_mask]
             self.n_hess_x += 1
 
-        return self._scf.energy_tot(self.dm, self.h1e, self.vhf), hess_x_symm
+        return self.saved_func, hess_x
 
     # kernel function
     def kernel(
@@ -418,7 +460,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 dm_per_spin_ao = self.dm
             oao_settings = OAOSettings()
             oao_settings.restricted = restricted
-            self.func, self.update_orbs, settings.project = oao_factory(
+            self.func, oao_update_orbs, settings.project = oao_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -427,6 +469,20 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.update_dm,
                 oao_settings,
             )
+
+            def wrapped_update_orbs(kappa, grad, h_diag):
+                func, hess_x = oao_update_orbs(kappa, grad, h_diag)
+                if np.sum(np.abs(kappa)) > 0.0 or not self.oao_update_orbs_called:
+                    self.n_update_orbs += 1
+                self.oao_update_orbs_called = True
+
+                def wrapped_hess_x(x, hx):
+                    hess_x(x, hx)
+                    self.n_hess_x += 1
+
+                return func, wrapped_hess_x
+
+            self.update_orbs = wrapped_update_orbs
 
         # define callback functions for approximate Hessians
         if self.arh:
@@ -439,7 +495,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 settings.hess_symm = not self.arh_type == "standard"
             else:
                 settings.hess_symm = True
-            self.func, self.approx_update_orbs, settings.project = arh_factory(
+            self.func, approx_update_orbs, settings.project = arh_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -452,6 +508,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 ),
                 arh_settings,
             )
+
+            def wrapped_approx_update_orbs(kappa, grad, h_diag):
+                func, hess_x = approx_update_orbs(kappa, grad, h_diag)
+                if np.sum(np.abs(kappa)) > 0.0 or not self.oao_update_orbs_called:
+                    self.n_update_orbs += 1
+                self.oao_update_orbs_called = True
+                return func, hess_x
+
+            self.approx_update_orbs = wrapped_approx_update_orbs
         elif self.hess_update_scheme is not None:
             qn_settings = QNSettings()
             qn_settings.hess_update_scheme = self.hess_update_scheme
@@ -532,7 +597,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._finalize()
 
         return self.e_tot
-    
+
     def close(self):
         # call deconstructor
         if self.arh:
@@ -544,7 +609,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         elif self.oao:
             oao_deconstructor()
         atexit.unregister(self.close)
-    
+
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
@@ -1496,37 +1561,47 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(self, x, grad, h_diag):
-        u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        eris = self.ao2mo(self.mo_coeff)
+        if (
+            np.sum(np.abs(x)) > 0.0
+            or self.saved_func is None
+            or self.saved_grad is None
+            or self.saved_h_diag is None
+            or self.saved_hess_x is None
+        ):
+            u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
+            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+            eris = self.ao2mo(self.mo_coeff)
 
-        idx_start = self.n_param_orb
-        if self.fcisolver.nroots == 1:
-            ci = self.ci + x[idx_start:]
-            ci /= np.linalg.norm(ci)
-            self.ci = ci
-        else:
-            ci = []
-            for c in self.ci:
-                idx_stop = idx_start + c.size
-                ci.append(c + x[idx_start:idx_stop])
-                ci[-1] /= np.linalg.norm(ci[-1])
-                idx_start = idx_stop
-            self.ci = ci
-            ci = [c.ravel() for c in ci]
+            idx_start = self.n_param_orb
+            if self.fcisolver.nroots == 1:
+                ci = self.ci + x[idx_start:]
+                ci /= np.linalg.norm(ci)
+                self.ci = ci
+            else:
+                ci = []
+                for c in self.ci:
+                    idx_stop = idx_start + c.size
+                    ci.append(c + x[idx_start:idx_stop])
+                    ci[-1] /= np.linalg.norm(ci[-1])
+                    idx_start = idx_stop
+                self.ci = ci
+                ci = [c.ravel() for c in ci]
 
-        grad_full, _, hess_x_full, h_diag_full = newton_casscf.gen_g_hop(
-            self, self.mo_coeff, ci, eris
-        )
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
-        self.n_update_orbs += 1
+            self.saved_func = self.casci(self.mo_coeff, self.ci, eris)[0]
+            self.saved_grad, _, self.saved_hess_x, self.saved_h_diag = (
+                newton_casscf.gen_g_hop(self, self.mo_coeff, ci, eris)
+            )
 
-        def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
+            self.n_update_orbs += 1
+
+        grad[:] = 2 * self.saved_grad
+        h_diag[:] = 2 * self.saved_h_diag
+
+        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
+            hx[:] = 2 * self.saved_hess_x(x)
             self.n_hess_x += 1
 
-        return self.casci(self.mo_coeff, self.ci, eris)[0], hess_x
+        return self.saved_func, hess_x
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         if mo_coeff is None:
