@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-import atexit
+import weakref
 import numpy as np
 import scipy as sc
 from pyscf import gto, scf, lo, lib
@@ -271,8 +271,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def __init__(self, mf: scf.SCF):
         OTR.__init__(self)
 
-        atexit.register(self.close)
-
         self.__dict__.update(mf.__dict__)
         self._scf = mf
         self.pseudo_canonicalization = False
@@ -433,6 +431,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.hess_update_scheme = None
         if not hasattr(self, "s_gek"):
             self.s_gek = False
+
+        # deallocate resources from a previous kernel() call on this instance before
+        # registering a finalizer for the current one
+        if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
+            self._finalizer()
+        self._finalizer = weakref.finalize(
+            self, self._cleanup, self.arh, self.hess_update_scheme, self.s_gek, self.oao
+        )
 
         # number of parameters
         if self.oao:
@@ -598,17 +604,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         return self.e_tot
 
-    def close(self):
+    @staticmethod
+    def _cleanup(arh, hess_update_scheme, s_gek, oao):
         # call deconstructor
-        if self.arh:
+        if arh:
             arh_deconstructor()
-        elif self.hess_update_scheme is not None:
+        elif hess_update_scheme is not None:
             update_orbs_qn_deconstructor()
-        elif self.s_gek:
+        elif s_gek:
             update_orbs_s_gek_deconstructor()
-        elif self.oao:
+        elif oao:
             oao_deconstructor()
-        atexit.unregister(self.close)
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
