@@ -526,9 +526,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self._scf.mol.nao,
                 self.get_energy,
                 (
-                    self.update_dm_jk
+                    self.update_dm_spin
                     if isinstance(self, ROHFOTR) or isinstance(self, UHFOTR)
-                    else self.update_dm
+                    else self.update_dm_nonlinear
                 ),
                 arh_settings,
             )
@@ -717,11 +717,32 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
     def update_dm(
         self, dm: np.ndarray, fock: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        vhf = self._scf.get_veff(self._scf.mol, 2.0 * dm)
-        fock[:, :] = self.get_fock(self.h1e, self.s1e, vhf, 2.0 * dm)
-        return self._scf.energy_tot(2.0 * dm, self.h1e, vhf), self.get_response_factory(
+        veff = self._scf.get_veff(self._scf.mol, 2.0 * dm)
+        fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+        return self._scf.energy_tot(
+            2.0 * dm, self.h1e, veff
+        ), self.get_response_factory(
             self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
         )
+
+    # update density matrix with a separate non-linear (XC) contribution to the
+    # effective potential
+    def update_dm_nonlinear(
+        self, dm: np.ndarray, fock: np.ndarray, v_nonlinear: np.ndarray
+    ) -> float:
+        veff = self._scf.get_veff(self._scf.mol, 2.0 * dm)
+
+        if isinstance(self, scf.hf.KohnShamDFT):
+            v_linear = np.asarray(veff.vj)
+            if getattr(veff, "vk", None) is not None:
+                v_linear = v_linear - 0.5 * veff.vk
+            v_nonlinear[:, :] = np.asarray(veff) - v_linear
+        else:
+            # no non-linear contribution for Hartree-Fock
+            v_nonlinear[:, :] = 0.0
+
+        fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+        return self._scf.energy_tot(2.0 * dm, self.h1e, veff)
 
     def get_response_factory(
         self, gen_response: Callable[[np.ndarray], np.ndarray]
@@ -1256,26 +1277,56 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             self.gen_response(dm0=dm, hermi=1)
         )
 
-    # update density matrix with Coulomb and exchange contributions
-    def update_dm_jk(
+    # update density matrix with linear (Coulomb and exact exchange) and non-linear
+    # (XC) contributions to the effective potential
+    def update_dm_spin(
         self,
         dm: np.ndarray,
         fock: np.ndarray,
-        coulomb: np.ndarray,
-        exchange: np.ndarray,
-    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        # get Coulomb and exchange matrices
-        coulomb[:, :, :], exchange[:, :, :] = self._scf.get_jk(self.mol, dm)
+        v_same_spin: np.ndarray,
+        v_opposite_spin: np.ndarray,
+        v_nonlinear: np.ndarray,
+    ) -> float:
+        if isinstance(self, scf.hf.KohnShamDFT):
+            # get coulomb potential
+            vj = self._scf.get_j(self.mol, dm)
 
-        # construct mean-field potential
-        vhf = coulomb[0] + coulomb[1] - exchange
+            # get KS effective potential
+            veff = self._scf.get_veff(self.mol, dm)
 
-        # construct Fock matrix in AO basis
-        fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
+            # linear part of the potential
+            v_same_spin[0] = vj[0]
+            v_same_spin[1] = vj[1]
+            if veff.vk is not None:
+                v_same_spin[0] -= veff.vk[0]
+                v_same_spin[1] -= veff.vk[1]
+            v_opposite_spin[0] = vj[1]
+            v_opposite_spin[1] = vj[0]
 
-        return self._scf.energy_tot(dm, self.h1e, vhf), self.get_response_factory(
-            self.gen_response(dm0=dm, hermi=1)
-        )
+            # non-linear (exchange-correlation) part
+            v_nonlinear[0] = veff[0] - v_same_spin[0] - v_opposite_spin[0]
+            v_nonlinear[1] = veff[1] - v_same_spin[1] - v_opposite_spin[1]
+
+        else:
+            # get Coulomb and exchange matrices
+            vj, vk = self._scf.get_jk(self.mol, dm)
+
+            # construct mean-field potential
+            veff = vj[0] + vj[1] - vk
+
+            # construct same-spin and opposite-spin potentials, the entire
+            # Hartree-Fock potential is linear in the density matrix
+            v_same_spin[:, :, :] = vj - vk
+            v_opposite_spin[0] = vj[1]
+            v_opposite_spin[1] = vj[0]
+
+            # no non-linear contribution for Hartree-Fock
+            v_nonlinear[:, :, :] = 0.0
+
+        # construct Fock matrix
+        fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, veff, dm)
+
+        return self._scf.energy_tot(dm, self.h1e, veff)
 
     def get_response_factory(
         self, gen_response: Callable[[np.ndarray], np.ndarray]
