@@ -510,7 +510,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     setattr(arh_settings, setting, getattr(self, setting))
             if hasattr(self, "arh_type"):
                 arh_settings.arh_type = self.arh_type
-                settings.hess_symm = not self.arh_type == "standard"
+                settings.hess_symm = not self.arh_type == "arh"
             else:
                 settings.hess_symm = True
             (
