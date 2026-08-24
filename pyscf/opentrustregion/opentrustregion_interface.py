@@ -427,6 +427,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.oao = False
         if not hasattr(self, "arh"):
             self.arh = False
+        if isinstance(self, ROHFOTR) and (self.oao or self.arh):
+            raise NotImplementedError(
+                "OAO and ARH are not currently implemented for ROHF."
+            )
         if not hasattr(self, "hess_update_scheme"):
             self.hess_update_scheme = None
         if not hasattr(self, "s_gek"):
@@ -444,11 +448,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if self.oao:
             # number of particles for ARH
             n_particle = 1 if isinstance(self, RHFOTR) else 2
-            restricted = isinstance(self, RHFOTR) or isinstance(self, ROHFOTR)
             # number of parameters in AO basis
-            self.n_param = self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
-            if not restricted:
-                self.n_param *= n_particle
+            self.n_param = n_particle * self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
         else:
             self.n_param = np.count_nonzero(self.kappa_mask)
 
@@ -465,8 +466,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             else:
                 dm_per_spin_ao = self.dm
             oao_settings = OAOSettings()
-            oao_settings.restricted = restricted
-            self.func, oao_update_orbs, settings.project = oao_factory(
+            for setting in oao_setting_fields:
+                if hasattr(self, setting):
+                    setattr(oao_settings, setting, getattr(self, setting))
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -495,7 +497,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             if self.pseudo_canonicalization:
                 raise RuntimeError("Pseudo-canonicalization is not supported for ARH.")
             arh_settings = ARHSettings()
-            arh_settings.restricted = restricted
+            for setting in arh_setting_fields:
+                if hasattr(self, setting):
+                    setattr(arh_settings, setting, getattr(self, setting))
             if hasattr(self, "arh_type"):
                 arh_settings.arh_type = self.arh_type
                 settings.hess_symm = not self.arh_type == "standard"
@@ -525,9 +529,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.approx_update_orbs = wrapped_approx_update_orbs
         elif self.hess_update_scheme is not None:
             qn_settings = QNSettings()
-            qn_settings.hess_update_scheme = self.hess_update_scheme
-            if hasattr(self, "max_points"):
-                qn_settings.max_points = self.max_points
+            for setting in qn_setting_fields:
+                if hasattr(self, setting):
+                    setattr(qn_settings, setting, getattr(self, setting))
             self.approx_update_orbs = update_orbs_qn_factory(
                 self.update_orbs,
                 self.transport,
@@ -551,10 +555,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     "manifold."
                 )
             s_gek_settings = SGEKSettings()
-            if hasattr(self, "use_subspace"):
-                s_gek_settings.use_subspace = self.use_subspace
-            if hasattr(self, "max_points"):
-                s_gek_settings.max_points = self.max_points
+            for setting in s_gek_setting_fields:
+                if hasattr(self, setting):
+                    setattr(s_gek_settings, setting, getattr(self, setting))
             self.approx_update_orbs = update_orbs_s_gek_factory(
                 self.update_orbs, self.change_reference, self.n_param, s_gek_settings
             )
@@ -982,53 +985,6 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         kappa[self.kappa_mask_vo] = matrix_vo[self.rot_matrix_mask_vo].ravel()
         kappa[self.kappa_mask_oc] = matrix_oc[self.rot_matrix_mask_oc].ravel()
         return kappa
-
-    # energy function from density matrix
-    def get_energy(self, dm: np.ndarray) -> float:
-        return self._scf.energy_tot(dm, self.h1e)
-
-    # update_density matrix
-    def update_dm(
-        self, dm: np.ndarray, fock: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        vhf = self._scf.get_veff(self._scf.mol, dm)
-        eff_fock = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
-        fock[0, :, :] = eff_fock.focka
-        fock[1, :, :] = eff_fock.fockb
-        return self._scf.energy_tot(dm, self.h1e, vhf), self.get_response_factory(
-            self.gen_response(dm0=dm, hermi=1)
-        )
-
-    # update_density matrix with Coulomb and exchange contributions
-    def update_dm_jk(
-        self,
-        dm: np.ndarray,
-        fock: np.ndarray,
-        coulomb: np.ndarray,
-        exchange: np.ndarray,
-    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        # get Coulomb and exchange matrices
-        coulomb[:, :, :], exchange[:, :, :] = self._scf.get_jk(self.mol, dm)
-
-        # construct mean-field potential
-        vhf = coulomb[0] + coulomb[1] - exchange
-
-        # construct Fock matrix in AO basis
-        eff_fock = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
-        fock[0, :, :] = eff_fock.focka
-        fock[1, :, :] = eff_fock.fockb
-
-        return self._scf.energy_tot(dm, self.h1e, vhf), self.get_response_factory(
-            self.gen_response(dm0=dm, hermi=1)
-        )
-
-    def get_response_factory(
-        self, gen_response: Callable[[np.ndarray], np.ndarray]
-    ) -> Callable[[np.ndarray, np.ndarray], None]:
-        def get_response(dm: np.ndarray, response: np.ndarray):
-            response[:, :, :] = gen_response(dm)
-
-        return get_response
 
     # modify step to pseudo-canonical orbitals
     def modify_step(self, kappa: np.ndarray):
