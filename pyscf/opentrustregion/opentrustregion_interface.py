@@ -591,7 +591,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             grad = np.empty(self.n_param, dtype=np.float64)
             h_diag = np.empty(self.n_param, dtype=np.float64)
             settings.stability_hess_x = self.update_orbs(kappa, grad, h_diag)[1]
-            if not hasattr(self, "diag_solver"):
+            if (
+                not hasattr(self, "diag_solver")
+                and hasattr(settings, "hess_symm")
+                and settings.hess_symm
+            ):
                 settings.stability_settings.diag_solver = "jacobi-davidson"
                 settings.stability_settings.jacobi_davidson_start = 0
             if settings.stability_settings.diag_solver == "jacobi-davidson":
