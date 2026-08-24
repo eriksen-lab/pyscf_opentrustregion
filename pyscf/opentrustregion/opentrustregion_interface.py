@@ -469,6 +469,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in oao_setting_fields:
                 if hasattr(self, setting):
                     setattr(oao_settings, setting, getattr(self, setting))
+            self.func, oao_update_orbs, precond, precond_pd, project = oao_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -477,6 +478,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.update_dm,
                 oao_settings,
             )
+            self.project = settings.project = settings.stability_settings.project = (
+                project
+            )
+            self.precond = settings.precond = settings.stability_settings.precond = (
+                precond
+            )
+            self.precond_pd = settings.precond_pd = precond_pd
 
             def wrapped_update_orbs(kappa, grad, h_diag):
                 func, hess_x = oao_update_orbs(kappa, grad, h_diag)
@@ -505,7 +513,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 settings.hess_symm = not self.arh_type == "standard"
             else:
                 settings.hess_symm = True
-            self.func, approx_update_orbs, settings.project = arh_factory(
+            (
+                self.func,
+                approx_update_orbs,
+                precond,
+                precond_pd,
+                project,
+            ) = arh_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -518,6 +532,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 ),
                 arh_settings,
             )
+            self.project = settings.project = settings.stability_settings.project = (
+                project
+            )
+            self.precond = settings.precond = settings.stability_settings.precond = (
+                precond
+            )
+            self.precond_pd = settings.precond_pd = precond_pd
 
             def wrapped_approx_update_orbs(kappa, grad, h_diag):
                 func, hess_x = approx_update_orbs(kappa, grad, h_diag)
