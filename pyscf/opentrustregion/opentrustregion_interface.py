@@ -50,10 +50,24 @@ class OTR:
         return stable, direction
 
 
-class BoysOTR(OTR, lo.Boys):
+class LocalizerOTR(OTR):
+    """
+    this class is the OTR driver for the PySCF orbital localizers. This class must 
+    precede the pyscf.lo class in the base list of every concrete localizer below so 
+    that its kernel takes precedence over the PySCF one.
+    """
 
     norb: int
     mo_coeff: np.ndarray
+
+    # sign that turns the PySCF cost function into a minimization objective; PySCF's 
+    # gen_g_hop always returns derivatives of the minimization objective, so only the 
+    # cost function itself needs this factor
+    cost_sign = 1.0
+
+    # the boolean stability solver setting shadows the stability() method the PySCF
+    # localizers provide; the OTR equivalent is the stability_check() method
+    stability = False
 
     # unpack matrix
     def unpack(self, kappa: np.ndarray) -> np.ndarray:
@@ -65,24 +79,24 @@ class BoysOTR(OTR, lo.Boys):
     # cost function
     def func(self, kappa: np.ndarray) -> float:
         u = ciah.expmat(self.unpack(kappa))
-        return self.cost_function(u)
+        return self.cost_sign * self.cost_function(u)
 
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
     # function
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-    ) -> Tuple[float, np.ndarray, np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
         u = ciah.expmat(self.unpack(kappa))
         func = self.cost_function(u)
         grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
+        grad[:] = grad_full
+        h_diag[:] = h_diag_full
         self.mo_coeff = self.mo_coeff @ u
 
         def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
+            hx[:] = hess_x_full(x)
 
-        return func, hess_x
+        return self.cost_sign * func, hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -128,38 +142,25 @@ class BoysOTR(OTR, lo.Boys):
         return self.mo_coeff
 
 
-class PipekMezeyOTR(lo.PipekMezey, BoysOTR):
-
-    # cost function
-    def func(self, kappa: np.ndarray) -> float:
-        u = ciah.expmat(self.unpack(kappa))
-        return -self.cost_function(u)
-
-    # cost function, gradient, Hessian diagonal and Hessian linear transformation
-    # function
-    def update_orbs(
-        self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        u = ciah.expmat(self.unpack(kappa))
-        func = self.cost_function(u)
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
-        self.mo_coeff = self.mo_coeff @ u
-
-        def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
-
-        return -func, hess_x
-
-
-class EdmistonRuedenbergOTR(lo.EdmistonRuedenberg, PipekMezeyOTR):
+class BoysOTR(LocalizerOTR, lo.Boys):
     pass
+
+
+class PipekMezeyOTR(LocalizerOTR, lo.PipekMezey):
+
+    # the Pipek-Mezey cost function is maximized
+    cost_sign = -1.0
+
+
+class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
+
+    # the Edmiston-Ruedenberg cost function is maximized
+    cost_sign = -1.0
 
 
 if hasattr(lo, "FourthMoment"):
 
-    class FourthMomentOTR(lo.FourthMoment, BoysOTR):
+    class FourthMomentOTR(LocalizerOTR, lo.FourthMoment):
         pass
 
 else:
