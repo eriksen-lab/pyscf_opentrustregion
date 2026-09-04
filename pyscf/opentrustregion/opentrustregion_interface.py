@@ -55,6 +55,31 @@ s_gek_setting_fields = [
     field[0] for field in SGEKSettingsC._fields_ if field[0] != "initialized"
 ]
 
+# the solver and stability settings share several field names, so a setting meant for
+# the solver would otherwise leak into the stability check. These fields are therefore
+# only ever taken from a separate, explicitly stability-specific attribute
+stability_setting_aliases = {
+    "conv_tol": "stability_conv_tol",
+    "n_random_trial_vectors": "stability_n_random_trial_vectors",
+}
+
+
+def assign_stability_settings(obj, stability_settings) -> None:
+    """
+    this function copies the stability check settings from an object onto a stability
+    settings object
+    """
+    for setting in stability_setting_fields:
+        if setting in stability_setting_aliases:
+            alias = stability_setting_aliases[setting]
+            if hasattr(obj, alias):
+                setattr(stability_settings, setting, getattr(obj, alias))
+        elif hasattr(obj, setting) and (
+            setting != "conv_check"
+            or not isinstance(getattr(obj, "conv_check", None), bool)
+        ):
+            setattr(stability_settings, setting, getattr(obj, setting))
+
 
 class OTR:
     _keys = set(
@@ -71,6 +96,9 @@ class OTR:
             "saved_hess_x",
             "n_update_orbs",
             "n_hess_x",
+            "n_hess_x_stability",
+            "stability_conv_tol",
+            "stability_n_random_trial_vectors",
             "oao",
             "oao_update_orbs_called",
             "arh",
@@ -86,6 +114,7 @@ class OTR:
         self.saved_hess_x = None
         self.n_update_orbs = 0
         self.n_hess_x = 0
+        self.n_hess_x_stability = 0
 
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
@@ -97,16 +126,11 @@ class OTR:
 
         # initialize settings
         settings = StabilitySettings()
-        for setting in stability_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings, setting, getattr(self, setting))
+        assign_stability_settings(self, settings)
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
-        stable = stability_check(h_diag, hess_x, self.n_param, settings, direction)
+        stable, _ = stability_check(h_diag, hess_x, self.n_param, settings, direction)
 
         return stable, direction
 
@@ -193,12 +217,7 @@ class BoysOTR(OTR, lo.Boys):
                 or not isinstance(getattr(self, "conv_check", None), bool)
             ):
                 setattr(settings, setting, getattr(self, setting))
-        for setting in stability_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings.stability_settings, setting, getattr(self, setting))
+        assign_stability_settings(self, settings.stability_settings)
 
         # call solver
         solver(self.func, self.update_orbs, self.n_param, settings)
@@ -408,12 +427,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 and setting != "modify_step"
             ) or (setting == "modify_step" and self.pseudo_canonicalization):
                 setattr(settings, setting, getattr(self, setting))
-        for setting in stability_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings.stability_settings, setting, getattr(self, setting))
+        assign_stability_settings(self, settings.stability_settings)
 
         # set default values for OTR extensions
         if hasattr(self, "arh") and self.arh:
@@ -510,7 +524,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     setattr(arh_settings, setting, getattr(self, setting))
             if hasattr(self, "arh_type"):
                 arh_settings.arh_type = self.arh_type
-                settings.hess_symm = not self.arh_type == "arh"
+                settings.hess_symm = self.arh_type.lower() != "arh"
             else:
                 settings.hess_symm = True
             (
@@ -584,24 +598,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             )
 
         # accelerate stability check with approximate Hessian information
-        if (
-            self.hess_update_scheme is not None or self.arh or self.s_gek
-        ) and self.stability:
+        if self.stability:
             kappa = np.zeros(self.n_param, dtype=np.float64)
             grad = np.empty(self.n_param, dtype=np.float64)
             h_diag = np.empty(self.n_param, dtype=np.float64)
-            settings.stability_hess_x = self.update_orbs(kappa, grad, h_diag)[1]
-            if (
-                not hasattr(self, "diag_solver")
-                and hasattr(settings, "hess_symm")
-                and settings.hess_symm
-            ):
-                settings.stability_settings.diag_solver = "jacobi-davidson"
-                settings.stability_settings.jacobi_davidson_start = 0
-            if settings.stability_settings.diag_solver == "jacobi-davidson":
-                settings.stability_settings.approx_hess_x = self.approx_update_orbs(
-                    kappa, grad, h_diag
-                )[1]
+            raw_stability_hess_x = self.update_orbs(kappa, grad, h_diag)[1]
+
+            def wrapped_stability_hess_x(x, hx):
+                raw_stability_hess_x(x, hx)
+                self.n_hess_x_stability += 1
+
+            settings.stability_hess_x = wrapped_stability_hess_x
 
         # call solver
         solver(
