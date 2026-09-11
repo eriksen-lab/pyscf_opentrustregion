@@ -12,22 +12,107 @@ from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
 from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
 from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
+from ctypes import Structure
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Tuple, Callable, Optional, Union
 
 
-solver_setting_fields = [
-    field[0] for field in SolverSettingsC._fields_ if field[0] != "initialized"
-]
-stability_setting_fields = [
-    field[0] for field in StabilitySettingsC._fields_ if field[0] != "initialized"
-]
+def setting_fields(settings_c: type[Structure]) -> list[str]:
+    """
+    this function collects the settings a user can assign on a settings object,
+    skipping the initialization flag and any nested settings structure
+    """
+    return [
+        field[0]
+        for field in settings_c._fields_
+        if field[0] != "initialized"
+        and not (isinstance(field[1], type) and issubclass(field[1], Structure))
+    ]
+
+
+solver_setting_fields = setting_fields(SolverSettingsC)
+stability_setting_fields = setting_fields(StabilitySettingsC)
+
+# PySCF uses these field names itself, so their values are inherited from PySCF rather
+# than chosen for the solver and must not silently override the solver's own defaults
+solver_settings_shadowed_by_pyscf = ("conv_tol",)
+
+# the solver and stability settings share several field names, so a setting meant for
+# the solver would otherwise leak into the stability check. These fields are therefore
+# only ever taken from a separate, explicitly stability-specific attribute
+stability_setting_aliases = {
+    "conv_tol": "stability_conv_tol",
+    "n_random_trial_vectors": "stability_n_random_trial_vectors",
+    "jacobi_davidson_start": "stability_jacobi_davidson_start",
+}
+
+
+def setting_was_set_by_user(obj, name) -> bool:
+    """
+    this function decides whether a setting whose name PySCF also uses was set
+    deliberately, by comparing it against the value recorded when the object was
+    constructed
+    """
+    if not hasattr(obj, name):
+        return False
+    inherited = getattr(obj, "_inherited_settings", {})
+    if name not in inherited:
+        return True
+    return getattr(obj, name) != inherited[name]
+
+
+def assign_stability_settings(obj, stability_settings) -> None:
+    """
+    this function copies the stability check settings from an object onto a stability
+    settings object
+    """
+    for setting in stability_setting_fields:
+        if setting in stability_setting_aliases:
+            alias = stability_setting_aliases[setting]
+            if hasattr(obj, alias):
+                setattr(stability_settings, setting, getattr(obj, alias))
+        elif hasattr(obj, setting):
+            setattr(stability_settings, setting, getattr(obj, setting))
+
+
+def assign_solver_settings(obj, settings) -> None:
+    """
+    this function copies the solver settings from an object onto a solver settings
+    object, along with the settings of the stability check the solver runs itself
+    """
+    for setting in solver_setting_fields:
+        if setting in solver_settings_shadowed_by_pyscf:
+            if setting_was_set_by_user(obj, setting):
+                setattr(settings, setting, getattr(obj, setting))
+        elif hasattr(obj, setting) and (
+            setting != "conv_check"
+            or not isinstance(getattr(obj, "conv_check", None), bool)
+        ):
+            setattr(settings, setting, getattr(obj, setting))
+    assign_stability_settings(obj, settings.stability_settings)
 
 
 class OTR:
-    _keys = set(solver_setting_fields + stability_setting_fields)
+    _keys = set(
+        solver_setting_fields
+        + stability_setting_fields
+        + list(stability_setting_aliases.values())
+        + ["_inherited_settings"]
+    )
+
+    def _snapshot_shadowed_settings(self) -> None:
+        """
+        this function records the settings whose names PySCF also uses, so that a later
+        assignment can be told apart from a value inherited from PySCF; it must run
+        after any copying of another object's attributes
+        """
+        self._inherited_settings = {
+            name: getattr(self, name)
+            for name in solver_settings_shadowed_by_pyscf
+            if hasattr(self, name)
+        }
 
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
@@ -39,9 +124,7 @@ class OTR:
 
         # initialize settings
         settings = StabilitySettings()
-        for setting in stability_setting_fields:
-            if hasattr(self, setting):
-                setattr(settings, setting, getattr(self, setting))
+        assign_stability_settings(self, settings)
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
@@ -52,22 +135,26 @@ class OTR:
 
 class LocalizerOTR(OTR):
     """
-    this class is the OTR driver for the PySCF orbital localizers. This class must 
-    precede the pyscf.lo class in the base list of every concrete localizer below so 
+    this class is the OTR driver for the PySCF orbital localizers. This class must
+    precede the pyscf.lo class in the base list of every concrete localizer below so
     that its kernel takes precedence over the PySCF one.
     """
 
     norb: int
     mo_coeff: np.ndarray
 
-    # sign that turns the PySCF cost function into a minimization objective; PySCF's 
-    # gen_g_hop always returns derivatives of the minimization objective, so only the 
+    # sign that turns the PySCF cost function into a minimization objective; PySCF's
+    # gen_g_hop always returns derivatives of the minimization objective, so only the
     # cost function itself needs this factor
     cost_sign = 1.0
 
     # the boolean stability solver setting shadows the stability() method the PySCF
     # localizers provide; the OTR equivalent is the stability_check() method
     stability = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._snapshot_shadowed_settings()
 
     # unpack matrix
     def unpack(self, kappa: np.ndarray) -> np.ndarray:
@@ -129,12 +216,7 @@ class LocalizerOTR(OTR):
 
         # initialize settings
         settings = SolverSettings()
-        for setting in solver_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings, setting, getattr(self, setting))
+        assign_solver_settings(self, settings)
 
         # call solver
         solver(self.func, self.update_orbs, self.n_param, settings)
@@ -183,6 +265,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def __init__(self, mf: scf.SCF):
         self.__dict__.update(mf.__dict__)
         self._scf = mf
+        self._snapshot_shadowed_settings()
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
@@ -225,14 +308,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if dm is not None:
             if isinstance(dm, str):
                 lib.logger.debug(
-                    self, 
+                    self,
                     f"OpenTrustRegion solver reads density matrix from chkfile {dm}",
                 )
                 dm = self.from_chk(dm)
 
         elif mo_coeff is not None and mo_occ is None:
             lib.logger.warn(
-                self, 
+                self,
                 "Newton solver expects mo_coeff with mo_occ as initial guess but "
                 "mo_occ is not found in the arguments.",
             )
@@ -281,7 +364,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             vhf = self._scf.get_veff(mol, dm, dm_last=self.dm, vhf_last=self.vhf)
             self.dm, self.vhf = dm, vhf
 
-        self.mo_coeff, self.mo_occ = mo_coeff, mo_occ
+        self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
+
+        # fix phases of MO coefficients to improve deterministic behavior
+        self.fix_phase()
 
         # get indices of all mixed occupation combinations
         self.mask, self.mask_symm = self.get_indices()
@@ -291,12 +377,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # initialize settings
         settings = SolverSettings()
-        for setting in solver_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings, setting, getattr(self, setting))
+        assign_solver_settings(self, settings)
 
         # call solver
         solver(self.func, self.update_orbs, self.n_param, settings)
@@ -318,6 +399,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
+
+    # fix phases of MO coefficients to improve deterministic behavior
+    def fix_phase(self):
+        abs_mo_coeff = np.abs(self.mo_coeff)
+        max_mo_coeff = np.max(abs_mo_coeff, axis=0)
+        mask = np.isclose(abs_mo_coeff, max_mo_coeff, atol=1e-12)
+        idx = np.argmax(mask, axis=0)
+        cols = np.arange(self.mo_coeff.shape[1])
+        vals = self.mo_coeff[idx, cols]
+        signs = np.sign(vals)
+        signs[signs == 0] = 1
+        self.mo_coeff *= signs[np.newaxis, :]
 
     # get indices of all mixed occupation combinations
     def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -345,11 +438,25 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
 class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
+    fix_phase = RHFOTR.fix_phase
     get_indices = RHFOTR.get_indices
     unpack = RHFOTR.unpack
 
 
 class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
+
+    # fix phases of MO coefficients to improve deterministic behavior
+    def fix_phase(self):
+        abs_mo_coeff = np.abs(self.mo_coeff)
+        max_mo_coeff = np.max(abs_mo_coeff, axis=1)
+        for i in range(2):
+            mask = np.isclose(abs_mo_coeff[i], max_mo_coeff[i], atol=1e-12)
+            idx = np.argmax(mask, axis=0)
+            cols = np.arange(self.mo_coeff.shape[2])
+            vals = self.mo_coeff[i, idx, cols]
+            signs = np.sign(vals)
+            signs[signs == 0] = 1
+            self.mo_coeff[i] *= signs[np.newaxis, :]
 
     # get indices of all mixed occupation combinations
     def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -409,6 +516,8 @@ def mf_to_otr(mf):
     if hasattr(mf, "stability") and callable(mf.stability):
         mf.stability = None
 
+    mf._snapshot_shadowed_settings()
+
     return mf
 
 
@@ -432,6 +541,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         self.mo_energy = self._scf.mo_energy
         self.converged = False
         self._max_stepsize = None
+        self._snapshot_shadowed_settings()
 
     # energy function
     def func(self, x):
@@ -523,12 +633,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         # initialize settings
         settings = SolverSettings()
-        for setting in solver_setting_fields:
-            if hasattr(self, setting) and (
-                setting != "conv_check"
-                or not isinstance(getattr(self, "conv_check", None), bool)
-            ):
-                setattr(settings, setting, getattr(self, setting))
+        assign_solver_settings(self, settings)
 
         # call solver
         solver(self.func, self.update_orbs, self.n_param, settings)
@@ -566,12 +671,13 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 def casscf_to_otr(casscf):
     if isinstance(casscf, CASSCFOTR):
         return casscf
-    
+
     if not isinstance(casscf, newton_casscf.CASSCF):
         casscf = casscf.newton()
 
     casscf_otr = CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas)
     casscf_otr.__dict__.update(casscf.__dict__)
+    casscf_otr._snapshot_shadowed_settings()
 
     if isinstance(casscf, addons.StateAverageMCSCFSolver):
         wfnsym = getattr(casscf, "wfnsym", None)
