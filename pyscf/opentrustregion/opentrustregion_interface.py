@@ -141,6 +141,7 @@ class OTR:
             "saved_h_diag",
             "saved_hess_x",
             "saved_state",
+            "raw_hess_x",
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
@@ -165,6 +166,19 @@ class OTR:
     n_update_orbs = 0
     n_hess_x = 0
     n_hess_x_stability = 0
+
+    # Hessian linear transformation of the last orbital update
+    raw_hess_x = None
+
+    # Hessian linear transformation performed for the solver
+    def count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self.raw_hess_x(x, hx)
+        self.n_hess_x += 1
+
+    # Hessian linear transformation performed for a stability check
+    def count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self.raw_hess_x(x, hx)
+        self.n_hess_x_stability += 1
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
@@ -212,7 +226,7 @@ class OTR:
         kappa = np.zeros(self.n_param, dtype=np.float64)
         grad = np.empty(self.n_param, dtype=np.float64)
         h_diag = np.empty(self.n_param, dtype=np.float64)
-        _, hess_x = self.update_orbs(kappa, grad, h_diag)
+        self.update_orbs(kappa, grad, h_diag)
 
         # initialize settings
         settings = StabilitySettings()
@@ -220,7 +234,9 @@ class OTR:
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
-        stable, _ = stability_check(h_diag, hess_x, self.n_param, settings, direction)
+        stable, _ = stability_check(
+            h_diag, self.count_stability_hess_x, self.n_param, settings, direction
+        )
 
         return stable, direction
 
@@ -282,11 +298,12 @@ class LocalizerOTR(OTR):
         grad[:] = self.saved_grad
         h_diag[:] = self.saved_h_diag
 
-        def hess_x(x, hx):
+        def raw_hess_x(x, hx):
             hx[:] = self.saved_hess_x(x)
-            self.n_hess_x += 1
 
-        return self.cost_sign * self.saved_func, hess_x
+        self.raw_hess_x = raw_hess_x
+
+        return self.cost_sign * self.saved_func, self.count_hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -406,13 +423,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         grad[:] = 2 * self.saved_grad[self.kappa_mask]
         h_diag[:] = 2 * self.saved_h_diag[self.kappa_mask]
 
-        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
+        def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             x_full = np.zeros_like(self.kappa_mask, dtype=np.float64)
             x_full[self.kappa_mask] = x
             hx[:] = 2 * self.saved_hess_x(x_full)[self.kappa_mask]
-            self.n_hess_x += 1
 
-        return self.saved_func, hess_x
+        self.raw_hess_x = raw_hess_x
+
+        return self.saved_func, self.count_hess_x
 
     # kernel function
     def kernel(
@@ -568,12 +586,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 if np.sum(np.abs(kappa)) > 0.0 or not self.oao_update_orbs_called:
                     self.n_update_orbs += 1
                 self.oao_update_orbs_called = True
+                self.raw_hess_x = hess_x
 
-                def wrapped_hess_x(x, hx):
-                    hess_x(x, hx)
-                    self.n_hess_x += 1
-
-                return func, wrapped_hess_x
+                return func, self.count_hess_x
 
             self.update_orbs = wrapped_update_orbs
 
@@ -665,13 +680,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             kappa = np.zeros(self.n_param, dtype=np.float64)
             grad = np.empty(self.n_param, dtype=np.float64)
             h_diag = np.empty(self.n_param, dtype=np.float64)
-            raw_stability_hess_x = self.update_orbs(kappa, grad, h_diag)[1]
+            self.update_orbs(kappa, grad, h_diag)
 
-            def wrapped_stability_hess_x(x, hx):
-                raw_stability_hess_x(x, hx)
-                self.n_hess_x_stability += 1
-
-            settings.stability_hess_x = wrapped_stability_hess_x
+            settings.stability_hess_x = self.count_stability_hess_x
 
         # call solver
         solver(
@@ -1710,11 +1721,12 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         grad[:] = 2 * self.saved_grad
         h_diag[:] = 2 * self.saved_h_diag
 
-        def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
+        def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             hx[:] = 2 * self.saved_hess_x(x)
-            self.n_hess_x += 1
 
-        return self.saved_func, hess_x
+        self.raw_hess_x = raw_hess_x
+
+        return self.saved_func, self.count_hess_x
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         if mo_coeff is None:
