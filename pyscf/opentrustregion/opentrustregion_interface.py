@@ -105,34 +105,52 @@ class OTR:
             "saved_grad",
             "saved_h_diag",
             "saved_hess_x",
+            "saved_state",
             "n_update_orbs",
             "n_hess_x",
         ]
     )
 
     # cached result of the last orbital update, reused when the solver asks for the
-    # same point again
+    # same point again, together with the point it was computed at
     saved_func = None
     saved_grad = None
     saved_h_diag = None
     saved_hess_x = None
+    saved_state = None
 
     # orbital updates and Hessian linear transformations performed on this object,
     # accumulated over its lifetime
     n_update_orbs = 0
     n_hess_x = 0
 
-    def _invalidate_orbs_cache(self) -> None:
+    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
-        this function discards the cached orbital update. It has to run whenever the
-        orbitals are changed by anything other than update_orbs itself, since the
-        cached objective function, gradient, Hessian diagonal and Hessian linear
-        transformation only describe the orbitals they were computed at
+        this function returns the arrays that define the point a cached orbital update
+        describes, so that the cache can tell whether it still applies
         """
-        self.saved_func = None
-        self.saved_grad = None
-        self.saved_h_diag = None
-        self.saved_hess_x = None
+        return (self.mo_coeff,)
+
+    def _cache_is_valid(self) -> bool:
+        """
+        this function checks whether the cached orbital update still describes the
+        current point. A zero step alone is not enough, since a kernel can move the
+        orbitals after the solver has returned, for instance by canonicalizing them
+        """
+        if self.saved_state is None:
+            return False
+        state = self._orbs_state()
+        return len(state) == len(self.saved_state) and all(
+            np.array_equal(saved, current)
+            for saved, current in zip(self.saved_state, state)
+        )
+
+    def _save_orbs_state(self) -> None:
+        """
+        this function records the point a cached orbital update was computed at, as
+        copies, since the orbitals are also updated in place
+        """
+        self.saved_state = tuple(np.copy(array) for array in self._orbs_state())
 
     def _snapshot_shadowed_settings(self) -> None:
         """
@@ -205,9 +223,9 @@ class LocalizerOTR(OTR):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        # a zero step leaves the orbitals untouched, so a cached update still describes
-        # them and the cost function and its derivatives need not be recomputed
-        if np.any(kappa) or self.saved_hess_x is None:
+        # reuse the cached update when the step is zero and nothing has moved the
+        # orbitals since, so the cost function and its derivatives still apply
+        if np.any(kappa) or not self._cache_is_valid():
             u = ciah.expmat(self.unpack(kappa))
             self.saved_func = self.cost_function(u)
             (
@@ -217,6 +235,7 @@ class LocalizerOTR(OTR):
             ) = self.gen_g_hop(u)
             self.mo_coeff = self.mo_coeff @ u
             self.n_update_orbs += 1
+            self._save_orbs_state()
 
         grad[:] = self.saved_grad
         h_diag[:] = self.saved_h_diag
@@ -255,7 +274,6 @@ class LocalizerOTR(OTR):
         else:
             u0 = self.get_init_guess(None)
         self.mo_coeff = self.mo_coeff @ u0
-        self._invalidate_orbs_cache()
 
         # initialize settings
         settings = SolverSettings()
@@ -322,9 +340,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        # a zero step leaves the orbitals untouched, so a cached update still describes
-        # them and the effective potential and Fock matrix need not be rebuilt
-        if np.any(kappa) or self.saved_hess_x is None:
+        # reuse the cached update when the step is zero and nothing has moved the
+        # orbitals since, so the effective potential and Fock matrix need not be rebuilt
+        if np.any(kappa) or not self._cache_is_valid():
             u = self.exp_mat(self.unpack(kappa))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
@@ -338,6 +356,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             ) = self.gen_g_hop(self.mo_coeff, self.mo_occ, fock)
             self.saved_func = self._scf.energy_tot(dm, self.h1e, vhf)
             self.n_update_orbs += 1
+            self._save_orbs_state()
 
         grad[:] = 2 * self.saved_grad[self.mask_symm]
         h_diag[:] = 2 * self.saved_h_diag[self.mask_symm]
@@ -420,7 +439,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # fix phases of MO coefficients to improve deterministic behavior
         self.fix_phase()
-        self._invalidate_orbs_cache()
 
         # get indices of all mixed occupation combinations
         self.mask, self.mask_symm = self.get_indices()
@@ -445,7 +463,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.mo_energy, self.mo_coeff = self._scf.canonicalize(
             self.mo_coeff, self.mo_occ, fock
         )
-        self._invalidate_orbs_cache()
 
         self._finalize()
 
@@ -618,11 +635,16 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         return self.casci(rot_mo_coeff, ci, eris)[0]
 
+    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
+        if self.fcisolver.nroots == 1:
+            return (self.mo_coeff, self.ci)
+        return (self.mo_coeff, *self.ci)
+
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(self, x, grad, h_diag):
-        # a zero step leaves the orbitals and the CI vector untouched, so a cached
-        # update still describes them and the integrals need not be transformed again
-        if np.any(x) or self.saved_hess_x is None:
+        # reuse the cached update when the step is zero and nothing has moved the
+        # orbitals or CI vector since, so the integrals need not be transformed again
+        if np.any(x) or not self._cache_is_valid():
             u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             eris = self.ao2mo(self.mo_coeff)
@@ -650,6 +672,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             ) = newton_casscf.gen_g_hop(self, self.mo_coeff, ci, eris)
             self.saved_func = self.casci(self.mo_coeff, self.ci, eris)[0]
             self.n_update_orbs += 1
+            self._save_orbs_state()
 
         grad[:] = 2 * self.saved_grad
         h_diag[:] = 2 * self.saved_h_diag
@@ -678,8 +701,6 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             self.ci = fcivec.ravel()
         else:
             self.ci = [c.ravel() for c in fcivec]
-
-        self._invalidate_orbs_cache()
 
         # number of unique orbital rotation parameters
         self.n_param_orb = np.count_nonzero(
@@ -721,7 +742,6 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             )
         else:
             self.mo_energy = None
-        self._invalidate_orbs_cache()
 
         self._finalize()
 
