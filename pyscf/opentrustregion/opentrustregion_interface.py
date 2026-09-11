@@ -99,8 +99,40 @@ class OTR:
         solver_setting_fields
         + stability_setting_fields
         + list(stability_setting_aliases.values())
-        + ["_inherited_settings"]
+        + [
+            "_inherited_settings",
+            "saved_func",
+            "saved_grad",
+            "saved_h_diag",
+            "saved_hess_x",
+            "n_update_orbs",
+            "n_hess_x",
+        ]
     )
+
+    # cached result of the last orbital update, reused when the solver asks for the
+    # same point again
+    saved_func = None
+    saved_grad = None
+    saved_h_diag = None
+    saved_hess_x = None
+
+    # orbital updates and Hessian linear transformations performed on this object,
+    # accumulated over its lifetime
+    n_update_orbs = 0
+    n_hess_x = 0
+
+    def _invalidate_orbs_cache(self) -> None:
+        """
+        this function discards the cached orbital update. It has to run whenever the
+        orbitals are changed by anything other than update_orbs itself, since the
+        cached objective function, gradient, Hessian diagonal and Hessian linear
+        transformation only describe the orbitals they were computed at
+        """
+        self.saved_func = None
+        self.saved_grad = None
+        self.saved_h_diag = None
+        self.saved_hess_x = None
 
     def _snapshot_shadowed_settings(self) -> None:
         """
@@ -173,17 +205,27 @@ class LocalizerOTR(OTR):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        u = ciah.expmat(self.unpack(kappa))
-        func = self.cost_function(u)
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(u)
-        grad[:] = grad_full
-        h_diag[:] = h_diag_full
-        self.mo_coeff = self.mo_coeff @ u
+        # a zero step leaves the orbitals untouched, so a cached update still describes
+        # them and the cost function and its derivatives need not be recomputed
+        if np.any(kappa) or self.saved_hess_x is None:
+            u = ciah.expmat(self.unpack(kappa))
+            self.saved_func = self.cost_function(u)
+            (
+                self.saved_grad,
+                self.saved_hess_x,
+                self.saved_h_diag,
+            ) = self.gen_g_hop(u)
+            self.mo_coeff = self.mo_coeff @ u
+            self.n_update_orbs += 1
+
+        grad[:] = self.saved_grad
+        h_diag[:] = self.saved_h_diag
 
         def hess_x(x, hx):
-            hx[:] = hess_x_full(x)
+            hx[:] = self.saved_hess_x(x)
+            self.n_hess_x += 1
 
-        return self.cost_sign * func, hess_x
+        return self.cost_sign * self.saved_func, hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -213,6 +255,7 @@ class LocalizerOTR(OTR):
         else:
             u0 = self.get_init_guess(None)
         self.mo_coeff = self.mo_coeff @ u0
+        self._invalidate_orbs_cache()
 
         # initialize settings
         settings = SolverSettings()
@@ -269,7 +312,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
-        u = ciah.expmat(self.unpack(kappa))
+        u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
@@ -279,24 +322,33 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
-        u = ciah.expmat(self.unpack(kappa))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, dm)
-        self.dm, self.vhf = dm, vhf
-        fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
-        grad_full, hess_x_full, h_diag_full = self.gen_g_hop(
-            self.mo_coeff, self.mo_occ, fock
-        )
-        grad[:] = 2 * grad_full[self.mask_symm]
-        h_diag[:] = 2 * h_diag_full[self.mask_symm]
+        # a zero step leaves the orbitals untouched, so a cached update still describes
+        # them and the effective potential and Fock matrix need not be rebuilt
+        if np.any(kappa) or self.saved_hess_x is None:
+            u = self.exp_mat(self.unpack(kappa))
+            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+            dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
+            vhf = self._scf.get_veff(self._scf.mol, dm)
+            self.dm, self.vhf = dm, vhf
+            fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
+            (
+                self.saved_grad,
+                self.saved_hess_x,
+                self.saved_h_diag,
+            ) = self.gen_g_hop(self.mo_coeff, self.mo_occ, fock)
+            self.saved_func = self._scf.energy_tot(dm, self.h1e, vhf)
+            self.n_update_orbs += 1
+
+        grad[:] = 2 * self.saved_grad[self.mask_symm]
+        h_diag[:] = 2 * self.saved_h_diag[self.mask_symm]
 
         def hess_x_symm(x, hx):
             x_full = np.zeros_like(self.mask_symm, dtype=np.float64)
             x_full[self.mask_symm] = x
-            hx[:] = 2 * hess_x_full(x_full)[self.mask_symm]
+            hx[:] = 2 * self.saved_hess_x(x_full)[self.mask_symm]
+            self.n_hess_x += 1
 
-        return self._scf.energy_tot(dm, self.h1e, vhf), hess_x_symm
+        return self.saved_func, hess_x_symm
 
     # kernel function
     def kernel(
@@ -368,6 +420,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # fix phases of MO coefficients to improve deterministic behavior
         self.fix_phase()
+        self._invalidate_orbs_cache()
 
         # get indices of all mixed occupation combinations
         self.mask, self.mask_symm = self.get_indices()
@@ -392,6 +445,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.mo_energy, self.mo_coeff = self._scf.canonicalize(
             self.mo_coeff, self.mo_occ, fock
         )
+        self._invalidate_orbs_cache()
 
         self._finalize()
 
@@ -429,6 +483,10 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         return mask, mask_symm
 
+    # function to compute exponential of anti-symmetric matrix
+    def exp_mat(self, matrix):
+        return ciah.expmat(matrix)
+
     # unpack matrix
     def unpack(self, kappa):
         matrix = np.zeros(2 * (self.mol.nao,), dtype=np.float64)
@@ -440,6 +498,7 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
     fix_phase = RHFOTR.fix_phase
     get_indices = RHFOTR.get_indices
+    exp_mat = RHFOTR.exp_mat
     unpack = RHFOTR.unpack
 
 
@@ -477,25 +536,20 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         return mask, mask_symm
 
-    def rotate_mo(self, mo_coeff, u):
-        return super().rotate_mo(
-            mo_coeff,
-            (
-                u[: self.mol.nao, : self.mol.nao],
-                u[self.mol.nao :, self.mol.nao :],
-            ),
-        )
+    # function to compute exponential of anti-symmetric matrix
+    def exp_mat(self, matrix):
+        return [ciah.expmat(matrix[0]), ciah.expmat(matrix[1])]
 
     # unpack matrix
     def unpack(self, kappa):
-        matrix = np.zeros(2 * (2 * self.mol.nao,), dtype=np.float64)
-        matrix[: self.mol.nao, : self.mol.nao][self.mask[0]] = kappa[
-            : np.count_nonzero(self.mask[0])
+        n_param_a = np.count_nonzero(self.mask[0])
+        matrices = [
+            np.zeros(2 * (self.mol.nao,), dtype=np.float64),
+            np.zeros(2 * (self.mol.nao,), dtype=np.float64),
         ]
-        matrix[self.mol.nao :, self.mol.nao :][self.mask[1]] = kappa[
-            np.count_nonzero(self.mask[0]) :
-        ]
-        return matrix - matrix.T
+        matrices[0][self.mask[0]] = kappa[:n_param_a]
+        matrices[1][self.mask[1]] = kappa[n_param_a:]
+        return [matrix - matrix.T for matrix in matrices]
 
 
 def mf_to_otr(mf):
@@ -566,35 +620,45 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(self, x, grad, h_diag):
-        u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        eris = self.ao2mo(self.mo_coeff)
+        # a zero step leaves the orbitals and the CI vector untouched, so a cached
+        # update still describes them and the integrals need not be transformed again
+        if np.any(x) or self.saved_hess_x is None:
+            u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
+            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+            eris = self.ao2mo(self.mo_coeff)
 
-        idx_start = self.n_param_orb
-        if self.fcisolver.nroots == 1:
-            ci = self.ci + x[idx_start:]
-            ci /= np.linalg.norm(ci)
-            self.ci = ci
-        else:
-            ci = []
-            for c in self.ci:
-                idx_stop = idx_start + c.size
-                ci.append(c + x[idx_start:idx_stop])
-                ci[-1] /= np.linalg.norm(ci[-1])
-                idx_start = idx_stop
-            self.ci = ci
-            ci = [c.ravel() for c in ci]
+            idx_start = self.n_param_orb
+            if self.fcisolver.nroots == 1:
+                ci = self.ci + x[idx_start:]
+                ci /= np.linalg.norm(ci)
+                self.ci = ci
+            else:
+                ci = []
+                for c in self.ci:
+                    idx_stop = idx_start + c.size
+                    ci.append(c + x[idx_start:idx_stop])
+                    ci[-1] /= np.linalg.norm(ci[-1])
+                    idx_start = idx_stop
+                self.ci = ci
+                ci = [c.ravel() for c in ci]
 
-        grad_full, _, hess_x_full, h_diag_full = newton_casscf.gen_g_hop(
-            self, self.mo_coeff, ci, eris
-        )
-        grad[:] = 2 * grad_full
-        h_diag[:] = 2 * h_diag_full
+            (
+                self.saved_grad,
+                _,
+                self.saved_hess_x,
+                self.saved_h_diag,
+            ) = newton_casscf.gen_g_hop(self, self.mo_coeff, ci, eris)
+            self.saved_func = self.casci(self.mo_coeff, self.ci, eris)[0]
+            self.n_update_orbs += 1
+
+        grad[:] = 2 * self.saved_grad
+        h_diag[:] = 2 * self.saved_h_diag
 
         def hess_x(x, hx):
-            hx[:] = 2 * hess_x_full(x)
+            hx[:] = 2 * self.saved_hess_x(x)
+            self.n_hess_x += 1
 
-        return self.casci(self.mo_coeff, self.ci, eris)[0], hess_x
+        return self.saved_func, hess_x
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
         if mo_coeff is None:
@@ -614,6 +678,8 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             self.ci = fcivec.ravel()
         else:
             self.ci = [c.ravel() for c in fcivec]
+
+        self._invalidate_orbs_cache()
 
         # number of unique orbital rotation parameters
         self.n_param_orb = np.count_nonzero(
@@ -655,6 +721,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             )
         else:
             self.mo_energy = None
+        self._invalidate_orbs_cache()
 
         self._finalize()
 

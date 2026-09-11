@@ -3,12 +3,12 @@ from pyscf.opentrustregion import casscf_to_otr
 
 # define molecule
 mol = gto.M(
-    atom = """
+    atom="""
         N  0.000000  0.000000  0.7
         N  0.000000  0.000000 -0.7
     """,
-    basis = "cc-pVDZ",
-    symmetry = False,
+    basis="cc-pVDZ",
+    symmetry=False,
 )
 
 # perform HF calculation
