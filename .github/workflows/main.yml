@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'ci-debug/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      opentrustregion_ref:
+        description: "OpenTrustRegion ref to build against"
+        default: main
+  # the interface is built against whatever OpenTrustRegion main currently is, so a
+  # scheduled run catches upstream changes that break it between pull requests
+  schedule:
+    - cron: '0 5 * * 1'
+
+jobs:
+  formatting:
+    name: "Formatting • black"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout interface
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Install black
+        run: pip install black==25.1.0
+
+      - name: Check Python formatting
+        run: black --check --diff pyscf examples
+
+  test:
+    name: "Test • Python ${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Checkout interface
+        uses: actions/checkout@v7
+
+      - name: Checkout OpenTrustRegion
+        uses: actions/checkout@v7
+        with:
+          repository: eriksen-lab/opentrustregion
+          ref: ${{ github.event.inputs.opentrustregion_ref || 'main' }}
+          path: opentrustregion
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran cmake libopenblas-dev liblapack-dev
+
+      - name: Build and install OpenTrustRegion
+        working-directory: opentrustregion
+        run: pip install .
+
+      - name: Report the library ctypes loaded
+        run: |
+          python -c "
+          from pyopentrustregion import python_interface
+          print('loaded:', python_interface.lib._name)"
+
+      - name: Run the OpenTrustRegion testsuite
+        run: python -m pyopentrustregion.testsuite
+
+      - name: Install PySCF
+        run: pip install pyscf
+
+      - name: Type check
+        run: |
+          pip install mypy==2.3.1
+          mypy pyscf
+
+      - name: Run the interface tests
+        env:
+          PYSCF_EXT_PATH: ${{ github.workspace }}
+        run: |
+          python -m unittest -v \
+            pyscf.opentrustregion.test.test_opentrustregion_interface
+
+      - name: Run the examples
+        working-directory: examples
+        env:
+          PYSCF_EXT_PATH: ${{ github.workspace }}
+        run: |
+          for example in *.py; do
+            echo "::group::${example}"
+            python "${example}"
+            echo "::endgroup::"
+          done
