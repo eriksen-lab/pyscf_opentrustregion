@@ -67,6 +67,8 @@ solver_settings_shadowed_by_pyscf = ("conv_tol",)
 stability_setting_aliases = {
     "conv_tol": "stability_conv_tol",
     "n_random_trial_vectors": "stability_n_random_trial_vectors",
+    "n_extra_trial_vectors": "stability_n_extra_trial_vectors",
+    "get_extra_trial_vectors": "stability_get_extra_trial_vectors",
     "jacobi_davidson_start": "stability_jacobi_davidson_start",
 }
 
@@ -142,9 +144,11 @@ class OTR:
             "saved_hess_x",
             "saved_state",
             "raw_hess_x",
+            "raw_approx_update_orbs",
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
+            "get_extra_trial_vectors",
             "oao",
             "oao_update_orbs_called",
             "arh",
@@ -170,6 +174,10 @@ class OTR:
     # Hessian linear transformation of the last orbital update
     raw_hess_x = None
 
+    # the approximate orbital updating object before the counting wrapper, when the
+    # solver optimizes with an approximate Hessian
+    raw_approx_update_orbs = None
+
     # Hessian linear transformation performed for the solver
     def count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         self.raw_hess_x(x, hx)
@@ -179,6 +187,10 @@ class OTR:
     def count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         self.raw_hess_x(x, hx)
         self.n_hess_x_stability += 1
+
+    # approximate Hessian linear transformation prformed for a stability check
+    def approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self.raw_approx_update_orbs.hess_x(x, hx)
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
@@ -564,7 +576,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in oao_setting_fields:
                 if hasattr(self, setting):
                     setattr(oao_settings, setting, getattr(self, setting))
-            self.func, oao_update_orbs, precond, precond_pd, project = oao_factory(
+            (
+                self.func,
+                oao_update_orbs,
+                precond,
+                precond_pd,
+                project,
+                get_extra_trial_vectors,
+            ) = oao_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -580,6 +599,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 precond
             )
             self.precond_pd = settings.precond_pd = precond_pd
+            self.get_extra_trial_vectors = settings.get_extra_trial_vectors = (
+                settings.stability_settings.get_extra_trial_vectors
+            ) = get_extra_trial_vectors
 
             def wrapped_update_orbs(kappa, grad, h_diag):
                 func, hess_x = oao_update_orbs(kappa, grad, h_diag)
@@ -640,17 +662,20 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 return func, hess_x
 
             self.approx_update_orbs = wrapped_approx_update_orbs
+            self.raw_approx_update_orbs = approx_update_orbs
         elif self.hess_update_scheme is not None:
             qn_settings = QNSettings()
             for setting in qn_setting_fields:
                 if hasattr(self, setting):
                     setattr(qn_settings, setting, getattr(self, setting))
-            self.approx_update_orbs = update_orbs_qn_factory(
-                self.update_orbs,
-                self.transport,
-                self.init_hess,
-                self.n_param,
-                qn_settings,
+            self.approx_update_orbs = self.raw_approx_update_orbs = (
+                update_orbs_qn_factory(
+                    self.update_orbs,
+                    self.transport,
+                    self.init_hess,
+                    self.n_param,
+                    qn_settings,
+                )
             )
         elif self.s_gek:
             if self.pseudo_canonicalization:
@@ -671,11 +696,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in s_gek_setting_fields:
                 if hasattr(self, setting):
                     setattr(s_gek_settings, setting, getattr(self, setting))
-            self.approx_update_orbs = update_orbs_s_gek_factory(
-                self.update_orbs, self.change_reference, self.n_param, s_gek_settings
+            self.approx_update_orbs = self.raw_approx_update_orbs = (
+                update_orbs_s_gek_factory(
+                    self.update_orbs,
+                    self.change_reference,
+                    self.n_param,
+                    s_gek_settings,
+                )
             )
 
-        # accelerate stability check with approximate Hessian information
+        # set (approximate) Hessian linear transformation for stability check
         if self.stability:
             kappa = np.zeros(self.n_param, dtype=np.float64)
             grad = np.empty(self.n_param, dtype=np.float64)
@@ -683,6 +713,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.update_orbs(kappa, grad, h_diag)
 
             settings.stability_hess_x = self.count_stability_hess_x
+            if hasattr(self, "approx_update_orbs"):
+                settings.stability_settings.approx_hess_x = self.approx_stability_hess_x
 
         # call solver
         solver(
