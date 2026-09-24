@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import weakref
 import numpy as np
+from dataclasses import dataclass
 import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
@@ -34,7 +35,7 @@ from ctypes import Structure
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Tuple, Callable, Optional, Union
+    from typing import Any, Tuple, Callable, Optional, Union
 
 
 def setting_fields(settings_c: type[Structure]) -> list[str]:
@@ -48,6 +49,31 @@ def setting_fields(settings_c: type[Structure]) -> list[str]:
         if field[0] != "initialized"
         and not (isinstance(field[1], type) and issubclass(field[1], Structure))
     ]
+
+
+@dataclass(frozen=True, eq=False)
+class LastResult:
+    """
+    this class holds the result computed at the last point, together with copies of the
+    arrays that define that point, so that the result can be reused while the point is
+    unchanged
+    """
+
+    key: Tuple[np.ndarray, ...] = ()
+    value: Any = None
+
+    @classmethod
+    def of(cls, key: Tuple[np.ndarray, ...], value: Any) -> LastResult:
+        return cls(tuple(np.array(array, copy=True) for array in key), value)
+
+    def matches(self, key: Tuple[np.ndarray, ...]) -> bool:
+        return (
+            len(self.key) > 0
+            and len(self.key) == len(key)
+            and all(
+                np.array_equal(saved, current) for saved, current in zip(self.key, key)
+            )
+        )
 
 
 solver_setting_fields = setting_fields(SolverSettingsC)
@@ -131,39 +157,25 @@ class OTR:
     _keys = set(
         solver_setting_fields
         + stability_setting_fields
-        + oao_setting_fields
-        + arh_setting_fields
-        + qn_setting_fields
-        + s_gek_setting_fields
         + list(stability_setting_aliases.values())
         + [
             "_inherited_settings",
-            "saved_func",
-            "saved_grad",
-            "saved_h_diag",
-            "saved_hess_x",
-            "saved_state",
+            "_last_update",
+            "_updated",
             "raw_hess_x",
-            "raw_approx_update_orbs",
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
-            "get_extra_trial_vectors",
-            "oao",
-            "oao_update_orbs_called",
-            "arh",
-            "s_gek",
-            "pseudo_canonicalization",
         ]
     )
 
-    # cached result of the last orbital update, reused when the solver asks for the
-    # same point again, together with the point it was computed at
-    saved_func = None
-    saved_grad = None
-    saved_h_diag = None
-    saved_hess_x = None
-    saved_state = None
+    # the cost function, gradient, Hessian diagonal and Hessian linear transformation
+    # of the last orbital update, keyed by the point they were computed at and reused
+    # when the solver asks for the same point again
+    _last_update = LastResult()
+
+    # whether the current kernel has performed an orbital update yet
+    _updated = False
 
     # orbital updates and Hessian linear transformations performed on this object,
     # accumulated over its lifetime
@@ -171,12 +183,28 @@ class OTR:
     n_hess_x = 0
     n_hess_x_stability = 0
 
+    def _moves(self, kappa: np.ndarray) -> bool:
+        """
+        this function returns whether an orbital update moves the optimization (when it
+        takes a step, and when it is the first of a kernel, which starts the
+        optimization at its initial point) and counts it if so
+        """
+        moves = bool(np.any(kappa)) or not self._updated
+        self._updated = True
+        if moves:
+            self.n_update_orbs += 1
+
+        return moves
+
+    def _reset(self) -> None:
+        """
+        this function discards everything a previous kernel computed
+        """
+        self._updated = False
+        self._last_update = LastResult()
+
     # Hessian linear transformation of the last orbital update
     raw_hess_x = None
-
-    # the approximate orbital updating object before the counting wrapper, when the
-    # solver optimizes with an approximate Hessian
-    raw_approx_update_orbs = None
 
     # Hessian linear transformation performed for the solver
     def count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
@@ -188,37 +216,12 @@ class OTR:
         self.raw_hess_x(x, hx)
         self.n_hess_x_stability += 1
 
-    # approximate Hessian linear transformation prformed for a stability check
-    def approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        self.raw_approx_update_orbs.hess_x(x, hx)
-
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
-        this function returns the arrays that define the point a cached orbital update
-        describes, so that the cache can tell whether it still applies
+        this function returns the arrays that define the point an orbital update
+        describes
         """
         return (self.mo_coeff,)
-
-    def _cache_is_valid(self) -> bool:
-        """
-        this function checks whether the cached orbital update still describes the
-        current point. A zero step alone is not enough, since a kernel can move the
-        orbitals after the solver has returned, for instance by canonicalizing them
-        """
-        if self.saved_state is None:
-            return False
-        state = self._orbs_state()
-        return len(state) == len(self.saved_state) and all(
-            np.array_equal(saved, current)
-            for saved, current in zip(self.saved_state, state)
-        )
-
-    def _save_orbs_state(self) -> None:
-        """
-        this function records the point a cached orbital update was computed at, as
-        copies, since the orbitals are also updated in place
-        """
-        self.saved_state = tuple(np.copy(array) for array in self._orbs_state())
 
     def _snapshot_shadowed_settings(self) -> None:
         """
@@ -295,30 +298,31 @@ class LocalizerOTR(OTR):
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the cost function and its derivatives still apply
-        if np.any(kappa) or not self._cache_is_valid():
+        self._moves(kappa)
+        if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
             u = ciah.expmat(self.unpack(kappa))
-            self.saved_func = self.cost_function(u)
-            (
-                self.saved_grad,
-                self.saved_hess_x,
-                self.saved_h_diag,
-            ) = self.gen_g_hop(u)
+            func = self.cost_function(u)
+            new_grad, hess_x, new_h_diag = self.gen_g_hop(u)
             self.mo_coeff = self.mo_coeff @ u
-            self.n_update_orbs += 1
-            self._save_orbs_state()
+            self._last_update = LastResult.of(
+                self._orbs_state(), (func, new_grad, new_h_diag, hess_x)
+            )
+        func, new_grad, new_h_diag, hess_x = self._last_update.value
 
-        grad[:] = self.saved_grad
-        h_diag[:] = self.saved_h_diag
+        grad[:] = new_grad
+        h_diag[:] = new_h_diag
 
         def raw_hess_x(x, hx):
-            hx[:] = self.saved_hess_x(x)
+            hx[:] = hess_x(x)
 
         self.raw_hess_x = raw_hess_x
 
-        return self.cost_sign * self.saved_func, self.count_hess_x
+        return self.cost_sign * func, self.count_hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
+        # discard anything computed by a previous kernel
+        self._reset()
 
         # set MO coefficients if provided
         if mo_coeff is not None:
@@ -394,11 +398,112 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     dm: np.ndarray
     vhf: np.ndarray
 
+    _keys = set(
+        oao_setting_fields
+        + arh_setting_fields
+        + qn_setting_fields
+        + s_gek_setting_fields
+        + [
+            "_last_potential",
+            "_adopted_potential",
+            "raw_approx_update_orbs",
+            "raw_approx_hess_x",
+            "n_jk_update",
+            "n_jk_energy",
+            "n_jk_response",
+            "n_jk_response_stability",
+            "oao",
+            "arh",
+            "s_gek",
+            "pseudo_canonicalization",
+        ]
+    )
+
+    # two-electron builds the optimization requires for effective potentials and for
+    # the responses of exact Hessian linear transformations
+    n_jk_update = 0
+    n_jk_energy = 0
+    n_jk_response = 0
+    n_jk_response_stability = 0
+
+    @property
+    def n_jk(self) -> int:
+        return self.n_jk_update + self.n_jk_energy + self.n_jk_response
+
+    # the last built and the last adopted effective potential, keyed by their densities
+    _last_potential = LastResult()
+    _adopted_potential = None
+
+    def _build_potential(self, dm: np.ndarray) -> np.ndarray:
+        """
+        this function builds the effective potential at a density
+        """
+        return self._scf.get_veff(self._scf.mol, dm)
+
+    def _potential(self, dm: np.ndarray) -> np.ndarray:
+        """
+        this function returns the effective potential at a density, reusing the last
+        one whenever the density is unchanged
+        """
+        if not self._last_potential.matches((dm,)):
+            self._last_potential = LastResult.of((dm,), self._build_potential(dm))
+            self.n_jk_energy += 1
+
+        return self._last_potential.value
+
+    def _count_update(self) -> None:
+        """
+        this function recounts the last build of the effective potential as one at a
+        density the optimization moves to rather than a pure energy evaluation
+        """
+        if (
+            self._last_potential.key
+            and self._adopted_potential is not self._last_potential
+        ):
+            self._adopted_potential = self._last_potential
+            self.n_jk_energy -= 1
+            self.n_jk_update += 1
+
+    def _reset(self) -> None:
+        super()._reset()
+        self._last_potential = LastResult()
+        self._adopted_potential = None
+
+    # raw and counted orbital updates and (approximate) Hessian linear transformations
+    raw_approx_update_orbs = None
+    raw_approx_hess_x = None
+
+    def count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self.raw_approx_hess_x(x, hx)
+        self.n_hess_x += 1
+
+    def count_approx_update_orbs(self, approx_update_orbs: Callable) -> Callable[
+        [np.ndarray, np.ndarray, np.ndarray],
+        Tuple[float, Callable[[np.ndarray, np.ndarray], None]],
+    ]:
+        def update_orbs(
+            kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+        ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
+            func, self.raw_approx_hess_x = approx_update_orbs(kappa, grad, h_diag)
+            return func, self.count_approx_hess_x
+
+        return update_orbs
+
+    def count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        n_jk_response = self.n_jk_response
+        super().count_stability_hess_x(x, hx)
+        self.n_jk_response_stability += self.n_jk_response - n_jk_response
+
+    def approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        n_jk_response = self.n_jk_response
+        self.raw_approx_update_orbs.hess_x(x, hx)
+        self.n_hess_x_stability += 1
+        self.n_jk_response_stability += self.n_jk_response - n_jk_response
+
     def __init__(self, mf: scf.SCF):
         self.__dict__.update(mf.__dict__)
         self._scf = mf
         self.pseudo_canonicalization = False
-        self.oao_update_orbs_called = False
         self._snapshot_shadowed_settings()
 
     # energy function
@@ -406,7 +511,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, dm)
+        vhf = self._potential(dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
@@ -415,34 +520,38 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the effective potential and Fock matrix need not be rebuilt
-        if np.any(kappa) or not self._cache_is_valid():
+        self._moves(kappa)
+        if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
             # perform orbital rotation and get new fock matrix if not already done in
             # step modification function
             if not self.pseudo_canonicalization:
                 u = self.exp_mat(self.unpack(kappa))
                 self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
                 self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-                self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
+                self.vhf = self._potential(self.dm)
+                self._count_update()
                 self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-            self.saved_func = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
-            self.saved_grad, self.saved_hess_x, self.saved_h_diag = self.gen_g_hop(
+            energy = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
+            new_grad, hess_x, new_h_diag = self.gen_g_hop(
                 self.mo_coeff, self.mo_occ, self.fock
             )
+            self._last_update = LastResult.of(
+                self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
+            )
+        energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
-            self.n_update_orbs += 1
-            self._save_orbs_state()
-
-        grad[:] = 2 * self.saved_grad[self.kappa_mask]
-        h_diag[:] = 2 * self.saved_h_diag[self.kappa_mask]
+        grad[:] = 2 * new_grad[self.kappa_mask]
+        h_diag[:] = 2 * new_h_diag[self.kappa_mask]
 
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             x_full = np.zeros_like(self.kappa_mask, dtype=np.float64)
             x_full[self.kappa_mask] = x
-            hx[:] = 2 * self.saved_hess_x(x_full)[self.kappa_mask]
+            self.n_jk_response += 1
+            hx[:] = 2 * hess_x(x_full)[self.kappa_mask]
 
         self.raw_hess_x = raw_hess_x
 
-        return self.saved_func, self.count_hess_x
+        return energy, self.count_hess_x
 
     # kernel function
     def kernel(
@@ -451,6 +560,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         mo_occ: Optional[np.ndarray] = None,
         dm: Optional[np.ndarray] = None,
     ) -> float:
+        # discard anything computed by a previous kernel
+        self._reset()
+
         if dm is not None:
             if isinstance(dm, str):
                 lib.logger.debug(
@@ -486,7 +598,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # get initial guess
         if mo_coeff is not None and mo_occ is not None:
             dm = self.make_rdm1(mo_coeff, mo_occ)
-            vhf = self._scf.get_veff(mol, dm)
+            vhf = self._potential(dm)
+            self._count_update()
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
             mo_energy, mo_tmp = self.eig(fock, self.s1e)
@@ -501,13 +614,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     f"guess from {self.init_guess}",
                 )
                 dm = self.get_init_guess(self._scf.mol, self.init_guess)
-            vhf = self._scf.get_veff(mol, dm)
+            vhf = self._potential(dm)
+            self._count_update()
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
             mo_energy, mo_coeff = self.eig(fock, self.s1e)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
             dm = self.make_rdm1(mo_coeff, mo_occ)
-            vhf = self._scf.get_veff(mol, dm, dm_last=self.dm, vhf_last=self.vhf)
+            vhf = self._potential(dm)
+            self._count_update()
             self.dm, self.vhf = dm, vhf
 
         self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
@@ -588,8 +703,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.s1e,
                 n_particle,
                 self._scf.mol.nao,
-                self.get_energy,
-                self.update_dm,
+                self.evaluate_dm,
                 oao_settings,
             )
             self.project = settings.project = settings.stability_settings.project = (
@@ -604,10 +718,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             ) = get_extra_trial_vectors
 
             def wrapped_update_orbs(kappa, grad, h_diag):
+                n_jk = self.n_jk
                 func, hess_x = oao_update_orbs(kappa, grad, h_diag)
-                if np.sum(np.abs(kappa)) > 0.0 or not self.oao_update_orbs_called:
-                    self.n_update_orbs += 1
-                self.oao_update_orbs_called = True
+                if self._moves(kappa) or self.n_jk > n_jk:
+                    self._count_update()
                 self.raw_hess_x = hess_x
 
                 return func, self.count_hess_x
@@ -638,11 +752,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.s1e,
                 n_particle,
                 self._scf.mol.nao,
-                self.get_energy,
                 (
-                    self.update_dm_spin
+                    self.evaluate_dm_spin
                     if isinstance(self, ROHFOTR) or isinstance(self, UHFOTR)
-                    else self.update_dm_nonlinear
+                    else self.evaluate_dm_nonlinear
                 ),
                 arh_settings,
             )
@@ -655,10 +768,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.precond_pd = settings.precond_pd = precond_pd
 
             def wrapped_approx_update_orbs(kappa, grad, h_diag):
+                n_jk = self.n_jk
                 func, hess_x = approx_update_orbs(kappa, grad, h_diag)
-                if np.sum(np.abs(kappa)) > 0.0 or not self.oao_update_orbs_called:
-                    self.n_update_orbs += 1
-                self.oao_update_orbs_called = True
+                if self._moves(kappa) or self.n_jk > n_jk:
+                    self._count_update()
                 return func, hess_x
 
             self.approx_update_orbs = wrapped_approx_update_orbs
@@ -722,7 +835,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             (
                 self.update_orbs
                 if not hasattr(self, "approx_update_orbs")
-                else self.approx_update_orbs
+                else self.count_approx_update_orbs(self.approx_update_orbs)
             ),
             self.n_param,
             settings,
@@ -735,7 +848,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if self.oao:
             self.mo_occ, self.mo_coeff = self.get_orth_mo_coeff()
         self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, self.dm)
+        vhf = self._potential(self.dm)
+        self._count_update()
         self.e_tot = self._scf.energy_tot(self.dm, self.h1e, vhf)
         fock = self._scf.get_fock(self.h1e, self.s1e, vhf, self.dm)
         self.mo_energy, self.mo_coeff = self._scf.canonicalize(
@@ -822,45 +936,55 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
     def pack_vo(self, matrix):
         return matrix.ravel()[self.kappa_mask]
 
-    # energy function from density matrix
-    def get_energy(self, dm: np.ndarray) -> float:
-        return self._scf.energy_tot(2.0 * dm, self.h1e)
-
-    # update density matrix
-    def update_dm(
-        self, dm: np.ndarray, fock: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        veff = self._scf.get_veff(self._scf.mol, 2.0 * dm)
-        fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
-        return self._scf.energy_tot(
-            2.0 * dm, self.h1e, veff
-        ), self.get_response_factory(
-            self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
+    # evaluate quantities at a density matrix
+    def evaluate_dm(
+        self, dm: np.ndarray, fock: Optional[np.ndarray], get_response: bool
+    ) -> Tuple[float, Optional[Callable[[np.ndarray, np.ndarray], None]]]:
+        # anything the caller did not ask for is not built
+        veff = self._potential(2.0 * dm)
+        if fock is not None:
+            fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+        response = (
+            self.get_response_factory(
+                self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
+            )
+            if get_response
+            else None
         )
 
-    # update density matrix with a separate non-linear (XC) contribution to the
-    # effective potential
-    def update_dm_nonlinear(
-        self, dm: np.ndarray, fock: np.ndarray, v_nonlinear: np.ndarray
+        return self._scf.energy_tot(2.0 * dm, self.h1e, veff), response
+
+    # evaluate quantities at a density matrix with a separate non-linear (XC)
+    # contribution to the effective potential
+    def evaluate_dm_nonlinear(
+        self,
+        dm: np.ndarray,
+        fock: Optional[np.ndarray],
+        v_nonlinear: Optional[np.ndarray],
     ) -> float:
-        veff = self._scf.get_veff(self._scf.mol, 2.0 * dm)
+        # anything the caller did not ask for is not built
+        veff = self._potential(2.0 * dm)
 
-        if isinstance(self, scf.hf.KohnShamDFT):
-            v_linear = np.asarray(veff.vj)
-            if getattr(veff, "vk", None) is not None:
-                v_linear = v_linear - 0.5 * veff.vk
-            v_nonlinear[:, :] = np.asarray(veff) - v_linear
-        else:
-            # no non-linear contribution for Hartree-Fock
-            v_nonlinear[:, :] = 0.0
+        if v_nonlinear is not None:
+            if isinstance(self, scf.hf.KohnShamDFT):
+                v_linear = np.asarray(veff.vj)
+                if getattr(veff, "vk", None) is not None:
+                    v_linear = v_linear - 0.5 * veff.vk
+                v_nonlinear[:, :] = np.asarray(veff) - v_linear
+            else:
+                # no non-linear contribution for Hartree-Fock
+                v_nonlinear[:, :] = 0.0
 
-        fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+        if fock is not None:
+            fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff)
 
     def get_response_factory(
         self, gen_response: Callable[[np.ndarray], np.ndarray]
     ) -> Callable[[np.ndarray, np.ndarray], None]:
         def get_response(dm: np.ndarray, response: np.ndarray):
+            self.n_jk_response += 1
             response[:, :] = gen_response(2.0 * dm)
 
         return get_response
@@ -876,7 +1000,8 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         # build Fock matrix at new orbitals and build pseudo-canonicalization
         # transformation
         self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
+        self.vhf = self._potential(self.dm)
+        self._count_update()
         self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
         if self._scf.mol.symmetry:
             self.u_occ = np.zeros((self.n_occ, self.n_occ))
@@ -1157,7 +1282,8 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         # build Fock matrix at new orbitals and build pseudo-canonical orbital
         # transformation
         self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
+        self.vhf = self._potential(self.dm)
+        self._count_update()
         self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
         if self._scf.mol.symmetry:
             irreps = set(self.orbsym)
@@ -1300,9 +1426,31 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             signs[signs == 0] = 1
             self.mo_coeff[i] *= signs[np.newaxis, :]
 
-    # energy function from density matrix
-    def get_energy(self, dm: np.ndarray) -> float:
-        return self._scf.energy_tot(dm, self.h1e)
+    def _build_potential(self, dm: np.ndarray) -> np.ndarray:
+        """
+        this function builds the effective potential at a density; unrestricted
+        Hartree-Fock builds it from the Coulomb and exchange matrices of each spin and
+        tags these onto the result, since its same-spin and opposite-spin potentials
+        need them separately
+        """
+        if isinstance(self, scf.hf.KohnShamDFT):
+            return super()._build_potential(dm)
+        vj, vk = self._scf.get_jk(self._scf.mol, dm)
+
+        return lib.tag_array(vj[0] + vj[1] - vk, vj=vj, vk=vk)
+
+    def _spin_coulomb(self, dm: np.ndarray, veff: np.ndarray) -> np.ndarray:
+        """
+        this function returns the Coulomb potential of each spin separately; get_veff
+        tags the potential of the total density onto its result, so only one spin has
+        to be built and the other follows from it by linearity, which halves the
+        Coulomb work this costs; the build is not counted: the potential at this
+        density has been counted already, and this second pass exists only because
+        get_veff hands back the total rather than the per-spin potentials
+        """
+        vj_alpha = self._scf.get_j(self._scf.mol, dm[0])
+
+        return np.stack((vj_alpha, np.asarray(veff.vj) - vj_alpha))
 
     # get indices of all mixed occupation combinations
     def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -1380,64 +1528,83 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
     def pack_vo(self, matrix):
         return np.concatenate((matrix[0].ravel(), matrix[1].ravel()))[self.kappa_mask]
 
-    # update density matrix
-    def update_dm(
-        self, dm: np.ndarray, fock: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-        vhf = self._scf.get_veff(self._scf.mol, dm)
-        fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
-        return self._scf.energy_tot(dm, self.h1e, vhf), self.get_response_factory(
-            self.gen_response(dm0=dm, hermi=1)
+    # evaluate quantities at a density matrix
+    def evaluate_dm(
+        self, dm: np.ndarray, fock: Optional[np.ndarray], get_response: bool
+    ) -> Tuple[float, Optional[Callable[[np.ndarray, np.ndarray], None]]]:
+        # anything the caller did not ask for is not built
+        vhf = self._potential(dm)
+        if fock is not None:
+            fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
+        response = (
+            self.get_response_factory(self.gen_response(dm0=dm, hermi=1))
+            if get_response
+            else None
         )
 
-    # update density matrix with linear (Coulomb and exact exchange) and non-linear
-    # (XC) contributions to the effective potential
-    def update_dm_spin(
+        return self._scf.energy_tot(dm, self.h1e, vhf), response
+
+    # evaluate quantities at a density matrix with separate same-spin, opposite-spin
+    # and non-linear (XC) contributions to the effective potential
+    def evaluate_dm_spin(
         self,
         dm: np.ndarray,
-        fock: np.ndarray,
-        v_same_spin: np.ndarray,
-        v_opposite_spin: np.ndarray,
-        v_nonlinear: np.ndarray,
+        fock: Optional[np.ndarray],
+        v_same_spin: Optional[np.ndarray],
+        v_opposite_spin: Optional[np.ndarray],
+        v_nonlinear: Optional[np.ndarray],
     ) -> float:
+        # the channel potentials share one build, so they are all built as soon as any
+        # of them is wanted; anything else the caller did not ask for is skipped
+        channels = (
+            v_same_spin is not None
+            or v_opposite_spin is not None
+            or v_nonlinear is not None
+        )
+
         if isinstance(self, scf.hf.KohnShamDFT):
-            # get coulomb potential
-            vj = self._scf.get_j(self.mol, dm)
-
             # get KS effective potential
-            veff = self._scf.get_veff(self.mol, dm)
+            veff = self._potential(dm)
 
-            # linear part of the potential
-            v_same_spin[0] = vj[0]
-            v_same_spin[1] = vj[1]
-            if veff.vk is not None:
-                v_same_spin[0] -= veff.vk[0]
-                v_same_spin[1] -= veff.vk[1]
-            v_opposite_spin[0] = vj[1]
-            v_opposite_spin[1] = vj[0]
+            if channels:
+                # get the coulomb potential of each spin
+                vj = self._spin_coulomb(dm, veff)
 
-            # non-linear (exchange-correlation) part
-            v_nonlinear[0] = veff[0] - v_same_spin[0] - v_opposite_spin[0]
-            v_nonlinear[1] = veff[1] - v_same_spin[1] - v_opposite_spin[1]
+                # linear part of the potential
+                same_spin = np.array(vj)
+                if veff.vk is not None:
+                    same_spin -= veff.vk
+                opposite_spin = vj[::-1]
+
+                if v_same_spin is not None:
+                    v_same_spin[:, :, :] = same_spin
+                if v_opposite_spin is not None:
+                    v_opposite_spin[:, :, :] = opposite_spin
+
+                # non-linear (exchange-correlation) part
+                if v_nonlinear is not None:
+                    v_nonlinear[:, :, :] = np.asarray(veff) - same_spin - opposite_spin
 
         else:
-            # get Coulomb and exchange matrices
-            vj, vk = self._scf.get_jk(self.mol, dm)
-
-            # construct mean-field potential
-            veff = vj[0] + vj[1] - vk
+            # get the mean-field potential, tagged with the Coulomb and exchange
+            # matrices of each spin
+            veff = self._potential(dm)
+            vj, vk = veff.vj, veff.vk
 
             # construct same-spin and opposite-spin potentials, the entire
             # Hartree-Fock potential is linear in the density matrix
-            v_same_spin[:, :, :] = vj - vk
-            v_opposite_spin[0] = vj[1]
-            v_opposite_spin[1] = vj[0]
+            if v_same_spin is not None:
+                v_same_spin[:, :, :] = vj - vk
+            if v_opposite_spin is not None:
+                v_opposite_spin[:, :, :] = vj[::-1]
 
             # no non-linear contribution for Hartree-Fock
-            v_nonlinear[:, :, :] = 0.0
+            if v_nonlinear is not None:
+                v_nonlinear[:, :, :] = 0.0
 
         # construct Fock matrix
-        fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, veff, dm)
+        if fock is not None:
+            fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, veff, dm)
 
         return self._scf.energy_tot(dm, self.h1e, veff)
 
@@ -1445,6 +1612,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         self, gen_response: Callable[[np.ndarray], np.ndarray]
     ) -> Callable[[np.ndarray, np.ndarray], None]:
         def get_response(dm: np.ndarray, response: np.ndarray):
+            self.n_jk_response += 1
             response[:, :, :] = gen_response(dm)
 
         return get_response
@@ -1466,7 +1634,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         # build Fock matrix at new orbitals and build pseudo-canonical orbital
         # transformation
         self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._scf.get_veff(self._scf.mol, self.dm)
+        self.vhf = self._potential(self.dm)
+        self._count_update()
         self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
         if self._scf.mol.symmetry:
             self.u_occ = [
@@ -1722,7 +1891,8 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
     def update_orbs(self, x, grad, h_diag):
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals or CI vector since, so the integrals need not be transformed again
-        if np.any(x) or not self._cache_is_valid():
+        self._moves(x)
+        if np.any(x) or not self._last_update.matches(self._orbs_state()):
             u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             eris = self.ao2mo(self.mo_coeff)
@@ -1742,25 +1912,28 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
                 self.ci = ci
                 ci = [c.ravel() for c in ci]
 
-            self.saved_func = self.casci(self.mo_coeff, self.ci, eris)[0]
-            self.saved_grad, _, self.saved_hess_x, self.saved_h_diag = (
-                newton_casscf.gen_g_hop(self, self.mo_coeff, ci, eris)
+            energy = self.casci(self.mo_coeff, self.ci, eris)[0]
+            new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
+                self, self.mo_coeff, ci, eris
             )
+            self._last_update = LastResult.of(
+                self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
+            )
+        energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
-            self.n_update_orbs += 1
-            self._save_orbs_state()
-
-        grad[:] = 2 * self.saved_grad
-        h_diag[:] = 2 * self.saved_h_diag
+        grad[:] = 2 * new_grad
+        h_diag[:] = 2 * new_h_diag
 
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            hx[:] = 2 * self.saved_hess_x(x)
+            hx[:] = 2 * hess_x(x)
 
         self.raw_hess_x = raw_hess_x
 
-        return self.saved_func, self.count_hess_x
+        return energy, self.count_hess_x
 
     def kernel(self, mo_coeff=None, ci0=None, callback=None):
+        # discard anything computed by a previous kernel
+        self._reset()
         if mo_coeff is None:
             mo_coeff = self.mo_coeff
         else:
