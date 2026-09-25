@@ -691,31 +691,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in oao_setting_fields:
                 if hasattr(self, setting):
                     setattr(oao_settings, setting, getattr(self, setting))
-            (
-                self.func,
-                oao_update_orbs,
-                precond,
-                precond_pd,
-                project,
-                get_extra_trial_vectors,
-            ) = oao_factory(
+            self.func, oao_update_orbs = oao_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
                 self._scf.mol.nao,
                 self.evaluate_dm,
+                settings,
                 oao_settings,
             )
-            self.project = settings.project = settings.stability_settings.project = (
-                project
-            )
-            self.precond = settings.precond = settings.stability_settings.precond = (
-                precond
-            )
-            self.precond_pd = settings.precond_pd = precond_pd
-            self.get_extra_trial_vectors = settings.get_extra_trial_vectors = (
-                settings.stability_settings.get_extra_trial_vectors
-            ) = get_extra_trial_vectors
+            self.project = settings.project
+            self.precond = settings.precond
+            self.precond_pd = settings.precond_pd
+            self.get_extra_trial_vectors = settings.get_extra_trial_vectors
 
             def wrapped_update_orbs(kappa, grad, h_diag):
                 n_jk = self.n_jk
@@ -736,18 +724,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in arh_setting_fields:
                 if hasattr(self, setting):
                     setattr(arh_settings, setting, getattr(self, setting))
-            if hasattr(self, "arh_type"):
-                arh_settings.arh_type = self.arh_type
-                settings.hess_symm = self.arh_type.lower() != "arh"
-            else:
-                settings.hess_symm = True
-            (
-                self.func,
-                approx_update_orbs,
-                precond,
-                precond_pd,
-                project,
-            ) = arh_factory(
+            self.func, approx_update_orbs = arh_factory(
                 dm_per_spin_ao,
                 self.s1e,
                 n_particle,
@@ -757,15 +734,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     if isinstance(self, ROHFOTR) or isinstance(self, UHFOTR)
                     else self.evaluate_dm_nonlinear
                 ),
+                settings,
                 arh_settings,
             )
-            self.project = settings.project = settings.stability_settings.project = (
-                project
-            )
-            self.precond = settings.precond = settings.stability_settings.precond = (
-                precond
-            )
-            self.precond_pd = settings.precond_pd = precond_pd
+            self.project = settings.project
+            self.precond = settings.precond
+            self.precond_pd = settings.precond_pd
 
             def wrapped_approx_update_orbs(kappa, grad, h_diag):
                 n_jk = self.n_jk
