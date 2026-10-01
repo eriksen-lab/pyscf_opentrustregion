@@ -21,7 +21,12 @@ from pyopentrustregion.extensions.quasi_newton import (
     update_orbs_qn_deconstructor,
 )
 from pyopentrustregion.extensions.oao import OAOSettings, oao_factory, oao_deconstructor
-from pyopentrustregion.extensions.arh import ARHSettings, arh_factory, arh_deconstructor
+from pyopentrustregion.extensions.arh import (
+    ARHSettings,
+    arh_factory_mo,
+    arh_factory_oao,
+    arh_deconstructor,
+)
 from pyopentrustregion.extensions.s_gek import (
     SGEKSettings,
     update_orbs_s_gek_factory,
@@ -404,6 +409,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         + qn_setting_fields
         + s_gek_setting_fields
         + [
+            "_adopted_routines",
             "_last_potential",
             "_adopted_potential",
             "raw_approx_update_orbs",
@@ -464,10 +470,27 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.n_jk_energy -= 1
             self.n_jk_update += 1
 
+    # routines a kernel can replace or take over from the extension factories, and
+    # those the last kernel did, which refer to the extension objects of that kernel
+    # that the next kernel frees
+    factory_routines = (
+        "func",
+        "update_orbs",
+        "approx_update_orbs",
+        "raw_approx_update_orbs",
+        "project",
+        "precond",
+        "stability_get_extra_trial_vectors",
+    )
+    _adopted_routines: Tuple[str, ...] = ()
+
     def _reset(self) -> None:
         super()._reset()
         self._last_potential = LastResult()
         self._adopted_potential = None
+        for name in self._adopted_routines:
+            self.__dict__.pop(name, None)
+        self._adopted_routines = ()
 
     # raw and counted orbital updates and (approximate) Hessian linear transformations
     raw_approx_update_orbs = None
@@ -500,6 +523,29 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.n_hess_x_stability += 1
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
+    def current_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs an exact Hessian linear transformation for a stability
+        check at the current orbitals, which an approximate orbital update that never
+        performs the exact one may have moved away from, from the effective potential
+        the optimization adopted at these orbitals
+        """
+        if not self._last_update.matches(self._orbs_state()):
+            self.dm, self.vhf = (
+                self._adopted_potential.key[0],
+                self._adopted_potential.value,
+            )
+            self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
+            self._save_update_orbs()
+
+            # take over the Hessian linear transformation of the stored update
+            self.update_orbs(
+                np.zeros(self.n_param, dtype=np.float64),
+                np.empty(self.n_param, dtype=np.float64),
+                np.empty(self.n_param, dtype=np.float64),
+            )
+        self.count_stability_hess_x(x, hx)
+
     def __init__(self, mf: scf.SCF):
         self.__dict__.update(mf.__dict__)
         self._scf = mf
@@ -513,6 +559,20 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._potential(dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
+
+    def _save_update_orbs(self) -> None:
+        """
+        this function saves the energy, gradient, Hessian diagonal and Hessian linear
+        transformation at the current orbitals, computed from their density matrix,
+        effective potential and Fock matrix
+        """
+        energy = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
+        new_grad, hess_x, new_h_diag = self.gen_g_hop(
+            self.mo_coeff, self.mo_occ, self.fock
+        )
+        self._last_update = LastResult.of(
+            self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
+        )
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(
@@ -531,13 +591,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.vhf = self._potential(self.dm)
                 self._count_update()
                 self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-            energy = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
-            new_grad, hess_x, new_h_diag = self.gen_g_hop(
-                self.mo_coeff, self.mo_occ, self.fock
-            )
-            self._last_update = LastResult.of(
-                self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
-            )
+            self._save_update_orbs()
         energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
         grad[:] = 2 * new_grad[self.kappa_mask]
@@ -625,26 +679,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self._count_update()
             self.dm, self.vhf = dm, vhf
 
-        self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
-
-        # fix phases of MO coefficients to improve deterministic behavior
-        self.fix_phase()
-
-        # get indices of all mixed occupation combinations
-        self.get_indices()
-
-        # initialize settings
-        settings = SolverSettings()
-        assign_solver_settings(self, settings)
-
-        # set default values for OTR extensions
-        if hasattr(self, "arh") and self.arh:
-            # optimization is performed in orthogonal AO basis for ARH
-            if hasattr(self, "oao") and not self.oao:
-                raise RuntimeError(
-                    "ARH can only be performed in the orthogonal AO basis."
-                )
-            self.oao = True
+        # set default values for OTR extensions, ARH parameterizes the orbitals in the
+        # MO basis unless the orthogonal AO basis is requested
         if not hasattr(self, "oao"):
             self.oao = False
         if not hasattr(self, "arh"):
@@ -653,10 +689,34 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             raise NotImplementedError(
                 "OAO and ARH are not currently implemented for ROHF."
             )
+        if self.arh and self._scf.mol.symmetry:
+            raise NotImplementedError(
+                "ARH is not currently implemented for symmetry-adapted orbitals."
+            )
         if not hasattr(self, "hess_update_scheme"):
             self.hess_update_scheme = None
         if not hasattr(self, "s_gek"):
             self.s_gek = False
+
+        self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
+
+        # fix phases of MO coefficients to improve deterministic behavior
+        self.fix_phase()
+
+        # ARH in the MO basis expects the occupied orbitals of every spin first
+        if self.arh and not self.oao:
+            order = np.argsort(np.asarray(self.mo_occ) == 0, axis=-1, kind="stable")
+            self.mo_coeff = np.take_along_axis(
+                self.mo_coeff, order[..., None, :], axis=-1
+            )
+            self.mo_occ = np.take_along_axis(np.asarray(self.mo_occ), order, axis=-1)
+
+        # get indices of all mixed occupation combinations
+        self.get_indices()
+
+        # initialize settings
+        settings = SolverSettings()
+        assign_solver_settings(self, settings)
 
         # deallocate resources from a previous kernel() call on this instance before
         # registering a finalizer for the current one
@@ -666,10 +726,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self, self._cleanup, self.arh, self.hess_update_scheme, self.s_gek, self.oao
         )
 
+        # number of particles for OAO and ARH
+        n_particle = 1 if isinstance(self, RHFOTR) else 2
+
         # number of parameters
         if self.oao:
-            # number of particles for ARH
-            n_particle = 1 if isinstance(self, RHFOTR) else 2
             # number of parameters in AO basis
             self.n_param = n_particle * self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
         else:
@@ -681,6 +742,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         ):
             self.stability = settings.stability = True
 
+        # routines before the extensions replace or take over any of them
+        routines = {name: self.__dict__.get(name) for name in self.factory_routines}
+
         # check if orthogonal AO basis is to be used
         if self.oao:
             if isinstance(self, RHFOTR):
@@ -691,6 +755,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in oao_setting_fields:
                 if hasattr(self, setting):
                     setattr(oao_settings, setting, getattr(self, setting))
+            # run factory and set projection, preconditioner and extra trial vectors
+            # for stability check
             self.func, oao_update_orbs = oao_factory(
                 dm_per_spin_ao,
                 self.s1e,
@@ -702,8 +768,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             )
             self.project = settings.project
             self.precond = settings.precond
-            self.precond_pd = settings.precond_pd
-            self.get_extra_trial_vectors = settings.get_extra_trial_vectors
+            self.stability_get_extra_trial_vectors = (
+                settings.stability_settings.get_extra_trial_vectors
+            )
 
             def wrapped_update_orbs(kappa, grad, h_diag):
                 n_jk = self.n_jk
@@ -724,24 +791,43 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in arh_setting_fields:
                 if hasattr(self, setting):
                     setattr(arh_settings, setting, getattr(self, setting))
-            self.func, approx_update_orbs = arh_factory(
-                dm_per_spin_ao,
-                self.s1e,
-                n_particle,
-                self._scf.mol.nao,
-                (
-                    self.evaluate_dm_spin
-                    if isinstance(self, ROHFOTR) or isinstance(self, UHFOTR)
-                    else self.evaluate_dm_nonlinear
-                ),
-                settings,
-                arh_settings,
+            evaluate_dm = (
+                self.evaluate_dm_spin
+                if isinstance(self, UHFOTR)
+                else self.evaluate_dm_nonlinear
             )
-            self.project = settings.project
-            self.precond = settings.precond
-            self.precond_pd = settings.precond_pd
+            if self.oao:
+                # run factory and set preconditioner for stability check
+                self.func, approx_update_orbs = arh_factory_oao(
+                    dm_per_spin_ao,
+                    self.s1e,
+                    n_particle,
+                    self._scf.mol.nao,
+                    evaluate_dm,
+                    settings,
+                    arh_settings,
+                )
+                self.precond = settings.precond
+            else:
+                # run factory, projection is not needed for stability check in MO
+                # basis, preconditioner and extra trial vectors are not needed for
+                # stability check because static part of Hessian is diagonal after
+                # canonicalization
+                self.func, approx_update_orbs = arh_factory_mo(
+                    self.mo_coeff,
+                    self.s1e,
+                    np.count_nonzero(self.mo_occ, axis=-1),
+                    n_particle,
+                    self._scf.mol.nao,
+                    self.mo_coeff.shape[-1],
+                    evaluate_dm,
+                    settings,
+                    arh_settings,
+                )
 
-            def wrapped_approx_update_orbs(kappa, grad, h_diag):
+            def wrapped_approx_update_orbs(
+                kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+            ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
                 n_jk = self.n_jk
                 func, hess_x = approx_update_orbs(kappa, grad, h_diag)
                 if self._moves(kappa) or self.n_jk > n_jk:
@@ -792,14 +878,30 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 )
             )
 
+        # record the routines the extensions replaced or took over, so that the next
+        # kernel drops them
+        self._adopted_routines = tuple(
+            name
+            for name in self.factory_routines
+            if self.__dict__.get(name) is not routines[name]
+        )
+
         # set (approximate) Hessian linear transformation for stability check
         if self.stability:
-            kappa = np.zeros(self.n_param, dtype=np.float64)
-            grad = np.empty(self.n_param, dtype=np.float64)
-            h_diag = np.empty(self.n_param, dtype=np.float64)
-            self.update_orbs(kappa, grad, h_diag)
+            if self.arh and not self.oao:
+                # ARH in the MO basis never performs the exact orbital update so the
+                # linear transformation is not updated and it is therefore built from
+                # the cached potential during the stability check
+                settings.stability_hess_x = self.current_stability_hess_x
+            else:
+                # get linear transformation function which is continuously updated as
+                # the orbitals move
+                kappa = np.zeros(self.n_param, dtype=np.float64)
+                grad = np.empty(self.n_param, dtype=np.float64)
+                h_diag = np.empty(self.n_param, dtype=np.float64)
+                self.update_orbs(kappa, grad, h_diag)
 
-            settings.stability_hess_x = self.count_stability_hess_x
+                settings.stability_hess_x = self.count_stability_hess_x
             if hasattr(self, "approx_update_orbs"):
                 settings.stability_settings.approx_hess_x = self.approx_stability_hess_x
 
@@ -896,7 +998,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
     # unpack matrix
     def unpack(self, kappa):
-        matrix = np.zeros(2 * (self.mol.nao,), dtype=np.float64)
+        matrix = np.zeros(self.rot_matrix_mask.shape, dtype=np.float64)
         matrix[self.rot_matrix_mask] = kappa
         return matrix - matrix.T
 
@@ -1478,8 +1580,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
     def unpack(self, kappa):
         n_param_a = np.count_nonzero(self.rot_matrix_mask[0])
         matrix_list = [
-            np.zeros(2 * (self.mol.nao,), dtype=np.float64),
-            np.zeros(2 * (self.mol.nao,), dtype=np.float64),
+            np.zeros(self.rot_matrix_mask.shape[1:], dtype=np.float64),
+            np.zeros(self.rot_matrix_mask.shape[1:], dtype=np.float64),
         ]
         matrix_list[0][self.rot_matrix_mask[0]] = kappa[:n_param_a]
         matrix_list[1][self.rot_matrix_mask[1]] = kappa[n_param_a:]
