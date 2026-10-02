@@ -20,6 +20,7 @@ from pyopentrustregion.extensions.quasi_newton import (
     update_orbs_qn_factory,
     update_orbs_qn_deconstructor,
 )
+from pyopentrustregion.extensions.mo import MOSettings, mo_factory, mo_deconstructor
 from pyopentrustregion.extensions.oao import OAOSettings, oao_factory, oao_deconstructor
 from pyopentrustregion.extensions.arh import (
     ARHSettings,
@@ -32,6 +33,7 @@ from pyopentrustregion.extensions.s_gek import (
     update_orbs_s_gek_factory,
     update_orbs_s_gek_deconstructor,
 )
+from pyopentrustregion.extensions.mo.python_interface import MOSettingsC
 from pyopentrustregion.extensions.oao.python_interface import OAOSettingsC
 from pyopentrustregion.extensions.arh.python_interface import ARHSettingsC
 from pyopentrustregion.extensions.quasi_newton.python_interface import QNSettingsC
@@ -83,6 +85,7 @@ class LastResult:
 
 solver_setting_fields = setting_fields(SolverSettingsC)
 stability_setting_fields = setting_fields(StabilitySettingsC)
+mo_setting_fields = setting_fields(MOSettingsC)
 oao_setting_fields = setting_fields(OAOSettingsC)
 arh_setting_fields = setting_fields(ARHSettingsC)
 qn_setting_fields = setting_fields(QNSettingsC)
@@ -144,15 +147,9 @@ def assign_solver_settings(obj, settings) -> None:
         if setting in solver_settings_shadowed_by_pyscf:
             if setting_was_set_by_user(obj, setting):
                 setattr(settings, setting, getattr(obj, setting))
-        elif (
-            hasattr(obj, setting)
-            and (
-                setting != "conv_check"
-                or not isinstance(getattr(obj, "conv_check", None), bool)
-            )
-            and setting != "modify_step"
-        ) or (
-            setting == "modify_step" and getattr(obj, "pseudo_canonicalization", False)
+        elif hasattr(obj, setting) and (
+            setting != "conv_check"
+            or not isinstance(getattr(obj, "conv_check", None), bool)
         ):
             setattr(settings, setting, getattr(obj, setting))
     assign_stability_settings(obj, settings.stability_settings)
@@ -404,7 +401,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     vhf: np.ndarray
 
     _keys = set(
-        oao_setting_fields
+        mo_setting_fields
+        + oao_setting_fields
         + arh_setting_fields
         + qn_setting_fields
         + s_gek_setting_fields
@@ -412,6 +410,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "_adopted_routines",
             "_last_potential",
             "_adopted_potential",
+            "_canonical_rotation",
             "raw_approx_update_orbs",
             "raw_approx_hess_x",
             "n_jk_update",
@@ -421,7 +420,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "oao",
             "arh",
             "s_gek",
-            "pseudo_canonicalization",
         ]
     )
 
@@ -484,10 +482,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     )
     _adopted_routines: Tuple[str, ...] = ()
 
+    # occupied-occupied and virtual-virtual blocks of the rotation of every spin from
+    # the orbitals the MO objects hold to the canonicalized ones, if the last kernel
+    # used the MO extension
+    _canonical_rotation: Optional[list] = None
+
     def _reset(self) -> None:
         super()._reset()
         self._last_potential = LastResult()
         self._adopted_potential = None
+        self._canonical_rotation = None
         for name in self._adopted_routines:
             self.__dict__.pop(name, None)
         self._adopted_routines = ()
@@ -523,33 +527,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.n_hess_x_stability += 1
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
-    def current_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        """
-        this function performs an exact Hessian linear transformation for a stability
-        check at the current orbitals, which an approximate orbital update that never
-        performs the exact one may have moved away from, from the effective potential
-        the optimization adopted at these orbitals
-        """
-        if not self._last_update.matches(self._orbs_state()):
-            self.dm, self.vhf = (
-                self._adopted_potential.key[0],
-                self._adopted_potential.value,
-            )
-            self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-            self._save_update_orbs()
-
-            # take over the Hessian linear transformation of the stored update
-            self.update_orbs(
-                np.zeros(self.n_param, dtype=np.float64),
-                np.empty(self.n_param, dtype=np.float64),
-                np.empty(self.n_param, dtype=np.float64),
-            )
-        self.count_stability_hess_x(x, hx)
-
     def __init__(self, mf: scf.SCF):
         self.__dict__.update(mf.__dict__)
         self._scf = mf
-        self.pseudo_canonicalization = False
         self._snapshot_shadowed_settings()
 
     # energy function
@@ -582,15 +562,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # orbitals since, so the effective potential and Fock matrix need not be rebuilt
         self._moves(kappa)
         if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
-            # perform orbital rotation and get new fock matrix if not already done in
-            # step modification function
-            if not self.pseudo_canonicalization:
-                u = self.exp_mat(self.unpack(kappa))
-                self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-                self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-                self.vhf = self._potential(self.dm)
-                self._count_update()
-                self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
+            # perform orbital rotation and get new fock matrix
+            u = self.exp_mat(self.unpack(kappa))
+            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+            self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
+            self.vhf = self._potential(self.dm)
+            self._count_update()
+            self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
             self._save_update_orbs()
         energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
@@ -649,6 +627,30 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.h1e = self._scf.get_hcore(mol)
         self.s1e = self._scf.get_ovlp(mol)
 
+        # set default values for OTR extensions, ARH parameterizes the orbitals in the
+        # MO basis unless the orthogonal AO basis is requested
+        if not hasattr(self, "oao"):
+            self.oao = False
+        if not hasattr(self, "arh"):
+            self.arh = False
+        if isinstance(self, ROHFOTR) and (self.oao or self.arh):
+            raise NotImplementedError(
+                "OAO and ARH are not currently implemented for ROHF."
+            )
+        if self.arh and self._scf.mol.symmetry:
+            raise NotImplementedError(
+                "ARH is not currently implemented for symmetry-adapted orbitals."
+            )
+        if not hasattr(self, "hess_update_scheme"):
+            self.hess_update_scheme = None
+        if not hasattr(self, "s_gek"):
+            self.s_gek = False
+
+        # exact orbital updates of RHF and UHF in the MO basis come from the MO
+        # extension, which does not support symmetry yet, so that symmetry-adapted
+        # orbitals keep PySCF's own; the approximate Hessians build on them
+        mo = not self.oao and not isinstance(self, ROHFOTR) and not mol.symmetry
+
         # get initial guess
         if mo_coeff is not None and mo_occ is not None:
             dm = self.make_rdm1(mo_coeff, mo_occ)
@@ -674,37 +676,21 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
             mo_energy, mo_coeff = self.eig(fock, self.s1e)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
-            dm = self.make_rdm1(mo_coeff, mo_occ)
-            vhf = self._potential(dm)
-            self._count_update()
-            self.dm, self.vhf = dm, vhf
 
-        # set default values for OTR extensions, ARH parameterizes the orbitals in the
-        # MO basis unless the orthogonal AO basis is requested
-        if not hasattr(self, "oao"):
-            self.oao = False
-        if not hasattr(self, "arh"):
-            self.arh = False
-        if isinstance(self, ROHFOTR) and (self.oao or self.arh):
-            raise NotImplementedError(
-                "OAO and ARH are not currently implemented for ROHF."
-            )
-        if self.arh and self._scf.mol.symmetry:
-            raise NotImplementedError(
-                "ARH is not currently implemented for symmetry-adapted orbitals."
-            )
-        if not hasattr(self, "hess_update_scheme"):
-            self.hess_update_scheme = None
-        if not hasattr(self, "s_gek"):
-            self.s_gek = False
+            # the MO extension evaluates the density of these orbitals itself
+            if not mo:
+                dm = self.make_rdm1(mo_coeff, mo_occ)
+                vhf = self._potential(dm)
+                self._count_update()
+                self.dm, self.vhf = dm, vhf
 
         self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
 
         # fix phases of MO coefficients to improve deterministic behavior
         self.fix_phase()
 
-        # ARH in the MO basis expects the occupied orbitals of every spin first
-        if self.arh and not self.oao:
+        # the MO extension expects the occupied orbitals of every spin first
+        if mo:
             order = np.argsort(np.asarray(self.mo_occ) == 0, axis=-1, kind="stable")
             self.mo_coeff = np.take_along_axis(
                 self.mo_coeff, order[..., None, :], axis=-1
@@ -723,7 +709,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
             self._finalizer()
         self._finalizer = weakref.finalize(
-            self, self._cleanup, self.arh, self.hess_update_scheme, self.s_gek, self.oao
+            self,
+            self._cleanup,
+            self.arh,
+            self.hess_update_scheme,
+            self.s_gek,
+            mo,
+            self.oao,
         )
 
         # number of particles for OAO and ARH
@@ -745,28 +737,47 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # routines before the extensions replace or take over any of them
         routines = {name: self.__dict__.get(name) for name in self.factory_routines}
 
-        # check if orthogonal AO basis is to be used
-        if self.oao:
-            if isinstance(self, RHFOTR):
-                dm_per_spin_ao = self.dm / 2
-            else:
-                dm_per_spin_ao = self.dm
-            oao_settings = OAOSettings()
-            for setting in oao_setting_fields:
-                if hasattr(self, setting):
-                    setattr(oao_settings, setting, getattr(self, setting))
-            # run factory and set projection, preconditioner and extra trial vectors
-            # for stability check
-            self.func, oao_update_orbs = oao_factory(
-                dm_per_spin_ao,
-                self.s1e,
-                n_particle,
-                self._scf.mol.nao,
-                self.evaluate_dm,
-                settings,
-                oao_settings,
-            )
-            self.project = settings.project
+        # get exact orbital updates from the MO or the OAO extension
+        if mo or self.oao:
+            if mo:
+                mo_settings = MOSettings()
+                for setting in mo_setting_fields:
+                    if hasattr(self, setting):
+                        setattr(mo_settings, setting, getattr(self, setting))
+                # run factory, which rotates the MO coefficients in place
+                self.func, exact_update_orbs = mo_factory(
+                    self.mo_coeff,
+                    self.s1e,
+                    np.count_nonzero(self.mo_occ, axis=-1),
+                    n_particle,
+                    self._scf.mol.nao,
+                    self.mo_coeff.shape[-1],
+                    self.evaluate_dm,
+                    settings,
+                    mo_settings,
+                )
+            elif self.oao:
+                if isinstance(self, RHFOTR):
+                    dm_per_spin_ao = self.dm / 2
+                else:
+                    dm_per_spin_ao = self.dm
+                oao_settings = OAOSettings()
+                for setting in oao_setting_fields:
+                    if hasattr(self, setting):
+                        setattr(oao_settings, setting, getattr(self, setting))
+                # run factory and set projection
+                self.func, exact_update_orbs = oao_factory(
+                    dm_per_spin_ao,
+                    self.s1e,
+                    n_particle,
+                    self._scf.mol.nao,
+                    self.evaluate_dm,
+                    settings,
+                    oao_settings,
+                )
+                self.project = settings.project
+
+            # set preconditioner and extra trial vectors
             self.precond = settings.precond
             self.stability_get_extra_trial_vectors = (
                 settings.stability_settings.get_extra_trial_vectors
@@ -774,7 +785,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
             def wrapped_update_orbs(kappa, grad, h_diag):
                 n_jk = self.n_jk
-                func, hess_x = oao_update_orbs(kappa, grad, h_diag)
+                func, hess_x = exact_update_orbs(kappa, grad, h_diag)
                 if self._moves(kappa) or self.n_jk > n_jk:
                     self._count_update()
                 self.raw_hess_x = hess_x
@@ -785,8 +796,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # define callback functions for approximate Hessians
         if self.arh:
-            if self.pseudo_canonicalization:
-                raise RuntimeError("Pseudo-canonicalization is not supported for ARH.")
             arh_settings = ARHSettings()
             for setting in arh_setting_fields:
                 if hasattr(self, setting):
@@ -796,8 +805,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 if isinstance(self, UHFOTR)
                 else self.evaluate_dm_nonlinear
             )
+            # run factory after the factory of its basis, with which it shares the
+            # orbitals it updates in place and the orbital objects whose exact Hessian
+            # the stability check uses
             if self.oao:
-                # run factory and set preconditioner for stability check
                 self.func, approx_update_orbs = arh_factory_oao(
                     dm_per_spin_ao,
                     self.s1e,
@@ -807,12 +818,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     settings,
                     arh_settings,
                 )
-                self.precond = settings.precond
             else:
-                # run factory, projection is not needed for stability check in MO
-                # basis, preconditioner and extra trial vectors are not needed for
-                # stability check because static part of Hessian is diagonal after
-                # canonicalization
                 self.func, approx_update_orbs = arh_factory_mo(
                     self.mo_coeff,
                     self.s1e,
@@ -824,6 +830,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     settings,
                     arh_settings,
                 )
+
+            # set the preconditioner, which inverts the approximate Hessian, and extra
+            # trial vectors
+            self.precond = settings.precond
+            self.stability_get_extra_trial_vectors = (
+                settings.stability_settings.get_extra_trial_vectors
+            )
 
             def wrapped_approx_update_orbs(
                 kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
@@ -851,10 +864,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 )
             )
         elif self.s_gek:
-            if self.pseudo_canonicalization:
-                raise RuntimeError(
-                    "Pseudo-canonicalization is not supported for S-GEK."
-                )
             if self.oao:
                 raise RuntimeError(
                     "S-GEK cannot be performed in the orthogonal AO basis."
@@ -888,20 +897,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # set (approximate) Hessian linear transformation for stability check
         if self.stability:
-            if self.arh and not self.oao:
-                # ARH in the MO basis never performs the exact orbital update so the
-                # linear transformation is not updated and it is therefore built from
-                # the cached potential during the stability check
-                settings.stability_hess_x = self.current_stability_hess_x
-            else:
-                # get linear transformation function which is continuously updated as
-                # the orbitals move
-                kappa = np.zeros(self.n_param, dtype=np.float64)
-                grad = np.empty(self.n_param, dtype=np.float64)
-                h_diag = np.empty(self.n_param, dtype=np.float64)
-                self.update_orbs(kappa, grad, h_diag)
+            # get linear transformation function which is continuously updated as the
+            # orbitals move
+            kappa = np.zeros(self.n_param, dtype=np.float64)
+            grad = np.empty(self.n_param, dtype=np.float64)
+            h_diag = np.empty(self.n_param, dtype=np.float64)
+            self.update_orbs(kappa, grad, h_diag)
 
-                settings.stability_hess_x = self.count_stability_hess_x
+            settings.stability_hess_x = self.count_stability_hess_x
             if hasattr(self, "approx_update_orbs"):
                 settings.stability_settings.approx_hess_x = self.approx_stability_hess_x
 
@@ -917,6 +920,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             settings,
         )
 
+        # the MO objects keep the orbitals they hold now
+        mo_coeff_evaluated = self.mo_coeff
+
         # get canonical orbitals
         if self.oao:
             self.dm = 2 * dm_per_spin_ao if isinstance(self, RHFOTR) else dm_per_spin_ao
@@ -931,21 +937,87 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.mo_energy, self.mo_coeff = self._scf.canonicalize(
             self.mo_coeff, self.mo_occ, fock
         )
+
+        # get the rotation from the orbitals of the MO objects to the canonicalized
+        # ones, with which a stability check after the kernel starts from the rotations
+        # it would start from at the canonicalized orbitals and returns its direction
+        # for these
+        if mo:
+            rotation = (
+                np.swapaxes(mo_coeff_evaluated, -1, -2) @ self.s1e @ self.mo_coeff
+            )
+            occ_idx = self.occ_idx if isinstance(self, UHFOTR) else [self.occ_idx]
+            virt_idx = self.virt_idx if isinstance(self, UHFOTR) else [self.virt_idx]
+            rotation = rotation if isinstance(self, UHFOTR) else rotation[None]
+            self._canonical_rotation = [
+                (u[np.ix_(occ, occ)], u[np.ix_(virt, virt)])
+                for u, occ, virt in zip(rotation, occ_idx, virt_idx)
+            ]
+            self.stability_get_extra_trial_vectors = self._canonical_trial_vectors
+
         self._finalize()
 
         return self.e_tot
 
+    def _rotate_canonical(self, vector: np.ndarray, to_canonical: bool) -> np.ndarray:
+        """
+        this function rotates an orbital rotation from the orbitals the MO objects hold
+        to the canonicalized ones or back
+        """
+        vector_vo = self.unpack_vo(vector)
+        spins = vector_vo if isinstance(self, UHFOTR) else [vector_vo]
+        spins = [
+            u_virt.T @ x_vo @ u_occ if to_canonical else u_virt @ x_vo @ u_occ.T
+            for x_vo, (u_occ, u_virt) in zip(spins, self._canonical_rotation)
+        ]
+
+        return self.pack_vo(spins if isinstance(self, UHFOTR) else spins[0])
+
+    def _canonical_trial_vectors(self, trial_vectors: np.ndarray) -> None:
+        """
+        this function returns the rotations along the lowest eigenvalue pairs of the
+        static part of the Hessian at the canonicalized orbitals, the differences of
+        their orbital energies, in increasing order and rotated to the orbitals the MO
+        objects hold
+        """
+        mo_energy = self.mo_energy if isinstance(self, UHFOTR) else [self.mo_energy]
+        occ_idx = self.occ_idx if isinstance(self, UHFOTR) else [self.occ_idx]
+        virt_idx = self.virt_idx if isinstance(self, UHFOTR) else [self.virt_idx]
+        pairs = np.concatenate(
+            [
+                (energy[virt][:, None] - energy[occ]).ravel()
+                for energy, occ, virt in zip(mo_energy, occ_idx, virt_idx)
+            ]
+        )
+        for vector, idx in zip(trial_vectors, np.argsort(pairs, kind="stable")):
+            unit_vector = np.zeros(pairs.size)
+            unit_vector[idx] = 1.0
+            vector[:] = self._rotate_canonical(unit_vector, False)
+
+    def stability_check(self) -> Tuple[bool, np.ndarray]:
+        stable, direction = super().stability_check()
+
+        # the MO objects hold the orbitals before their canonicalization, so the
+        # direction is rotated to the canonicalized orbitals
+        if self._canonical_rotation is not None:
+            direction = self._rotate_canonical(direction, True)
+
+        return stable, direction
+
     @staticmethod
-    def _cleanup(arh, hess_update_scheme, s_gek, oao):
-        # call deconstructor
+    def _cleanup(arh, hess_update_scheme, s_gek, mo, oao):
+        # call deconstructors
         if arh:
             arh_deconstructor()
-        elif hess_update_scheme is not None:
-            update_orbs_qn_deconstructor()
-        elif s_gek:
-            update_orbs_s_gek_deconstructor()
-        elif oao:
-            oao_deconstructor()
+        else:
+            if hess_update_scheme is not None:
+                update_orbs_qn_deconstructor()
+            elif s_gek:
+                update_orbs_s_gek_deconstructor()
+            if mo:
+                mo_deconstructor()
+            elif oao:
+                oao_deconstructor()
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
@@ -1019,7 +1091,8 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         # anything the caller did not ask for is not built
         veff = self._potential(2.0 * dm)
         if fock is not None:
-            fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+            self.fock = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
+            fock[:, :] = self.fock
         response = (
             self.get_response_factory(
                 self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
@@ -1065,65 +1138,8 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         return get_response
 
-    # modify step to pseudo-canonical orbitals
-    def modify_step(self, kappa: np.ndarray):
-        # set new orbitals
-        u = self.exp_mat(self.unpack(kappa))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        mo_coeff_occ = self.mo_coeff[:, self.occ_idx]
-        mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
-
-        # build Fock matrix at new orbitals and build pseudo-canonicalization
-        # transformation
-        self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._potential(self.dm)
-        self._count_update()
-        self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-        if self._scf.mol.symmetry:
-            self.u_occ = np.zeros((self.n_occ, self.n_occ))
-            self.u_virt = np.zeros((self.n_virt, self.n_virt))
-            irreps = set(self.orbsym)
-            for ir in irreps:
-                ir_idx = self.orbsym == ir
-                occ_ir_idx = ir_idx & self.occ_idx
-                if np.count_nonzero(occ_ir_idx) > 0:
-                    mo_coeff_occ_ir = self.mo_coeff[:, occ_ir_idx]
-                    fock_occ = mo_coeff_occ_ir.T @ self.fock @ mo_coeff_occ_ir
-                    local_irrep_idx = np.where(self.orbsym[self.occ_idx] == ir)[0]
-                    self.u_occ[np.ix_(local_irrep_idx, local_irrep_idx)] = (
-                        np.linalg.eigh(fock_occ)[1]
-                    )
-                virt_ir_idx = ir_idx & self.virt_idx
-                if np.count_nonzero(virt_ir_idx) > 0:
-                    mo_coeff_virt_ir = self.mo_coeff[:, virt_ir_idx]
-                    fock_virt = mo_coeff_virt_ir.T @ self.fock @ mo_coeff_virt_ir
-                    local_irrep_idx = np.where(self.orbsym[self.virt_idx] == ir)[0]
-                    self.u_virt[np.ix_(local_irrep_idx, local_irrep_idx)] = (
-                        np.linalg.eigh(fock_virt)[1]
-                    )
-        else:
-            fock_oo = mo_coeff_occ.T @ self.fock @ mo_coeff_occ
-            self.u_occ = np.linalg.eigh(fock_oo)[1]
-            fock_vv = mo_coeff_virt.T @ self.fock @ mo_coeff_virt
-            self.u_virt = np.linalg.eigh(fock_vv)[1]
-
-        # rotate MO coefficients to pseudo-canonical orbitals
-        self.mo_coeff[:, self.occ_idx] = self.rotate_mo(mo_coeff_occ, self.u_occ)
-        self.mo_coeff[:, self.virt_idx] = self.rotate_mo(mo_coeff_virt, self.u_virt)
-
-        # rotate step to pseudo-canonical orbitals
-        kappa_vo = self.unpack_vo(kappa)
-        kappa_vo = self.u_virt.T @ kappa_vo @ self.u_occ
-        kappa[:] = self.pack_vo(kappa_vo)
-
     # transport tangent vector along geodesic
     def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray):
-        # perform pseudo-canonicalization if enabled
-        if self.pseudo_canonicalization:
-            tangent_vector[:] = self.pack_vo(
-                self.u_virt.T @ self.unpack_vo(tangent_vector) @ self.u_occ
-            )
-
         return
 
     # Hessian initialization
@@ -1307,98 +1323,8 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
             self.kappa_mask = sym_allow[self.rot_matrix_mask]
             self.rot_matrix_mask[self.rot_matrix_mask] = self.kappa_mask
 
-        # get non-redundant mask for virtual-closed, virtual-open, and open-closed
-        # blocks which only describes which of those rotations are redundant due to
-        # symmetry
-        self.rot_matrix_mask_vc = self.rot_matrix_mask[
-            np.ix_(self.virt_idx, self.clos_idx)
-        ]
-        self.rot_matrix_mask_vo = self.rot_matrix_mask[
-            np.ix_(self.virt_idx, self.open_idx)
-        ]
-        self.rot_matrix_mask_oc = self.rot_matrix_mask[
-            np.ix_(self.open_idx, self.clos_idx)
-        ]
-
-        # get mask for specific blocks in kappa matrix
-        self.kappa_mask_vc = self.vc_mask[self.rot_matrix_mask]
-        self.kappa_mask_vo = self.vo_mask[self.rot_matrix_mask]
-        self.kappa_mask_oc = self.oc_mask[self.rot_matrix_mask]
-
     exp_mat = RHFOTR.exp_mat
     unpack = RHFOTR.unpack
-
-    # unpack matrix into virtual-closed, virtual-open, and open-closed blocks
-    def unpack_voc(self, kappa):
-        matrix_vc = np.zeros((self.n_virt, self.n_clos), dtype=np.float64)
-        matrix_vo = np.zeros((self.n_virt, self.n_open), dtype=np.float64)
-        matrix_oc = np.zeros((self.n_open, self.n_clos), dtype=np.float64)
-        matrix_vc[self.rot_matrix_mask_vc] = kappa[self.kappa_mask_vc]
-        matrix_vo[self.rot_matrix_mask_vo] = kappa[self.kappa_mask_vo]
-        matrix_oc[self.rot_matrix_mask_oc] = kappa[self.kappa_mask_oc]
-        return matrix_vc, matrix_vo, matrix_oc
-
-    # pack matrix from virtual-occupied, virtual-open, and open-closed block
-    def pack_voc(self, matrix_vc, matrix_vo, matrix_oc):
-        kappa = np.empty(self.n_param, dtype=np.float64)
-        kappa[self.kappa_mask_vc] = matrix_vc[self.rot_matrix_mask_vc].ravel()
-        kappa[self.kappa_mask_vo] = matrix_vo[self.rot_matrix_mask_vo].ravel()
-        kappa[self.kappa_mask_oc] = matrix_oc[self.rot_matrix_mask_oc].ravel()
-        return kappa
-
-    # modify step to pseudo-canonical orbitals
-    def modify_step(self, kappa: np.ndarray):
-        # set new orbitals
-        u = self.exp_mat(self.unpack(kappa))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        mo_coeff_clos = self.mo_coeff[:, self.clos_idx]
-        mo_coeff_open = self.mo_coeff[:, self.open_idx]
-        mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
-
-        # build Fock matrix at new orbitals and build pseudo-canonical orbital
-        # transformation
-        self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._potential(self.dm)
-        self._count_update()
-        self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-        if self._scf.mol.symmetry:
-            irreps = set(self.orbsym)
-            self.u_clos = np.zeros((self.n_clos, self.n_clos))
-            self.u_open = np.zeros((self.n_open, self.n_open))
-            self.u_virt = np.zeros((self.n_virt, self.n_virt))
-            for ir in irreps:
-                ir_idx = self.orbsym == ir
-                for occ_idx, u_occ in zip(
-                    [self.clos_idx, self.open_idx, self.virt_idx],
-                    [self.u_clos, self.u_open, self.u_virt],
-                ):
-                    occ_ir_idx = ir_idx & occ_idx
-                    if np.count_nonzero(occ_ir_idx) > 0:
-                        mo_coeff_occ_ir = self.mo_coeff[:, occ_ir_idx]
-                        fock_occ = mo_coeff_occ_ir.T @ self.fock @ mo_coeff_occ_ir
-                        local_irrep_idx = np.where(self.orbsym[occ_idx] == ir)[0]
-                        u_occ[np.ix_(local_irrep_idx, local_irrep_idx)] = (
-                            np.linalg.eigh(fock_occ)[1]
-                        )
-        else:
-            for mo_coeff_occ, u_occ in zip(
-                [mo_coeff_clos, mo_coeff_open, mo_coeff_virt],
-                [self.u_clos, self.u_open, self.u_virt],
-            ):
-                fock_occ = mo_coeff_occ.T @ self.fock @ mo_coeff_occ
-                u_occ[:] = np.linalg.eigh(fock_occ)[1]
-
-        # rotate MO coefficients to pseudo-canonical orbitals
-        self.mo_coeff[:, self.clos_idx] = self.rotate_mo(mo_coeff_clos, self.u_clos)
-        self.mo_coeff[:, self.open_idx] = self.rotate_mo(mo_coeff_open, self.u_open)
-        self.mo_coeff[:, self.virt_idx] = self.rotate_mo(mo_coeff_virt, self.u_virt)
-
-        # rotate step to pseudo-canonical orbitals
-        kappa_vc, kappa_vo, kappa_oc = self.unpack_voc(kappa)
-        kappa_vc = self.u_virt.T @ kappa_vc @ self.u_clos
-        kappa_vo = self.u_virt.T @ kappa_vo @ self.u_open
-        kappa_oc = self.u_open.T @ kappa_oc @ self.u_clos
-        kappa[:] = self.pack_voc(kappa_vc, kappa_vo, kappa_oc)
 
     # transport tangent vector along geodesic
     def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray):
@@ -1411,14 +1337,6 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         define by the new base. The geodesic describes the rotation from the starting
         base to the new base.
         """
-        # perform pseudo-canonicalization for history if enabled
-        if self.pseudo_canonicalization:
-            kappa_vc, kappa_vo, kappa_oc = self.unpack_voc(tangent_vector)
-            kappa_vc = self.u_virt.T @ kappa_vc @ self.u_clos
-            kappa_vo = self.u_virt.T @ kappa_vo @ self.u_open
-            kappa_oc = self.u_open.T @ kappa_oc @ self.u_clos
-            tangent_vector[:] = self.pack_voc(kappa_vc, kappa_vo, kappa_oc)
-
         # unpack into full matrix
         geodesic_full = self.unpack(geodesic)
 
@@ -1693,83 +1611,6 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         return get_response
 
-    # modify step to pseudo-canonical orbitals
-    def modify_step(self, kappa: np.ndarray):
-        # set new orbitals
-        u = self.exp_mat(self.unpack(kappa))
-        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        mo_coeff_occ = [
-            self.mo_coeff[0][:, self.occ_idx[0]],
-            self.mo_coeff[1][:, self.occ_idx[1]],
-        ]
-        mo_coeff_virt = [
-            self.mo_coeff[0][:, self.virt_idx[0]],
-            self.mo_coeff[1][:, self.virt_idx[1]],
-        ]
-
-        # build Fock matrix at new orbitals and build pseudo-canonical orbital
-        # transformation
-        self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        self.vhf = self._potential(self.dm)
-        self._count_update()
-        self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-        if self._scf.mol.symmetry:
-            self.u_occ = [
-                np.zeros((self.n_occ[0], self.n_occ[0])),
-                np.zeros((self.n_occ[1], self.n_occ[1])),
-            ]
-            self.u_virt = [
-                np.zeros((self.n_virt[0], self.n_virt[0])),
-                np.zeros((self.n_virt[1], self.n_virt[1])),
-            ]
-            for spin in [0, 1]:
-                irreps = set(self.orbsym[spin])
-                for ir in irreps:
-                    ir_idx = self.orbsym[spin] == ir
-                    occ_ir_idx = ir_idx & self.occ_idx[spin]
-                    if np.count_nonzero(occ_ir_idx) > 0:
-                        mo_coeff_occ_ir = self.mo_coeff[spin][:, occ_ir_idx]
-                        fock_occ = mo_coeff_occ_ir.T @ self.fock[spin] @ mo_coeff_occ_ir
-                        local_irrep_idx = np.where(
-                            self.orbsym[spin][self.occ_idx[spin]] == ir
-                        )[0]
-                        self.u_occ[spin][np.ix_(local_irrep_idx, local_irrep_idx)] = (
-                            np.linalg.eigh(fock_occ)[1]
-                        )
-                    virt_ir_idx = ir_idx & self.virt_idx[spin]
-                    if np.count_nonzero(virt_ir_idx) > 0:
-                        mo_coeff_virt_ir = self.mo_coeff[spin][:, virt_ir_idx]
-                        fock_virt = (
-                            mo_coeff_virt_ir.T @ self.fock[spin] @ mo_coeff_virt_ir
-                        )
-                        local_irrep_idx = np.where(
-                            self.orbsym[spin][self.virt_idx[spin]] == ir
-                        )[0]
-                        self.u_virt[spin][np.ix_(local_irrep_idx, local_irrep_idx)] = (
-                            np.linalg.eigh(fock_virt)[1]
-                        )
-
-        else:
-            self.u_occ = []
-            self.u_virt = []
-            for spin in [0, 1]:
-                fock_oo = mo_coeff_occ[spin].T @ self.fock[spin] @ mo_coeff_occ[spin]
-                self.u_occ.append(np.linalg.eigh(fock_oo)[1])
-                fock_vv = mo_coeff_virt[spin].T @ self.fock[spin] @ mo_coeff_virt[spin]
-                self.u_virt.append(np.linalg.eigh(fock_vv)[1])
-
-        # rotate MO coefficients to pseudo-canonical orbitals
-        self.mo_coeff[0][:, self.occ_idx[0]] = mo_coeff_occ[0] @ self.u_occ[0]
-        self.mo_coeff[1][:, self.occ_idx[1]] = mo_coeff_occ[1] @ self.u_occ[1]
-        self.mo_coeff[0][:, self.virt_idx[0]] = mo_coeff_virt[0] @ self.u_virt[0]
-        self.mo_coeff[1][:, self.virt_idx[1]] = mo_coeff_virt[1] @ self.u_virt[1]
-
-        # rotate step to pseudo-canonical orbitals
-        kappa_vo = self.unpack_vo(kappa)
-        kappa_vo[0] = self.u_virt[0].T @ kappa_vo[0] @ self.u_occ[0]
-        kappa_vo[1] = self.u_virt[1].T @ kappa_vo[1] @ self.u_occ[1]
-        kappa[:] = self.pack_vo(kappa_vo)
-
     # change of reference
     def change_reference(
         self,
@@ -1868,16 +1709,6 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
     # change of reference
     def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray):
-        # perform pseudo-canonicalization for history if enabled
-        if self.pseudo_canonicalization:
-            tangent_vector_vo = self.unpack_vo(tangent_vector)
-            tangent_vector[:] = self.pack_vo(
-                [
-                    self.u_virt[0].T @ tangent_vector_vo[0] @ self.u_occ[0],
-                    self.u_virt[1].T @ tangent_vector_vo[1] @ self.u_occ[1],
-                ]
-            )
-
         return
 
     # function to get orthogonal MO coefficients and occupations
