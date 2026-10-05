@@ -483,8 +483,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _adopted_routines: Tuple[str, ...] = ()
 
     # occupied-occupied and virtual-virtual blocks of the rotation of every spin from
-    # the orbitals the MO objects hold to the canonicalized ones, if the last kernel
-    # used the MO extension
+    # the orbitals the MO objects hold to the final ones, with the masks of the
+    # parameters of both, if the last kernel used the MO extension
     _canonical_rotation: Optional[list] = None
 
     def _reset(self) -> None:
@@ -637,9 +637,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             raise NotImplementedError(
                 "OAO and ARH are not currently implemented for ROHF."
             )
-        if self.arh and self._scf.mol.symmetry:
+        if self.oao and self._scf.mol.symmetry:
             raise NotImplementedError(
-                "ARH is not currently implemented for symmetry-adapted orbitals."
+                "The OAO basis is not currently implemented for symmetry-adapted "
+                "orbitals."
             )
         if not hasattr(self, "hess_update_scheme"):
             self.hess_update_scheme = None
@@ -647,9 +648,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.s_gek = False
 
         # exact orbital updates of RHF and UHF in the MO basis come from the MO
-        # extension, which does not support symmetry yet, so that symmetry-adapted
-        # orbitals keep PySCF's own; the approximate Hessians build on them
-        mo = not self.oao and not isinstance(self, ROHFOTR) and not mol.symmetry
+        # extension; the approximate Hessians build on them
+        mo = not self.oao and not isinstance(self, ROHFOTR)
 
         # get initial guess
         if mo_coeff is not None and mo_occ is not None:
@@ -699,6 +699,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # get indices of all mixed occupation combinations
         self.get_indices()
+
+        # irreps of the MOs, whose occupied-virtual rotations between orbitals of the
+        # same irrep are the parameters of the MO extension
+        orbsym = (
+            np.asarray(self.get_orbsym(self.mo_coeff)) if mo and mol.symmetry else None
+        )
 
         # initialize settings
         settings = SolverSettings()
@@ -755,6 +761,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self.evaluate_dm,
                     settings,
                     mo_settings,
+                    orbsym,
                 )
             elif self.oao:
                 if isinstance(self, RHFOTR):
@@ -829,6 +836,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     evaluate_dm,
                     settings,
                     arh_settings,
+                    orbsym,
                 )
 
             # set the preconditioner, which inverts the approximate Hessian, and extra
@@ -934,14 +942,28 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._count_update()
         self.e_tot = self._scf.energy_tot(self.dm, self.h1e, vhf)
         fock = self._scf.get_fock(self.h1e, self.s1e, vhf, self.dm)
+        # the orbitals the MO extension optimized keep the irreps they started with,
+        # which canonicalization is told so that it diagonalizes the Fock matrix per
+        # irrep and every orbital keeps its irrep, which the masks of the parameters
+        # refer to
+        if mo and orbsym is not None:
+            self.mo_coeff = lib.tag_array(self.mo_coeff, orbsym=orbsym)
         self.mo_energy, self.mo_coeff = self._scf.canonicalize(
             self.mo_coeff, self.mo_occ, fock
         )
+        masks_evaluated = self._vo_masks() if mo else []
+        self._finalize()
 
-        # get the rotation from the orbitals of the MO objects to the canonicalized
-        # ones, with which a stability check after the kernel starts from the rotations
-        # it would start from at the canonicalized orbitals and returns its direction
-        # for these
+        # finalizing may reorder the orbitals within the occupied and the virtual
+        # ones, which with symmetry changes the irrep at every orbital index, so the
+        # masks of the parameters are determined anew for the final orbitals
+        if not self.oao:
+            self.get_indices()
+
+        # get the rotation from the orbitals of the MO objects to the final ones with
+        # the masks of the parameters of either, with which a stability check after
+        # the kernel starts from the rotations it would start from at the final
+        # orbitals and returns its direction for these
         if mo:
             rotation = (
                 np.swapaxes(mo_coeff_evaluated, -1, -2) @ self.s1e @ self.mo_coeff
@@ -950,43 +972,59 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             virt_idx = self.virt_idx if isinstance(self, UHFOTR) else [self.virt_idx]
             rotation = rotation if isinstance(self, UHFOTR) else rotation[None]
             self._canonical_rotation = [
-                (u[np.ix_(occ, occ)], u[np.ix_(virt, virt)])
-                for u, occ, virt in zip(rotation, occ_idx, virt_idx)
+                (u[np.ix_(occ, occ)], u[np.ix_(virt, virt)], mask_evaluated, mask)
+                for u, occ, virt, mask_evaluated, mask in zip(
+                    rotation, occ_idx, virt_idx, masks_evaluated, self._vo_masks()
+                )
             ]
             self.stability_get_extra_trial_vectors = self._canonical_trial_vectors
 
-        self._finalize()
-
         return self.e_tot
+
+    def _vo_masks(self) -> list:
+        """
+        this function returns the virtual-occupied blocks of the masks of the
+        parameters of every spin, whose entries in row-major order are the parameters
+        """
+        if isinstance(self, UHFOTR):
+            return list(self.rot_matrix_mask_vo)
+
+        return [self.rot_matrix_mask_vo]
 
     def _rotate_canonical(self, vector: np.ndarray, to_canonical: bool) -> np.ndarray:
         """
         this function rotates an orbital rotation from the orbitals the MO objects hold
-        to the canonicalized ones or back
+        to the final ones or back
         """
-        vector_vo = self.unpack_vo(vector)
-        spins = vector_vo if isinstance(self, UHFOTR) else [vector_vo]
-        spins = [
-            u_virt.T @ x_vo @ u_occ if to_canonical else u_virt @ x_vo @ u_occ.T
-            for x_vo, (u_occ, u_virt) in zip(spins, self._canonical_rotation)
-        ]
+        offset, rotated = 0, []
+        for u_occ, u_virt, mask_evaluated, mask in self._canonical_rotation:
+            source, target = (
+                (mask_evaluated, mask) if to_canonical else (mask, mask_evaluated)
+            )
+            x_vo = np.zeros(source.shape)
+            x_vo[source] = vector[offset : offset + np.count_nonzero(source)]
+            offset += int(np.count_nonzero(source))
+            x_vo = u_virt.T @ x_vo @ u_occ if to_canonical else u_virt @ x_vo @ u_occ.T
+            rotated.append(x_vo[target])
 
-        return self.pack_vo(spins if isinstance(self, UHFOTR) else spins[0])
+        return np.concatenate(rotated)
 
     def _canonical_trial_vectors(self, trial_vectors: np.ndarray) -> None:
         """
         this function returns the rotations along the lowest eigenvalue pairs of the
-        static part of the Hessian at the canonicalized orbitals, the differences of
-        their orbital energies, in increasing order and rotated to the orbitals the MO
-        objects hold
+        static part of the Hessian at the final, canonical orbitals, the differences of
+        the orbital energies of the parameters, in increasing order and rotated to the
+        orbitals the MO objects hold
         """
         mo_energy = self.mo_energy if isinstance(self, UHFOTR) else [self.mo_energy]
         occ_idx = self.occ_idx if isinstance(self, UHFOTR) else [self.occ_idx]
         virt_idx = self.virt_idx if isinstance(self, UHFOTR) else [self.virt_idx]
         pairs = np.concatenate(
             [
-                (energy[virt][:, None] - energy[occ]).ravel()
-                for energy, occ, virt in zip(mo_energy, occ_idx, virt_idx)
+                (energy[virt][:, None] - energy[occ])[mask]
+                for energy, occ, virt, (*_, mask) in zip(
+                    mo_energy, occ_idx, virt_idx, self._canonical_rotation
+                )
             ]
         )
         for vector, idx in zip(trial_vectors, np.argsort(pairs, kind="stable")):
@@ -997,8 +1035,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         stable, direction = super().stability_check()
 
-        # the MO objects hold the orbitals before their canonicalization, so the
-        # direction is rotated to the canonicalized orbitals
+        # the MO objects hold the orbitals before they were canonicalized and
+        # reordered, so the direction is rotated to the final orbitals
         if self._canonical_rotation is not None:
             direction = self._rotate_canonical(direction, True)
 
