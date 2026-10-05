@@ -651,6 +651,22 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # extension; the approximate Hessians build on them
         mo = not self.oao and not isinstance(self, ROHFOTR)
 
+        # orthogonalize the AO basis for the eigensolver as PySCF's own kernel does,
+        # which removes linearly dependent AOs, if this version of PySCF supports it
+        eig_kwargs = (
+            {"x": self.check_linear_dependency(self.s1e)}
+            if hasattr(self, "check_linear_dependency")
+            else {}
+        )
+
+        # the OAO basis rotates all AOs, so it cannot exclude linearly dependent ones
+        if self.oao and "x" in eig_kwargs:
+            if eig_kwargs["x"].shape[1] < self.s1e.shape[0]:
+                raise NotImplementedError(
+                    "The OAO basis is not currently implemented for linearly "
+                    "dependent AOs."
+                )
+
         # get initial guess
         if mo_coeff is not None and mo_occ is not None:
             dm = self.make_rdm1(mo_coeff, mo_occ)
@@ -658,7 +674,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self._count_update()
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
-            mo_energy, mo_tmp = self.eig(fock, self.s1e)
+            mo_energy, mo_tmp = self.eig(fock, self.s1e, **eig_kwargs)
             self.get_occ(mo_energy, mo_tmp)
             mo_tmp = None
 
@@ -674,7 +690,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self._count_update()
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
-            mo_energy, mo_coeff = self.eig(fock, self.s1e)
+            mo_energy, mo_coeff = self.eig(fock, self.s1e, **eig_kwargs)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
 
             # the MO extension evaluates the density of these orbitals itself
