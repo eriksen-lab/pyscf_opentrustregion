@@ -700,6 +700,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self._count_update()
                 self.dm, self.vhf = dm, vhf
 
+        # share the in-core integrals the wrapped object has just built for the
+        # initial potential so that the responses, which go through this object,
+        # neither cache them a second time nor, when a second copy does not fit, fall 
+        # back to direct J/K builds
+        if self.mol is self._scf.mol and not getattr(self, "with_df", None):
+            self._eri = self._scf._eri
+
         self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
 
         # fix phases of MO coefficients to improve deterministic behavior
