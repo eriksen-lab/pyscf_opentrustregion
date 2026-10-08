@@ -438,6 +438,27 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _last_potential = LastResult()
     _adopted_potential = None
 
+    def _check_exchange_kernel(self) -> None:
+        """
+        this function raises if the exact exchange of the functional is not a positive
+        semidefinite kernel: PySCF builds the exchange matrix as hyb K + (alpha - hyb)
+        K_lr = hyb K_sr + alpha K_lr, and the full, short-range and long-range exchange
+        kernels are positive semidefinite, so that this holds exactly when hyb and, for
+        range-separated hybrids, alpha are not negative
+        """
+        if not isinstance(self, scf.hf.KohnShamDFT):
+            return
+        omega, alpha, hyb = self._numint.rsh_and_hybrid_coeff(
+            self.xc, spin=self._scf.mol.spin
+        )
+        if hyb < 0.0 or (omega != 0.0 and alpha < 0.0):
+            raise NotImplementedError(
+                f"The functional {self.xc} has a negative fraction of exact exchange "
+                f"(short-range {hyb}, long-range {alpha}), which multisecant SR1 does "
+                "not support since its exact-exchange kernel is not positive "
+                "semidefinite."
+            )
+
     def _build_potential(self, dm: np.ndarray) -> np.ndarray:
         """
         this function builds the effective potential at a density
@@ -702,7 +723,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # share the in-core integrals the wrapped object has just built for the
         # initial potential so that the responses, which go through this object,
-        # neither cache them a second time nor, when a second copy does not fit, fall 
+        # neither cache them a second time nor, when a second copy does not fit, fall
         # back to direct J/K builds
         if self.mol is self._scf.mol and not getattr(self, "with_df", None):
             self._eri = self._scf._eri
@@ -830,11 +851,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in arh_setting_fields:
                 if hasattr(self, setting):
                     setattr(arh_settings, setting, getattr(self, setting))
-            evaluate_dm = (
-                self.evaluate_dm_spin
-                if isinstance(self, UHFOTR)
-                else self.evaluate_dm_nonlinear
-            )
+            # multisecant SR1 splits the linear potential into a Coulomb and an
+            # exact-exchange term, which requires an exact-exchange kernel that is
+            # positive semidefinite
+            if arh_settings.arh_type == "ms_sr1":
+                self._check_exchange_kernel()
             # run factory after the factory of its basis, with which it shares the
             # orbitals it updates in place and the orbital objects whose exact Hessian
             # the stability check uses
@@ -844,7 +865,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self.s1e,
                     n_particle,
                     self._scf.mol.nao,
-                    evaluate_dm,
+                    self.evaluate_dm_arh,
                     settings,
                     arh_settings,
                 )
@@ -856,7 +877,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     n_particle,
                     self._scf.mol.nao,
                     self.mo_coeff.shape[-1],
-                    evaluate_dm,
+                    self.evaluate_dm_arh,
                     settings,
                     arh_settings,
                     orbsym,
@@ -1083,6 +1104,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
+    def _build_potential(self, dm: np.ndarray) -> np.ndarray:
+        """
+        this function builds the effective potential at a density; restricted
+        Hartree-Fock builds it as RHF.get_veff does, from one Coulomb and exchange
+        build, but tags both matrices onto the result as Kohn-Sham's potential carries
+        them, since its Coulomb and exact-exchange potentials need them separately
+        """
+        if isinstance(self, scf.hf.KohnShamDFT):
+            return super()._build_potential(dm)
+        vj, vk = self._scf.get_jk(self._scf.mol, dm)
+
+        return lib.tag_array(vj - 0.5 * vk, vj=vj, vk=vk)
+
     # fix phases of MO coefficients to improve deterministic behavior
     def fix_phase(self):
         abs_mo_coeff = np.abs(self.mo_coeff)
@@ -1164,25 +1198,35 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff), response
 
-    # evaluate quantities at a density matrix with a separate non-linear (XC)
-    # contribution to the effective potential
-    def evaluate_dm_nonlinear(
+    # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
+    # non-linear (XC) contributions to the effective potential
+    def evaluate_dm_arh(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
+        v_coulomb: Optional[np.ndarray],
+        v_exchange: Optional[np.ndarray],
         v_nonlinear: Optional[np.ndarray],
     ) -> float:
         # anything the caller did not ask for is not built
         veff = self._potential(2.0 * dm)
 
+        # linear (Coulomb and exact exchange) part of the potential, the Coulomb minus
+        # the exact-exchange potential, which is half the exchange matrix tagged onto
+        # the potential, already weighted by the exact-exchange fractions of the
+        # functional, and vanishes without exact exchange
+        vk = getattr(veff, "vk", None)
+        exchange = 0.0 if vk is None else 0.5 * np.asarray(vk)
+        if v_coulomb is not None:
+            v_coulomb[:, :] = veff.vj
+        if v_exchange is not None:
+            v_exchange[:, :] = exchange
+
+        # non-linear (exchange-correlation) part, which Hartree-Fock does not have
         if v_nonlinear is not None:
             if isinstance(self, scf.hf.KohnShamDFT):
-                v_linear = np.asarray(veff.vj)
-                if getattr(veff, "vk", None) is not None:
-                    v_linear = v_linear - 0.5 * veff.vk
-                v_nonlinear[:, :] = np.asarray(veff) - v_linear
+                v_nonlinear[:, :] = np.asarray(veff) - (np.asarray(veff.vj) - exchange)
             else:
-                # no non-linear contribution for Hartree-Fock
                 v_nonlinear[:, :] = 0.0
 
         if fock is not None:
@@ -1485,7 +1529,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         """
         this function builds the effective potential at a density; unrestricted
         Hartree-Fock builds it from the Coulomb and exchange matrices of each spin and
-        tags these onto the result, since its same-spin and opposite-spin potentials
+        tags these onto the result, since its Coulomb and exact-exchange potentials
         need them separately
         """
         if isinstance(self, scf.hf.KohnShamDFT):
@@ -1599,62 +1643,43 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         return self._scf.energy_tot(dm, self.h1e, vhf), response
 
-    # evaluate quantities at a density matrix with separate same-spin, opposite-spin
-    # and non-linear (XC) contributions to the effective potential
-    def evaluate_dm_spin(
+    # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
+    # non-linear (XC) contributions to the effective potential
+    def evaluate_dm_arh(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
-        v_same_spin: Optional[np.ndarray],
-        v_opposite_spin: Optional[np.ndarray],
+        v_coulomb: Optional[np.ndarray],
+        v_exchange: Optional[np.ndarray],
         v_nonlinear: Optional[np.ndarray],
     ) -> float:
-        # the channel potentials share one build, so they are all built as soon as any
-        # of them is wanted; anything else the caller did not ask for is skipped
-        channels = (
-            v_same_spin is not None
-            or v_opposite_spin is not None
-            or v_nonlinear is not None
-        )
+        # anything the caller did not ask for is not built
+        veff = self._potential(dm)
+        ks = isinstance(self, scf.hf.KohnShamDFT)
 
-        if isinstance(self, scf.hf.KohnShamDFT):
-            # get KS effective potential
-            veff = self._potential(dm)
+        # exact-exchange potential of each spin, the exchange matrix tagged onto the
+        # potential, already weighted by the exact-exchange fractions of the
+        # functional, which vanishes without exact exchange
+        vk = getattr(veff, "vk", None)
+        exchange = 0.0 if vk is None else np.asarray(vk)
+        if v_exchange is not None:
+            v_exchange[:, :, :] = exchange
 
-            if channels:
-                # get the coulomb potential of each spin
-                vj = self._spin_coulomb(dm, veff)
+        # Coulomb potential of the density matrix of each spin, which Hartree-Fock tags
+        # onto its potential, while Kohn-Sham tags only that of the total density and
+        # needs a second pass
+        if v_coulomb is not None or (ks and v_nonlinear is not None):
+            vj = self._spin_coulomb(dm, veff) if ks else veff.vj
+            if v_coulomb is not None:
+                v_coulomb[:, :, :] = vj
 
-                # linear part of the potential
-                same_spin = np.array(vj)
-                if veff.vk is not None:
-                    same_spin -= veff.vk
-                opposite_spin = vj[::-1]
-
-                if v_same_spin is not None:
-                    v_same_spin[:, :, :] = same_spin
-                if v_opposite_spin is not None:
-                    v_opposite_spin[:, :, :] = opposite_spin
-
-                # non-linear (exchange-correlation) part
-                if v_nonlinear is not None:
-                    v_nonlinear[:, :, :] = np.asarray(veff) - same_spin - opposite_spin
-
-        else:
-            # get the mean-field potential, tagged with the Coulomb and exchange
-            # matrices of each spin
-            veff = self._potential(dm)
-            vj, vk = veff.vj, veff.vk
-
-            # construct same-spin and opposite-spin potentials, the entire
-            # Hartree-Fock potential is linear in the density matrix
-            if v_same_spin is not None:
-                v_same_spin[:, :, :] = vj - vk
-            if v_opposite_spin is not None:
-                v_opposite_spin[:, :, :] = vj[::-1]
-
-            # no non-linear contribution for Hartree-Fock
-            if v_nonlinear is not None:
+        # non-linear (exchange-correlation) part, the potential minus the linear part,
+        # the Coulomb potential of both spins minus the exact-exchange potential, which
+        # Hartree-Fock does not have
+        if v_nonlinear is not None:
+            if ks:
+                v_nonlinear[:, :, :] = np.asarray(veff) - (vj[0] + vj[1] - exchange)
+            else:
                 v_nonlinear[:, :, :] = 0.0
 
         # construct Fock matrix
