@@ -30,6 +30,7 @@ from pyscf.opentrustregion.opentrustregion_interface import (
     OTR,
     assign_solver_settings,
     assign_stability_settings,
+    non_setting_fields,
     setting_fields,
     setting_is_assignable,
     setting_was_set_by_user,
@@ -180,6 +181,8 @@ class SettingsTests(unittest.TestCase):
         for fields in (solver_setting_fields, stability_setting_fields):
             self.assertNotIn("initialized", fields)
             self.assertNotIn("stability_settings", fields)
+            for field in non_setting_fields:
+                self.assertNotIn(field, fields)
 
         # the settings the library exposes, pinned so that adding or removing one
         # upstream shows up here rather than silently changing what the interface
@@ -232,6 +235,7 @@ class SettingsTests(unittest.TestCase):
                 field[0]
                 for field in SolverSettingsC._fields_
                 if field[0] not in ("initialized", "stability_settings")
+                and field[0] not in non_setting_fields
             ],
         )
 

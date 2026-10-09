@@ -22,15 +22,21 @@ if TYPE_CHECKING:
     OTRHessX = Callable[[np.ndarray, np.ndarray], None]
 
 
+# fields of the settings structures that are not settings
+non_setting_fields = ("max_precision_reached", "n_update_orbs", "n_hess_x", "context")
+
+
 def setting_fields(settings_c: type[Structure]) -> list[str]:
     """
     this function collects the settings a user can assign on a settings object,
-    skipping the initialization flag and any nested settings structure
+    skipping the initialization flag, the fields that are not settings and any nested
+    settings structure
     """
     return [
         field[0]
         for field in settings_c._fields_
         if field[0] != "initialized"
+        and field[0] not in non_setting_fields
         and not (isinstance(field[1], type) and issubclass(field[1], Structure))
     ]
 
