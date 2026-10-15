@@ -6,33 +6,26 @@
 
 from __future__ import annotations
 
-import weakref
+import functools
 import numpy as np
 from dataclasses import dataclass
 import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, newton_casscf, addons
-from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
+from pyopentrustregion import (
+    SolverSettings,
+    StabilitySettings,
+    SolverState,
+    solver,
+    stability_check,
+)
 from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
-from pyopentrustregion.extensions.quasi_newton import (
-    QNSettings,
-    update_orbs_qn_factory,
-    update_orbs_qn_deconstructor,
-)
-from pyopentrustregion.extensions.mo import MOSettings, mo_factory, mo_deconstructor
-from pyopentrustregion.extensions.oao import OAOSettings, oao_factory, oao_deconstructor
-from pyopentrustregion.extensions.arh import (
-    ARHSettings,
-    arh_factory_mo,
-    arh_factory_oao,
-    arh_deconstructor,
-)
-from pyopentrustregion.extensions.s_gek import (
-    SGEKSettings,
-    update_orbs_s_gek_factory,
-    update_orbs_s_gek_deconstructor,
-)
+from pyopentrustregion.extensions.quasi_newton import QNSettings, qn_factory
+from pyopentrustregion.extensions.mo import MOSettings, mo_factory
+from pyopentrustregion.extensions.oao import OAOSettings, oao_factory
+from pyopentrustregion.extensions.arh import ARHSettings, arh_factory
+from pyopentrustregion.extensions.s_gek import SGEKSettings, s_gek_factory
 from pyopentrustregion.extensions.mo.python_interface import MOSettingsC
 from pyopentrustregion.extensions.oao.python_interface import OAOSettingsC
 from pyopentrustregion.extensions.arh.python_interface import ARHSettingsC
@@ -45,15 +38,19 @@ if TYPE_CHECKING:
     from typing import Any, Tuple, Callable, Optional, Union
 
 
+# fields of the settings structures that are not settings
+non_setting_fields = ("initialized", "context")
+
+
 def setting_fields(settings_c: type[Structure]) -> list[str]:
     """
     this function collects the settings a user can assign on a settings object,
-    skipping the initialization flag and any nested settings structure
+    skipping the fields that are not settings and any nested settings structure
     """
     return [
         field[0]
         for field in settings_c._fields_
-        if field[0] != "initialized"
+        if field[0] not in non_setting_fields
         and not (isinstance(field[1], type) and issubclass(field[1], Structure))
     ]
 
@@ -252,7 +249,7 @@ class OTR:
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
         stable, _ = stability_check(
-            h_diag, self.count_stability_hess_x, self.n_param, settings, direction
+            h_diag, self.count_stability_hess_x, self.n_param, settings, kappa=direction
         )
 
         return stable, direction
@@ -357,7 +354,7 @@ class LocalizerOTR(OTR):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.func, self.update_orbs, self.n_param, settings)
+        solver(self.update_orbs, self.func, self.n_param, settings)
 
         return self.mo_coeff
 
@@ -491,7 +488,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # routines a kernel can replace or take over from the extension factories, and
     # those the last kernel did, which refer to the extension objects of that kernel
-    # that the next kernel frees
+    # and keep them alive and which the next kernel drops, so that its factories wrap
+    # the routines of this object
     factory_routines = (
         "func",
         "update_orbs",
@@ -750,23 +748,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             np.asarray(self.get_orbsym(self.mo_coeff)) if mo and mol.symmetry else None
         )
 
-        # initialize settings
+        # initialize settings and the state of the solver, which the extension
+        # objects read
         settings = SolverSettings()
         assign_solver_settings(self, settings)
-
-        # deallocate resources from a previous kernel() call on this instance before
-        # registering a finalizer for the current one
-        if getattr(self, "_finalizer", None) is not None and self._finalizer.alive:
-            self._finalizer()
-        self._finalizer = weakref.finalize(
-            self,
-            self._cleanup,
-            self.arh,
-            self.hess_update_scheme,
-            self.s_gek,
-            mo,
-            self.oao,
-        )
+        state = SolverState()
 
         # number of particles for OAO and ARH
         n_particle = 1 if isinstance(self, RHFOTR) else 2
@@ -795,7 +781,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     if hasattr(self, setting):
                         setattr(mo_settings, setting, getattr(self, setting))
                 # run factory, which rotates the MO coefficients in place
-                self.func, exact_update_orbs = mo_factory(
+                exact_update_orbs, self.func = mo_factory(
                     self.mo_coeff,
                     self.s1e,
                     np.count_nonzero(self.mo_occ, axis=-1),
@@ -804,6 +790,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self.mo_coeff.shape[-1],
                     self.evaluate_dm,
                     settings,
+                    state,
                     mo_settings,
                     orbsym,
                 )
@@ -817,13 +804,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     if hasattr(self, setting):
                         setattr(oao_settings, setting, getattr(self, setting))
                 # run factory and set projection
-                self.func, exact_update_orbs = oao_factory(
+                exact_update_orbs, self.func = oao_factory(
                     dm_per_spin_ao,
                     self.s1e,
                     n_particle,
                     self._scf.mol.nao,
                     self.evaluate_dm,
                     settings,
+                    state,
                     oao_settings,
                 )
                 self.project = settings.project
@@ -834,6 +822,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 settings.stability_settings.get_extra_trial_vectors
             )
 
+            # the quasi-Newton and S-GEK factories accept a wrapper of the returned
+            # orbital updating function if it is marked as one
+            @functools.wraps(exact_update_orbs)
             def wrapped_update_orbs(kappa, grad, h_diag):
                 n_jk = self.n_jk
                 func, hess_x = exact_update_orbs(kappa, grad, h_diag)
@@ -856,32 +847,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             # positive semidefinite
             if arh_settings.arh_type == "ms_sr1":
                 self._check_exchange_kernel()
-            # run factory after the factory of its basis, with which it shares the
-            # orbitals it updates in place and the orbital objects whose exact Hessian
-            # the stability check uses
-            if self.oao:
-                self.func, approx_update_orbs = arh_factory_oao(
-                    dm_per_spin_ao,
-                    self.s1e,
-                    n_particle,
-                    self._scf.mol.nao,
-                    self.evaluate_dm_arh,
-                    settings,
-                    arh_settings,
-                )
-            else:
-                self.func, approx_update_orbs = arh_factory_mo(
-                    self.mo_coeff,
-                    self.s1e,
-                    np.count_nonzero(self.mo_occ, axis=-1),
-                    n_particle,
-                    self._scf.mol.nao,
-                    self.mo_coeff.shape[-1],
-                    self.evaluate_dm_arh,
-                    settings,
-                    arh_settings,
-                    orbsym,
-                )
+            # run factory after the factory of its basis, whose object it builds on,
+            # which holds the orbitals it updates in place and provides the exact
+            # Hessian the stability check uses
+            approx_update_orbs, self.func = arh_factory(
+                self.evaluate_dm_arh, settings, state, arh_settings
+            )
 
             # set the preconditioner, which inverts the approximate Hessian, and extra
             # trial vectors
@@ -906,15 +877,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in qn_setting_fields:
                 if hasattr(self, setting):
                     setattr(qn_settings, setting, getattr(self, setting))
-            self.approx_update_orbs = self.raw_approx_update_orbs = (
-                update_orbs_qn_factory(
-                    self.update_orbs,
-                    self.transport,
-                    self.init_hess,
-                    self.n_param,
-                    qn_settings,
-                )
+            self.approx_update_orbs, self.func = qn_factory(
+                self.n_param,
+                self.update_orbs,
+                self.func,
+                self.transport,
+                self.init_hess,
+                settings,
+                state,
+                qn_settings,
             )
+            self.raw_approx_update_orbs = self.approx_update_orbs
         elif self.s_gek:
             if self.oao:
                 raise RuntimeError(
@@ -930,14 +903,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             for setting in s_gek_setting_fields:
                 if hasattr(self, setting):
                     setattr(s_gek_settings, setting, getattr(self, setting))
-            self.approx_update_orbs = self.raw_approx_update_orbs = (
-                update_orbs_s_gek_factory(
-                    self.update_orbs,
-                    self.change_reference,
-                    self.n_param,
-                    s_gek_settings,
-                )
+            self.approx_update_orbs, self.func = s_gek_factory(
+                self.n_param,
+                self.update_orbs,
+                self.func,
+                self.change_reference,
+                settings,
+                state,
+                s_gek_settings,
             )
+            self.raw_approx_update_orbs = self.approx_update_orbs
 
         # record the routines the extensions replaced or took over, so that the next
         # kernel drops them
@@ -962,14 +937,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # call solver
         solver(
-            self.func,
             (
                 self.update_orbs
                 if not hasattr(self, "approx_update_orbs")
                 else self.count_approx_update_orbs(self.approx_update_orbs)
             ),
+            self.func,
             self.n_param,
             settings,
+            state,
         )
 
         # the MO objects keep the orbitals they hold now
@@ -1085,21 +1061,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             direction = self._rotate_canonical(direction, True)
 
         return stable, direction
-
-    @staticmethod
-    def _cleanup(arh, hess_update_scheme, s_gek, mo, oao):
-        # call deconstructors
-        if arh:
-            arh_deconstructor()
-        else:
-            if hess_update_scheme is not None:
-                update_orbs_qn_deconstructor()
-            elif s_gek:
-                update_orbs_s_gek_deconstructor()
-            if mo:
-                mo_deconstructor()
-            elif oao:
-                oao_deconstructor()
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
@@ -1966,7 +1927,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.func, self.update_orbs, self.n_param, settings)
+        solver(self.update_orbs, self.func, self.n_param, settings)
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
