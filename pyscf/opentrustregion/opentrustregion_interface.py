@@ -773,154 +773,156 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # routines before the extensions replace or take over any of them
         routines = {name: self.__dict__.get(name) for name in self.factory_routines}
 
-        # get exact orbital updates from the MO or the OAO extension
-        if mo or self.oao:
-            if mo:
-                mo_settings = MOSettings()
-                for setting in mo_setting_fields:
-                    if hasattr(self, setting):
-                        setattr(mo_settings, setting, getattr(self, setting))
-                # run factory, which rotates the MO coefficients in place
-                exact_update_orbs, self.func = mo_factory(
-                    self.mo_coeff,
-                    self.s1e,
-                    np.count_nonzero(self.mo_occ, axis=-1),
-                    n_particle,
-                    self._scf.mol.nao,
-                    self.mo_coeff.shape[-1],
-                    self.evaluate_dm,
-                    settings,
-                    state,
-                    mo_settings,
-                    orbsym,
-                )
-            elif self.oao:
-                if isinstance(self, RHFOTR):
-                    dm_per_spin_ao = self.dm / 2
-                else:
-                    dm_per_spin_ao = self.dm
-                oao_settings = OAOSettings()
-                for setting in oao_setting_fields:
-                    if hasattr(self, setting):
-                        setattr(oao_settings, setting, getattr(self, setting))
-                # run factory and set projection
-                exact_update_orbs, self.func = oao_factory(
-                    dm_per_spin_ao,
-                    self.s1e,
-                    n_particle,
-                    self._scf.mol.nao,
-                    self.evaluate_dm,
-                    settings,
-                    state,
-                    oao_settings,
-                )
-                self.project = settings.project
-
-            # set preconditioner and extra trial vectors
-            self.precond = settings.precond
-            self.stability_get_extra_trial_vectors = (
-                settings.stability_settings.get_extra_trial_vectors
-            )
-
-            # the quasi-Newton and S-GEK factories accept a wrapper of the returned
-            # orbital updating function if it is marked as one
-            @functools.wraps(exact_update_orbs)
-            def wrapped_update_orbs(kappa, grad, h_diag):
-                n_jk = self.n_jk
-                func, hess_x = exact_update_orbs(kappa, grad, h_diag)
-                if self._moves(kappa) or self.n_jk > n_jk:
-                    self._count_update()
-                self.raw_hess_x = hess_x
-
-                return func, self.count_hess_x
-
-            self.update_orbs = wrapped_update_orbs
-
-        # define callback functions for approximate Hessians
-        if self.arh:
-            arh_settings = ARHSettings()
-            for setting in arh_setting_fields:
-                if hasattr(self, setting):
-                    setattr(arh_settings, setting, getattr(self, setting))
-            # multisecant SR1 splits the linear potential into a Coulomb and an
-            # exact-exchange term, which requires an exact-exchange kernel that is
-            # positive semidefinite
-            if arh_settings.arh_type == "ms_sr1":
-                self._check_exchange_kernel()
-            # run factory after the factory of its basis, whose object it builds on,
-            # which holds the orbitals it updates in place and provides the exact
-            # Hessian the stability check uses
-            approx_update_orbs, self.func = arh_factory(
-                self.evaluate_dm_arh, settings, state, arh_settings
-            )
-
-            # set the preconditioner, which inverts the approximate Hessian, and extra
-            # trial vectors
-            self.precond = settings.precond
-            self.stability_get_extra_trial_vectors = (
-                settings.stability_settings.get_extra_trial_vectors
-            )
-
-            def wrapped_approx_update_orbs(
-                kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-            ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-                n_jk = self.n_jk
-                func, hess_x = approx_update_orbs(kappa, grad, h_diag)
-                if self._moves(kappa) or self.n_jk > n_jk:
-                    self._count_update()
-                return func, hess_x
-
-            self.approx_update_orbs = wrapped_approx_update_orbs
-            self.raw_approx_update_orbs = approx_update_orbs
-        elif self.hess_update_scheme is not None:
-            qn_settings = QNSettings()
-            for setting in qn_setting_fields:
-                if hasattr(self, setting):
-                    setattr(qn_settings, setting, getattr(self, setting))
-            self.approx_update_orbs, self.func = qn_factory(
-                self.n_param,
-                self.update_orbs,
-                self.func,
-                self.transport,
-                self.init_hess,
-                settings,
-                state,
-                qn_settings,
-            )
-            self.raw_approx_update_orbs = self.approx_update_orbs
-        elif self.s_gek:
-            if self.oao:
-                raise RuntimeError(
-                    "S-GEK cannot be performed in the orthogonal AO basis."
-                )
-            if isinstance(self, ROHFOTR):
-                raise RuntimeError(
-                    "ROHFOTR is not supported for S-GEK because history cannot be "
-                    "transformed consistently to make redundant blocks vanish for flag "
-                    "manifold."
-                )
-            s_gek_settings = SGEKSettings()
-            for setting in s_gek_setting_fields:
-                if hasattr(self, setting):
-                    setattr(s_gek_settings, setting, getattr(self, setting))
-            self.approx_update_orbs, self.func = s_gek_factory(
-                self.n_param,
-                self.update_orbs,
-                self.func,
-                self.change_reference,
-                settings,
-                state,
-                s_gek_settings,
-            )
-            self.raw_approx_update_orbs = self.approx_update_orbs
-
-        # record the routines the extensions replaced or took over, so that the next
+        # the extensions replace or take over routines of this object, which are
+        # recorded also if a factory or a check after one raises, so that the next
         # kernel drops them
-        self._adopted_routines = tuple(
-            name
-            for name in self.factory_routines
-            if self.__dict__.get(name) is not routines[name]
-        )
+        try:
+            # get exact orbital updates from the MO or the OAO extension
+            if mo or self.oao:
+                if mo:
+                    mo_settings = MOSettings()
+                    for setting in mo_setting_fields:
+                        if hasattr(self, setting):
+                            setattr(mo_settings, setting, getattr(self, setting))
+                    # run factory, which rotates the MO coefficients in place
+                    exact_update_orbs, self.func = mo_factory(
+                        self.mo_coeff,
+                        self.s1e,
+                        np.count_nonzero(self.mo_occ, axis=-1),
+                        n_particle,
+                        self._scf.mol.nao,
+                        self.mo_coeff.shape[-1],
+                        self.evaluate_dm,
+                        settings,
+                        state,
+                        mo_settings,
+                        orbsym,
+                    )
+                elif self.oao:
+                    if isinstance(self, RHFOTR):
+                        dm_per_spin_ao = self.dm / 2
+                    else:
+                        dm_per_spin_ao = self.dm
+                    oao_settings = OAOSettings()
+                    for setting in oao_setting_fields:
+                        if hasattr(self, setting):
+                            setattr(oao_settings, setting, getattr(self, setting))
+                    # run factory and set projection
+                    exact_update_orbs, self.func = oao_factory(
+                        dm_per_spin_ao,
+                        self.s1e,
+                        n_particle,
+                        self._scf.mol.nao,
+                        self.evaluate_dm,
+                        settings,
+                        state,
+                        oao_settings,
+                    )
+                    self.project = settings.project
+
+                # set preconditioner and extra trial vectors
+                self.precond = settings.precond
+                self.stability_get_extra_trial_vectors = (
+                    settings.stability_settings.get_extra_trial_vectors
+                )
+
+                # the quasi-Newton and S-GEK factories accept a wrapper of the returned
+                # orbital updating function if it is marked as one
+                @functools.wraps(exact_update_orbs)
+                def wrapped_update_orbs(kappa, grad, h_diag):
+                    n_jk = self.n_jk
+                    func, hess_x = exact_update_orbs(kappa, grad, h_diag)
+                    if self._moves(kappa) or self.n_jk > n_jk:
+                        self._count_update()
+                    self.raw_hess_x = hess_x
+
+                    return func, self.count_hess_x
+
+                self.update_orbs = wrapped_update_orbs
+
+            # define callback functions for approximate Hessians
+            if self.arh:
+                arh_settings = ARHSettings()
+                for setting in arh_setting_fields:
+                    if hasattr(self, setting):
+                        setattr(arh_settings, setting, getattr(self, setting))
+                # multisecant SR1 splits the linear potential into a Coulomb and an
+                # exact-exchange term, which requires an exact-exchange kernel that is
+                # positive semidefinite
+                if arh_settings.arh_type == "ms_sr1":
+                    self._check_exchange_kernel()
+                # run factory after the factory of its basis, whose object it builds on,
+                # which holds the orbitals it updates in place and provides the exact
+                # Hessian the stability check uses
+                approx_update_orbs, self.func = arh_factory(
+                    self.evaluate_dm_arh, settings, state, arh_settings
+                )
+
+                # set the preconditioner, which inverts the approximate Hessian, and extra
+                # trial vectors
+                self.precond = settings.precond
+                self.stability_get_extra_trial_vectors = (
+                    settings.stability_settings.get_extra_trial_vectors
+                )
+
+                def wrapped_approx_update_orbs(
+                    kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+                ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
+                    n_jk = self.n_jk
+                    func, hess_x = approx_update_orbs(kappa, grad, h_diag)
+                    if self._moves(kappa) or self.n_jk > n_jk:
+                        self._count_update()
+                    return func, hess_x
+
+                self.approx_update_orbs = wrapped_approx_update_orbs
+                self.raw_approx_update_orbs = approx_update_orbs
+            elif self.hess_update_scheme is not None:
+                qn_settings = QNSettings()
+                for setting in qn_setting_fields:
+                    if hasattr(self, setting):
+                        setattr(qn_settings, setting, getattr(self, setting))
+                self.approx_update_orbs, self.func = qn_factory(
+                    self.n_param,
+                    self.update_orbs,
+                    self.func,
+                    self.transport,
+                    self.init_hess,
+                    settings,
+                    state,
+                    qn_settings,
+                )
+                self.raw_approx_update_orbs = self.approx_update_orbs
+            elif self.s_gek:
+                if self.oao:
+                    raise RuntimeError(
+                        "S-GEK cannot be performed in the orthogonal AO basis."
+                    )
+                if isinstance(self, ROHFOTR):
+                    raise RuntimeError(
+                        "ROHFOTR is not supported for S-GEK because history cannot be "
+                        "transformed consistently to make redundant blocks vanish for flag "
+                        "manifold."
+                    )
+                s_gek_settings = SGEKSettings()
+                for setting in s_gek_setting_fields:
+                    if hasattr(self, setting):
+                        setattr(s_gek_settings, setting, getattr(self, setting))
+                self.approx_update_orbs, self.func = s_gek_factory(
+                    self.n_param,
+                    self.update_orbs,
+                    self.func,
+                    self.change_reference,
+                    settings,
+                    state,
+                    s_gek_settings,
+                )
+                self.raw_approx_update_orbs = self.approx_update_orbs
+        finally:
+            self._adopted_routines = tuple(
+                name
+                for name in self.factory_routines
+                if self.__dict__.get(name) is not routines[name]
+            )
 
         # set (approximate) Hessian linear transformation for stability check
         if self.stability:
