@@ -248,7 +248,7 @@ class OTR:
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
-        stable, _ = stability_check(
+        stable = stability_check(
             h_diag, self.count_stability_hess_x, self.n_param, settings, kappa=direction
         )
 
