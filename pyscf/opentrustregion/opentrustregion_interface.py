@@ -21,15 +21,23 @@ from pyopentrustregion import (
     stability_check,
 )
 from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
-from pyopentrustregion.extensions.quasi_newton import QNSettings, qn_factory
+from pyopentrustregion.extensions.rotation_qn import (
+    RotationQNSettings,
+    rotation_qn_factory,
+)
 from pyopentrustregion.extensions.mo import MOSettings, mo_factory
 from pyopentrustregion.extensions.oao import OAOSettings, oao_factory
-from pyopentrustregion.extensions.arh import ARHSettings, arh_factory
+from pyopentrustregion.extensions.density_qn import (
+    DensityQNSettings,
+    density_qn_factory,
+)
 from pyopentrustregion.extensions.s_gek import SGEKSettings, s_gek_factory
 from pyopentrustregion.extensions.mo.python_interface import MOSettingsC
 from pyopentrustregion.extensions.oao.python_interface import OAOSettingsC
-from pyopentrustregion.extensions.arh.python_interface import ARHSettingsC
-from pyopentrustregion.extensions.quasi_newton.python_interface import QNSettingsC
+from pyopentrustregion.extensions.density_qn.python_interface import DensityQNSettingsC
+from pyopentrustregion.extensions.rotation_qn.python_interface import (
+    RotationQNSettingsC,
+)
 from pyopentrustregion.extensions.s_gek.python_interface import SGEKSettingsC
 from ctypes import Structure
 from typing import TYPE_CHECKING
@@ -84,9 +92,16 @@ solver_setting_fields = setting_fields(SolverSettingsC)
 stability_setting_fields = setting_fields(StabilitySettingsC)
 mo_setting_fields = setting_fields(MOSettingsC)
 oao_setting_fields = setting_fields(OAOSettingsC)
-arh_setting_fields = setting_fields(ARHSettingsC)
-qn_setting_fields = setting_fields(QNSettingsC)
+density_qn_setting_fields = setting_fields(DensityQNSettingsC)
+rotation_qn_setting_fields = setting_fields(RotationQNSettingsC)
 s_gek_setting_fields = setting_fields(SGEKSettingsC)
+
+# the quasi-Newton methods of the two extensions, whose names differ, so that the
+# method alone selects the extension: the density QN methods update the Hessian in the
+# space of the density matrices, the rotation QN methods in that of the orbital
+# rotations
+density_qn_methods = ("arh", "symm_arh", "ms_psb", "ms_sp", "ms_sr1")
+rotation_qn_methods = ("sr1", "bfgs")
 
 # PySCF uses these field names itself, so their values are inherited from PySCF rather
 # than chosen for the solver and must not silently override the solver's own defaults
@@ -398,8 +413,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _keys = set(
         mo_setting_fields
         + oao_setting_fields
-        + arh_setting_fields
-        + qn_setting_fields
+        + density_qn_setting_fields
+        + rotation_qn_setting_fields
         + s_gek_setting_fields
         + [
             "_adopted_routines",
@@ -413,7 +428,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "n_jk_response",
             "n_jk_response_stability",
             "oao",
-            "arh",
             "s_gek",
         ]
     )
@@ -644,23 +658,33 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.h1e = self._scf.get_hcore(mol)
         self.s1e = self._scf.get_ovlp(mol)
 
-        # set default values for OTR extensions, ARH parameterizes the orbitals in the
-        # MO basis unless the orthogonal AO basis is requested
+        # set default values for OTR extensions, density QN parameterizes the orbitals
+        # in the MO basis unless the orthogonal AO basis is requested, and the
+        # quasi-Newton method, in any letter case, selects density QN or rotation QN
         if not hasattr(self, "oao"):
             self.oao = False
-        if not hasattr(self, "arh"):
-            self.arh = False
-        if isinstance(self, ROHFOTR) and (self.oao or self.arh):
+        if not hasattr(self, "qn_method"):
+            self.qn_method = None
+        qn_method = None if self.qn_method is None else self.qn_method.lower()
+        if qn_method is not None and qn_method not in (
+            density_qn_methods + rotation_qn_methods
+        ):
+            raise ValueError(
+                f"Unknown quasi-Newton method {self.qn_method!r}: the density QN "
+                f"methods are {', '.join(density_qn_methods)} and the rotation QN "
+                f"methods {', '.join(rotation_qn_methods)}."
+            )
+        density_qn = qn_method in density_qn_methods
+        rotation_qn = qn_method in rotation_qn_methods
+        if isinstance(self, ROHFOTR) and (self.oao or density_qn):
             raise NotImplementedError(
-                "OAO and ARH are not currently implemented for ROHF."
+                "OAO and density QN are not currently implemented for ROHF."
             )
         if self.oao and self._scf.mol.symmetry:
             raise NotImplementedError(
                 "The OAO basis is not currently implemented for symmetry-adapted "
                 "orbitals."
             )
-        if not hasattr(self, "hess_update_scheme"):
-            self.hess_update_scheme = None
         if not hasattr(self, "s_gek"):
             self.s_gek = False
 
@@ -752,7 +776,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         assign_solver_settings(self, settings)
         state = SolverState()
 
-        # number of particles for OAO and ARH
+        # number of particles for OAO and density QN
         n_particle = 1 if isinstance(self, RHFOTR) else 2
 
         # number of parameters
@@ -764,7 +788,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # turn on automatic stability check for approximate Hessians
         if (not hasattr(self, "stability") or self.stability is None) and (
-            self.hess_update_scheme is not None or self.arh or self.s_gek
+            qn_method is not None or self.s_gek
         ):
             self.stability = settings.stability = True
 
@@ -824,7 +848,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     settings.stability_settings.get_extra_trial_vectors
                 )
 
-                # the quasi-Newton and S-GEK factories accept a wrapper of the returned
+                # the rotation QN and S-GEK factories accept a wrapper of the returned
                 # orbital updating function if it is marked as one
                 @functools.wraps(exact_update_orbs)
                 def wrapped_update_orbs(kappa, grad, h_diag):
@@ -839,21 +863,21 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 self.update_orbs = wrapped_update_orbs
 
             # define callback functions for approximate Hessians
-            if self.arh:
-                arh_settings = ARHSettings()
-                for setting in arh_setting_fields:
+            if density_qn:
+                density_qn_settings = DensityQNSettings()
+                for setting in density_qn_setting_fields:
                     if hasattr(self, setting):
-                        setattr(arh_settings, setting, getattr(self, setting))
+                        setattr(density_qn_settings, setting, getattr(self, setting))
                 # multisecant SR1 splits the linear potential into a Coulomb and an
                 # exact-exchange term, which requires an exact-exchange kernel that is
                 # positive semidefinite
-                if arh_settings.arh_type == "ms_sr1":
+                if qn_method == "ms_sr1":
                     self._check_exchange_kernel()
                 # run factory after the factory of its basis, whose object it builds on,
                 # which holds the orbitals it updates in place and provides the exact
                 # Hessian the stability check uses
-                approx_update_orbs, self.func = arh_factory(
-                    self.evaluate_dm_arh, settings, state, arh_settings
+                approx_update_orbs, self.func = density_qn_factory(
+                    self.evaluate_dm_density_qn, settings, state, density_qn_settings
                 )
 
                 # set the preconditioner, which inverts the approximate Hessian, and extra
@@ -874,12 +898,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
                 self.approx_update_orbs = wrapped_approx_update_orbs
                 self.raw_approx_update_orbs = approx_update_orbs
-            elif self.hess_update_scheme is not None:
-                qn_settings = QNSettings()
-                for setting in qn_setting_fields:
+            elif rotation_qn:
+                rotation_qn_settings = RotationQNSettings()
+                for setting in rotation_qn_setting_fields:
                     if hasattr(self, setting):
-                        setattr(qn_settings, setting, getattr(self, setting))
-                self.approx_update_orbs, self.func = qn_factory(
+                        setattr(rotation_qn_settings, setting, getattr(self, setting))
+                self.approx_update_orbs, self.func = rotation_qn_factory(
                     self.n_param,
                     self.update_orbs,
                     self.func,
@@ -887,7 +911,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self.init_hess,
                     settings,
                     state,
-                    qn_settings,
+                    rotation_qn_settings,
                 )
                 self.raw_approx_update_orbs = self.approx_update_orbs
             elif self.s_gek:
@@ -1161,7 +1185,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
     # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
     # non-linear (XC) contributions to the effective potential
-    def evaluate_dm_arh(
+    def evaluate_dm_density_qn(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
@@ -1606,7 +1630,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
     # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
     # non-linear (XC) contributions to the effective potential
-    def evaluate_dm_arh(
+    def evaluate_dm_density_qn(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
