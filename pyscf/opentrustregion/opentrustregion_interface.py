@@ -23,20 +23,18 @@ if TYPE_CHECKING:
 
 
 # fields of the settings structures that are not settings
-non_setting_fields = ("max_precision_reached", "n_update_orbs", "n_hess_x", "context")
+non_setting_fields = ("initialized", "context")
 
 
 def setting_fields(settings_c: type[Structure]) -> list[str]:
     """
     this function collects the settings a user can assign on a settings object,
-    skipping the initialization flag, the fields that are not settings and any nested
-    settings structure
+    skipping the fields that are not settings and any nested settings structure
     """
     return [
         field[0]
         for field in settings_c._fields_
-        if field[0] != "initialized"
-        and field[0] not in non_setting_fields
+        if field[0] not in non_setting_fields
         and not (isinstance(field[1], type) and issubclass(field[1], Structure))
     ]
 
@@ -212,7 +210,9 @@ class OTR:
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
-        stable = stability_check(h_diag, hess_x, self.n_param, settings, direction)
+        stable = stability_check(
+            h_diag, hess_x, self.n_param, settings, kappa=direction
+        )
 
         return stable, direction
 
@@ -321,7 +321,7 @@ class LocalizerOTR(OTR):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.func, self.update_orbs, self.n_param, settings)
+        solver(self.update_orbs, self.func, self.n_param, settings)
 
         return self.mo_coeff
 
@@ -494,7 +494,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.func, self.update_orbs, self.n_param, settings)
+        solver(self.update_orbs, self.func, self.n_param, settings)
 
         # get canonical orbitals
         self.converged = True
@@ -822,7 +822,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.func, self.update_orbs, self.n_param, settings)
+        solver(self.update_orbs, self.func, self.n_param, settings)
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)

@@ -179,7 +179,6 @@ class SettingsTests(unittest.TestCase):
     def test_setting_fields(self) -> None:
         # non-assignable settings
         for fields in (solver_setting_fields, stability_setting_fields):
-            self.assertNotIn("initialized", fields)
             self.assertNotIn("stability_settings", fields)
             for field in non_setting_fields:
                 self.assertNotIn(field, fields)
@@ -234,7 +233,7 @@ class SettingsTests(unittest.TestCase):
             [
                 field[0]
                 for field in SolverSettingsC._fields_
-                if field[0] not in ("initialized", "stability_settings")
+                if field[0] != "stability_settings"
                 and field[0] not in non_setting_fields
             ],
         )
