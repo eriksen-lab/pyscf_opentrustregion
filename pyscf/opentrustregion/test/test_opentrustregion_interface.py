@@ -222,6 +222,7 @@ class SettingsTests(unittest.TestCase):
                 "hess_symm",
                 "stop_on_instability",
                 "conv_tol",
+                "stability_thresh",
                 "n_random_trial_vectors",
                 "n_extra_trial_vectors",
                 "n_iter",
