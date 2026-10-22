@@ -51,7 +51,10 @@ solver_settings_shadowed_by_pyscf = ("conv_tol",)
 # only ever taken from a separate, explicitly stability-specific attribute
 stability_setting_aliases = {
     "conv_tol": "stability_conv_tol",
+    "conv_check": "stability_conv_check",
     "n_random_trial_vectors": "stability_n_random_trial_vectors",
+    "n_extra_trial_vectors": "stability_n_extra_trial_vectors",
+    "get_extra_trial_vectors": "stability_get_extra_trial_vectors",
     "jacobi_davidson_start": "stability_jacobi_davidson_start",
 }
 

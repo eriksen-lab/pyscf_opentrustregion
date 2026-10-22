@@ -40,7 +40,6 @@ from pyscf.opentrustregion.opentrustregion_interface import (
 )
 from pyopentrustregion import SolverSettings, StabilitySettings
 
-
 # fixtures shared by every test, built once in setUpModule
 mol: gto.Mole
 mol_sym: gto.Mole
@@ -191,6 +190,7 @@ class SettingsTests(unittest.TestCase):
             [
                 "precond",
                 "project",
+                "get_extra_trial_vectors",
                 "conv_check",
                 "logger",
                 "stability",
@@ -202,6 +202,7 @@ class SettingsTests(unittest.TestCase):
                 "global_red_factor",
                 "local_red_factor",
                 "n_random_trial_vectors",
+                "n_extra_trial_vectors",
                 "n_macro",
                 "n_micro",
                 "jacobi_davidson_start",
@@ -215,9 +216,14 @@ class SettingsTests(unittest.TestCase):
             [
                 "precond",
                 "project",
+                "get_extra_trial_vectors",
+                "conv_check",
                 "logger",
+                "hess_symm",
+                "stop_on_instability",
                 "conv_tol",
                 "n_random_trial_vectors",
+                "n_extra_trial_vectors",
                 "n_iter",
                 "jacobi_davidson_start",
                 "seed",
@@ -290,9 +296,11 @@ class SettingsTests(unittest.TestCase):
         assign_solver_settings(obj, settings)
         self.assertEqual(settings.conv_check, SolverSettings().conv_check)
 
-        # the stability check has no convergence check function of its own, so the
-        # boolean cannot reach it either
-        self.assertNotIn("conv_check", stability_setting_fields)
+        # the stability check takes its convergence check function only from
+        # stability_conv_check, so the boolean cannot reach it either
+        self.assertEqual(
+            settings.stability_settings.conv_check, StabilitySettings().conv_check
+        )
 
     def test_callable_conv_check_is_kept(self) -> None:
         def conv_check(residual: np.ndarray, eigval: float) -> bool:
@@ -322,11 +330,25 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.stability_settings.n_random_trial_vectors, 3)
 
     def test_solver_setting_does_not_leak_into_stability_check(self) -> None:
-        obj = DummySettingsHolder(conv_tol=1e-7)
+        # a convergence check of the solver, which tests the solver's progress, must
+        # not decide when the stability check stops either
+        def conv_check() -> bool:
+            return True
+
+        obj = DummySettingsHolder(
+            conv_tol=1e-7, conv_check=conv_check, n_extra_trial_vectors=3
+        )
         settings = SolverSettings()
         assign_solver_settings(obj, settings)
         self.assertAlmostEqual(
             settings.stability_settings.conv_tol, StabilitySettings().conv_tol, 12
+        )
+        self.assertEqual(
+            settings.stability_settings.conv_check, StabilitySettings().conv_check
+        )
+        self.assertEqual(
+            settings.stability_settings.n_extra_trial_vectors,
+            StabilitySettings().n_extra_trial_vectors,
         )
 
     def test_stability_settings_assigned_on_their_own(self) -> None:

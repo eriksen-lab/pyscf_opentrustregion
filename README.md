@@ -152,7 +152,10 @@ separate attribute; every other stability setting is read from its plain name:
 | Stability check setting | Attribute to set |
 |---|---|
 | `conv_tol` | `stability_conv_tol` |
+| `conv_check` | `stability_conv_check` |
 | `n_random_trial_vectors` | `stability_n_random_trial_vectors` |
+| `n_extra_trial_vectors` | `stability_n_extra_trial_vectors` |
+| `get_extra_trial_vectors` | `stability_get_extra_trial_vectors` |
 | `jacobi_davidson_start` | `stability_jacobi_davidson_start` |
 
 **`conv_check` is a function here.** PySCF uses `conv_check` as a boolean flag whereas
