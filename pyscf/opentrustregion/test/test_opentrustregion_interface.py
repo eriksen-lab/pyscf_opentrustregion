@@ -195,6 +195,8 @@ class SettingsTests(unittest.TestCase):
                 "logger",
                 "stability",
                 "line_search",
+                "grad_noise",
+                "hess_symm",
                 "conv_tol",
                 "start_trust_radius",
                 "global_red_factor",
