@@ -189,7 +189,7 @@ class OTR:
             if hasattr(self, name)
         }
 
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         """
@@ -205,7 +205,7 @@ class OTR:
         kappa = np.zeros(self.n_param, dtype=np.float64)
         grad = np.empty(self.n_param, dtype=np.float64)
         h_diag = np.empty(self.n_param, dtype=np.float64)
-        _, hess_x = self.update_orbs(kappa, grad, h_diag)
+        _, hess_x = self._update_orbs(kappa, grad, h_diag)
 
         # initialize settings
         settings = StabilitySettings()
@@ -258,13 +258,13 @@ class LocalizerOTR(OTR):
         return matrix - matrix.conj().T
 
     # cost function
-    def func(self, kappa: np.ndarray) -> float:
+    def _func(self, kappa: np.ndarray) -> float:
         u = ciah.expmat(self.unpack(kappa))
         return self.cost_sign * self.cost_function(u)
 
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
     # function
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -324,7 +324,7 @@ class LocalizerOTR(OTR):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.update_orbs, self.func, self.n_param, settings)
+        solver(self._update_orbs, self._func, self.n_param, settings)
 
         return self.mo_coeff
 
@@ -418,7 +418,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             )
 
     # energy function
-    def func(self, kappa: np.ndarray) -> float:
+    def _func(self, kappa: np.ndarray) -> float:
         u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
@@ -426,7 +426,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         return self._scf.energy_tot(dm, self.h1e, vhf)
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -544,11 +544,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.update_orbs, self.func, self.n_param, settings)
+        solver(self._update_orbs, self._func, self.n_param, settings)
 
         # get canonical orbitals
         self.converged = True
-        self.e_tot = self.func(np.zeros(self.n_param, dtype=np.float64))
+        self.e_tot = self._func(np.zeros(self.n_param, dtype=np.float64))
         dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
         self.dm, self.vhf = dm, vhf
@@ -779,7 +779,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         return energy
 
     # energy function
-    def func(self, x: np.ndarray) -> float:
+    def _func(self, x: np.ndarray) -> float:
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
 
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
@@ -791,7 +791,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         return (self.mo_coeff, *self.ci_vectors(self.ci))
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(
+    def _update_orbs(
         self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -878,7 +878,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.update_orbs, self.func, self.n_param, settings)
+        solver(self._update_orbs, self._func, self.n_param, settings)
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
