@@ -10,8 +10,9 @@ Tests for the PySCF interface to OpenTrustRegion
 
 import io
 import unittest
+from contextlib import contextmanager, redirect_stderr
 from itertools import product
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Generator, Tuple
 
 import numpy as np
 
@@ -139,15 +140,18 @@ def check_derivatives_match_finite_differences(
     test.assertLess(abs(x @ hx - curvature), 1e-4 * abs(curvature))
 
 
-def capture_warnings(obj: Any) -> io.StringIO:
+@contextmanager
+def capture_warnings(obj: Any) -> Generator[io.StringIO, None, None]:
     """
-    this function routes the PySCF log of an object into a buffer, at the verbosity that
-    still includes warnings
+    this function routes the PySCF log of an object into a buffer, at the verbosity
+    that still includes warnings, and discards the copy of every warning PySCF writes
+    to the standard error while the log is not the standard output
     """
     log = io.StringIO()
     obj.stdout = log
     obj.verbose = lib.logger.WARN
-    return log
+    with redirect_stderr(io.StringIO()):
+        yield log
 
 
 def check_stability_shape(test: unittest.TestCase, obj: OTR) -> Tuple[bool, np.ndarray]:
@@ -399,6 +403,26 @@ class SettingsTests(unittest.TestCase):
         for setting in solver_setting_fields + list(stability_setting_aliases.values()):
             self.assertIn(setting, keys)
 
+    def test_attributes_set_by_the_kernel_are_recognized_keys(self) -> None:
+        # PySCF also warns about the attributes the kernel sets once the object is
+        # built again, as by a second kernel, unless one of its classes registers them;
+        # it joins the keys of all these classes and skips class attributes and names
+        # starting with an underscore
+        for obj in (
+            mf_to_otr(scf.RHF(mol)),
+            mf_to_otr(scf.ROHF(mol_open)),
+            mf_to_otr(scf.UHF(mol_open)),
+            BoysOTR(mol, occ_orbs),
+            casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
+        ):
+            with self.subTest(cls=type(obj).__name__):
+                obj.kernel()
+                keys = set().union(
+                    *(getattr(cls, "_keys", ()) for cls in type(obj).__mro__)
+                )
+                public = {name for name in vars(obj) if not name.startswith("_")}
+                self.assertFalse(public - keys - set(dir(type(obj))))
+
 
 class SCFTests(unittest.TestCase):
     """
@@ -499,6 +523,40 @@ class SCFTests(unittest.TestCase):
         otr_sym = mf_to_otr(scf.RHF(mol_sym))
         otr_sym.kernel()
         self.assertLess(otr_sym.n_param, otr.n_param)
+
+    def test_symmetry_restricts_an_object_that_is_not_symmetry_adapted(self) -> None:
+        # an object of a class that is not symmetry-adapted on a molecule with
+        # symmetry, as one built before the symmetry of its molecule was switched on,
+        # is optimized in the rotations symmetry allows, as one of the symmetry-adapted
+        # class is; PySCF's Newton solver stops short for such an object itself, so the
+        # reference is the symmetry-adapted one
+        mol_open_sym = mol_open.copy()
+        mol_open_sym.symmetry = True
+        mol_open_sym.build(False, False)
+        for plain, adapted, molecule in (
+            (scf.hf.RHF, scf.RHF, mol_sym),
+            (scf.rohf.ROHF, scf.ROHF, mol_open_sym),
+            (scf.uhf.UHF, scf.UHF, mol_open_sym),
+        ):
+            with self.subTest(cls=plain.__name__):
+                otr = self._check(plain(molecule), adapted(molecule))
+                otr_adapted = mf_to_otr(adapted(molecule))
+                otr_adapted.kernel()
+                self.assertEqual(otr.n_param, otr_adapted.n_param)
+
+    def test_symmetry_can_forbid_every_rotation(self) -> None:
+        # in the minimal basis, the orbitals of the carbon atom other than 1s and 2s each
+        # belong to an irrep of their own, so symmetry forbids every occupied-virtual
+        # rotation of the triplet and the kernel keeps the orbitals it starts from
+        carbon = gto.M(atom="C", basis="sto-3g", spin=2, symmetry=True, verbose=0)
+        for cls in (scf.ROHF, scf.UHF):
+            with self.subTest(cls=cls.__name__):
+                ref = cls(carbon).newton().kernel()
+                otr = mf_to_otr(cls(carbon))
+                self.assertAlmostEqual(otr.kernel(), ref, 8)
+                self.assertEqual(otr.n_param, 0)
+                stable, _ = check_stability_shape(self, otr)
+                self.assertTrue(stable)
 
     def test_kernel_from_a_given_density_matrix(self) -> None:
         ref = scf.RHF(mol).newton().kernel()
@@ -658,19 +716,18 @@ class SCFTests(unittest.TestCase):
         # an option defining the energy that is assigned afterwards reaches at most the
         # Hessian, which the solver and the stability check warn about
         otr = mf_to_otr(dft.UKS(mol_open, xc="b3lyp"))
-        log = capture_warnings(otr)
+        with capture_warnings(otr) as log:
+            # a replaced grid for the nonlocal correlation, which b3lyp does not use,
+            # leaves the optimization unaffected
+            otr.nlcgrids = dft.gen_grid.Grids(mol_open)
+            otr.kernel()
+            self.assertIn("nlcgrids of this object differs", log.getvalue())
 
-        # a replaced grid for the nonlocal correlation, which b3lyp does not use, leaves
-        # the optimization unaffected
-        otr.nlcgrids = dft.gen_grid.Grids(mol_open)
-        otr.kernel()
-        self.assertIn("nlcgrids of this object differs", log.getvalue())
-
-        log.seek(0)
-        log.truncate()
-        otr.xc = "pbe"
-        otr.stability_check()
-        self.assertIn("xc, nlcgrids of this object differ", log.getvalue())
+            log.seek(0)
+            log.truncate()
+            otr.xc = "pbe"
+            otr.stability_check()
+            self.assertIn("xc, nlcgrids of this object differ", log.getvalue())
 
     def test_energy_option_reaching_the_energy_is_not_reported(self) -> None:
         # an option assigned before the conversion, a functional name differing only in
@@ -679,15 +736,15 @@ class SCFTests(unittest.TestCase):
         uks = dft.UKS(mol_open)
         uks.xc = "b3lyp"
         otr = mf_to_otr(uks)
-        log = capture_warnings(otr)
-        otr.xc = "B3LYP"
-        otr.grids.level = 2
-        # the secondary grid only exists in PySCF releases after 2.14
-        if hasattr(otr, "set_second_grids"):
-            otr.set_second_grids(2)
-        otr.kernel()
-        otr.stability_check()
-        self.assertNotIn("mf_to_otr", log.getvalue())
+        with capture_warnings(otr) as log:
+            otr.xc = "B3LYP"
+            otr.grids.level = 2
+            # the secondary grid only exists in PySCF releases after 2.14
+            if hasattr(otr, "set_second_grids"):
+                otr.set_second_grids(2)
+            otr.kernel()
+            otr.stability_check()
+            self.assertNotIn("mf_to_otr", log.getvalue())
 
 
 class LocalizerTests(unittest.TestCase):

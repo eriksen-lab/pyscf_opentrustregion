@@ -11,6 +11,7 @@ import numpy as np
 from dataclasses import dataclass
 import scipy as sc
 from pyscf import gto, scf, lo, lib
+from pyscf.scf import hf_symm, uhf_symm
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, mc1step, newton_casscf, addons
 from pyopentrustregion import (
@@ -190,6 +191,7 @@ class OTR:
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
+            "n_param",
         ]
     )
 
@@ -277,6 +279,11 @@ class OTR:
 
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
+        # without parameters, as when symmetry forbids every rotation, there is no
+        # direction to lower the objective along
+        if self.n_param == 0:
+            return True, np.empty(0, dtype=np.float64)
+
         # get Hessian diagonal and linear transformation at current point
         kappa = np.zeros(self.n_param, dtype=np.float64)
         grad = np.empty(self.n_param, dtype=np.float64)
@@ -492,6 +499,25 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "n_jk_response_stability",
             "oao",
             "s_gek",
+            "h1e",
+            "s1e",
+            "dm",
+            "vhf",
+            "fock",
+            "kappa_mask",
+            "rot_matrix_mask",
+            "rot_matrix_mask_vo",
+            "occ_idx",
+            "virt_idx",
+            "n_occ",
+            "n_virt",
+            "clos_idx",
+            "open_idx",
+            "n_clos",
+            "n_open",
+            "vc_mask",
+            "vo_mask",
+            "oc_mask",
         ]
     )
 
@@ -898,9 +924,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         # irreps of the MOs, whose occupied-virtual rotations between orbitals of the
         # same irrep are the parameters of the MO extension
-        orbsym = (
-            np.asarray(self.get_orbsym(self.mo_coeff)) if mo and mol.symmetry else None
-        )
+        orbsym = None
+        if mo and mol.symmetry:
+            # labeled as in get_indices
+            symm_module = uhf_symm if isinstance(self, UHFOTR) else hf_symm
+            orbsym = np.asarray(symm_module.get_orbsym(mol, self.mo_coeff))
 
         # initialize settings and the state of the solver, which the extension
         # objects read
@@ -924,197 +952,208 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         ):
             self.stability = settings.stability = True
 
-        # routines before the extensions replace or take over any of them
-        routines = {name: self.__dict__.get(name) for name in self.factory_routines}
+        # without parameters, as when symmetry forbids every rotation, the orbitals are
+        # stationary already, so neither an extension object is built nor the solver
+        # called
+        if self.n_param > 0:
+            # routines before the extensions replace or take over any of them
+            routines = {name: self.__dict__.get(name) for name in self.factory_routines}
 
-        # the extensions replace or take over routines of this object, which are
-        # recorded also if a factory or a check after one raises, so that the next
-        # kernel drops them
-        try:
-            # get exact orbital updates from the MO or the OAO extension
-            if mo or self.oao:
-                if mo:
-                    mo_settings = MOSettings()
-                    for setting in mo_setting_fields:
+            # the extensions replace or take over routines of this object, which are
+            # recorded also if a factory or a check after one raises, so that the next
+            # kernel drops them
+            try:
+                # get exact orbital updates from the MO or the OAO extension
+                if mo or self.oao:
+                    if mo:
+                        mo_settings = MOSettings()
+                        for setting in mo_setting_fields:
+                            if hasattr(self, setting):
+                                setattr(mo_settings, setting, getattr(self, setting))
+                        # run factory, which rotates the MO coefficients in place
+                        exact_update_orbs, obj_func = mo_factory(
+                            self.mo_coeff,
+                            self.s1e,
+                            np.count_nonzero(self.mo_occ, axis=-1),
+                            n_particle,
+                            self._scf.mol.nao,
+                            self.mo_coeff.shape[-1],
+                            self.evaluate_dm,
+                            settings,
+                            state,
+                            mo_settings,
+                            orbsym,
+                        )
+                        self._adopt("_func", obj_func)
+                    elif self.oao:
+                        if isinstance(self, RHFOTR):
+                            dm_per_spin_ao = self.dm / 2
+                        else:
+                            dm_per_spin_ao = self.dm
+                        oao_settings = OAOSettings()
+                        for setting in oao_setting_fields:
+                            if hasattr(self, setting):
+                                setattr(oao_settings, setting, getattr(self, setting))
+                        # run factory and set projection
+                        exact_update_orbs, obj_func = oao_factory(
+                            dm_per_spin_ao,
+                            self.s1e,
+                            n_particle,
+                            self._scf.mol.nao,
+                            self.evaluate_dm,
+                            settings,
+                            state,
+                            oao_settings,
+                        )
+                        self._adopt("_func", obj_func)
+                        self.project = settings.project
+
+                    # set preconditioner and extra trial vectors
+                    self.precond = settings.precond
+                    self.stability_get_extra_trial_vectors = (
+                        settings.stability_settings.get_extra_trial_vectors
+                    )
+
+                    # the rotation QN and S-GEK factories accept a wrapper of the
+                    # returned orbital updating function if it is marked as one
+                    @functools.wraps(exact_update_orbs)
+                    def wrapped_update_orbs(
+                        kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+                    ) -> Tuple[float, OTRHessX]:
+                        n_jk = self.n_jk
+                        func, hess_x = exact_update_orbs(kappa, grad, h_diag)
+                        if self._moves(kappa) or self.n_jk > n_jk:
+                            self._count_update()
+                        self._raw_hess_x = hess_x
+
+                        return func, self._count_hess_x
+
+                    self._adopt("_update_orbs", wrapped_update_orbs)
+
+                # define callback functions for approximate Hessians
+                if density_qn:
+                    density_qn_settings = DensityQNSettings()
+                    for setting in density_qn_setting_fields:
                         if hasattr(self, setting):
-                            setattr(mo_settings, setting, getattr(self, setting))
-                    # run factory, which rotates the MO coefficients in place
-                    exact_update_orbs, obj_func = mo_factory(
-                        self.mo_coeff,
-                        self.s1e,
-                        np.count_nonzero(self.mo_occ, axis=-1),
-                        n_particle,
-                        self._scf.mol.nao,
-                        self.mo_coeff.shape[-1],
-                        self.evaluate_dm,
+                            setattr(
+                                density_qn_settings, setting, getattr(self, setting)
+                            )
+                    # multisecant SR1 splits the linear potential into a Coulomb and an
+                    # exact-exchange term, which requires an exact-exchange kernel that
+                    # is positive semidefinite
+                    if qn_method == "ms_sr1":
+                        self._check_exchange_kernel()
+                    # run factory after the factory of its basis, whose object it builds
+                    # on, which holds the orbitals it updates in place and provides the
+                    # exact Hessian the stability check uses
+                    approx_update_orbs, obj_func = density_qn_factory(
+                        self.evaluate_dm_density_qn,
                         settings,
                         state,
-                        mo_settings,
-                        orbsym,
+                        density_qn_settings,
                     )
                     self._adopt("_func", obj_func)
-                elif self.oao:
-                    if isinstance(self, RHFOTR):
-                        dm_per_spin_ao = self.dm / 2
-                    else:
-                        dm_per_spin_ao = self.dm
-                    oao_settings = OAOSettings()
-                    for setting in oao_setting_fields:
+
+                    # set the preconditioner, which inverts the approximate Hessian, and
+                    # extra trial vectors
+                    self.precond = settings.precond
+                    self.stability_get_extra_trial_vectors = (
+                        settings.stability_settings.get_extra_trial_vectors
+                    )
+
+                    def wrapped_approx_update_orbs(
+                        kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+                    ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
+                        n_jk = self.n_jk
+                        func, hess_x = approx_update_orbs(kappa, grad, h_diag)
+                        if self._moves(kappa) or self.n_jk > n_jk:
+                            self._count_update()
+                        return func, hess_x
+
+                    self._approx_update_orbs = wrapped_approx_update_orbs
+                    self._raw_approx_update_orbs = approx_update_orbs
+                elif rotation_qn:
+                    rotation_qn_settings = RotationQNSettings()
+                    for setting in rotation_qn_setting_fields:
                         if hasattr(self, setting):
-                            setattr(oao_settings, setting, getattr(self, setting))
-                    # run factory and set projection
-                    exact_update_orbs, obj_func = oao_factory(
-                        dm_per_spin_ao,
-                        self.s1e,
-                        n_particle,
-                        self._scf.mol.nao,
-                        self.evaluate_dm,
+                            setattr(
+                                rotation_qn_settings, setting, getattr(self, setting)
+                            )
+                    self._approx_update_orbs, obj_func = rotation_qn_factory(
+                        self.n_param,
+                        self._update_orbs,
+                        self._func,
+                        self.transport,
+                        self.init_hess,
                         settings,
                         state,
-                        oao_settings,
+                        rotation_qn_settings,
                     )
                     self._adopt("_func", obj_func)
-                    self.project = settings.project
-
-                # set preconditioner and extra trial vectors
-                self.precond = settings.precond
-                self.stability_get_extra_trial_vectors = (
-                    settings.stability_settings.get_extra_trial_vectors
-                )
-
-                # the rotation QN and S-GEK factories accept a wrapper of the returned
-                # orbital updating function if it is marked as one
-                @functools.wraps(exact_update_orbs)
-                def wrapped_update_orbs(
-                    kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-                ) -> Tuple[float, OTRHessX]:
-                    n_jk = self.n_jk
-                    func, hess_x = exact_update_orbs(kappa, grad, h_diag)
-                    if self._moves(kappa) or self.n_jk > n_jk:
-                        self._count_update()
-                    self._raw_hess_x = hess_x
-
-                    return func, self._count_hess_x
-
-                self._adopt("_update_orbs", wrapped_update_orbs)
-
-            # define callback functions for approximate Hessians
-            if density_qn:
-                density_qn_settings = DensityQNSettings()
-                for setting in density_qn_setting_fields:
-                    if hasattr(self, setting):
-                        setattr(density_qn_settings, setting, getattr(self, setting))
-                # multisecant SR1 splits the linear potential into a Coulomb and an
-                # exact-exchange term, which requires an exact-exchange kernel that is
-                # positive semidefinite
-                if qn_method == "ms_sr1":
-                    self._check_exchange_kernel()
-                # run factory after the factory of its basis, whose object it builds on,
-                # which holds the orbitals it updates in place and provides the exact
-                # Hessian the stability check uses
-                approx_update_orbs, obj_func = density_qn_factory(
-                    self.evaluate_dm_density_qn, settings, state, density_qn_settings
-                )
-                self._adopt("_func", obj_func)
-
-                # set the preconditioner, which inverts the approximate Hessian, and extra
-                # trial vectors
-                self.precond = settings.precond
-                self.stability_get_extra_trial_vectors = (
-                    settings.stability_settings.get_extra_trial_vectors
-                )
-
-                def wrapped_approx_update_orbs(
-                    kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-                ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-                    n_jk = self.n_jk
-                    func, hess_x = approx_update_orbs(kappa, grad, h_diag)
-                    if self._moves(kappa) or self.n_jk > n_jk:
-                        self._count_update()
-                    return func, hess_x
-
-                self._approx_update_orbs = wrapped_approx_update_orbs
-                self._raw_approx_update_orbs = approx_update_orbs
-            elif rotation_qn:
-                rotation_qn_settings = RotationQNSettings()
-                for setting in rotation_qn_setting_fields:
-                    if hasattr(self, setting):
-                        setattr(rotation_qn_settings, setting, getattr(self, setting))
-                self._approx_update_orbs, obj_func = rotation_qn_factory(
-                    self.n_param,
-                    self._update_orbs,
-                    self._func,
-                    self.transport,
-                    self.init_hess,
-                    settings,
-                    state,
-                    rotation_qn_settings,
-                )
-                self._adopt("_func", obj_func)
-                self._raw_approx_update_orbs = self._approx_update_orbs
-            elif self.s_gek:
-                if self.oao:
-                    raise RuntimeError(
-                        "S-GEK cannot be performed in the orthogonal AO basis."
+                    self._raw_approx_update_orbs = self._approx_update_orbs
+                elif self.s_gek:
+                    if self.oao:
+                        raise RuntimeError(
+                            "S-GEK cannot be performed in the orthogonal AO basis."
+                        )
+                    if isinstance(self, ROHFOTR):
+                        raise RuntimeError(
+                            "ROHFOTR is not supported for S-GEK because history cannot be "
+                            "transformed consistently to make redundant blocks vanish for flag "
+                            "manifold."
+                        )
+                    s_gek_settings = SGEKSettings()
+                    for setting in s_gek_setting_fields:
+                        if hasattr(self, setting):
+                            setattr(s_gek_settings, setting, getattr(self, setting))
+                    self._approx_update_orbs, obj_func = s_gek_factory(
+                        self.n_param,
+                        self._update_orbs,
+                        self._func,
+                        self.change_reference,
+                        settings,
+                        state,
+                        s_gek_settings,
                     )
-                if isinstance(self, ROHFOTR):
-                    raise RuntimeError(
-                        "ROHFOTR is not supported for S-GEK because history cannot be "
-                        "transformed consistently to make redundant blocks vanish for flag "
-                        "manifold."
-                    )
-                s_gek_settings = SGEKSettings()
-                for setting in s_gek_setting_fields:
-                    if hasattr(self, setting):
-                        setattr(s_gek_settings, setting, getattr(self, setting))
-                self._approx_update_orbs, obj_func = s_gek_factory(
-                    self.n_param,
-                    self._update_orbs,
-                    self._func,
-                    self.change_reference,
-                    settings,
-                    state,
-                    s_gek_settings,
+                    self._adopt("_func", obj_func)
+                    self._raw_approx_update_orbs = self._approx_update_orbs
+            finally:
+                self._adopted_routines = tuple(
+                    name
+                    for name in self.factory_routines
+                    if self.__dict__.get(name) is not routines[name]
                 )
-                self._adopt("_func", obj_func)
-                self._raw_approx_update_orbs = self._approx_update_orbs
-        finally:
-            self._adopted_routines = tuple(
-                name
-                for name in self.factory_routines
-                if self.__dict__.get(name) is not routines[name]
+
+            # set (approximate) Hessian linear transformation for stability check
+            if self.stability:
+                # get linear transformation function which is continuously updated as
+                # the orbitals move
+                kappa = np.zeros(self.n_param, dtype=np.float64)
+                grad = np.empty(self.n_param, dtype=np.float64)
+                h_diag = np.empty(self.n_param, dtype=np.float64)
+                self._update_orbs(kappa, grad, h_diag)
+
+                settings.stability_hess_x = self._count_stability_hess_x
+                if hasattr(self, "_approx_update_orbs"):
+                    settings.stability_settings.approx_hess_x = (
+                        self._approx_stability_hess_x
+                    )
+
+            # call solver
+            solver(
+                (
+                    self._update_orbs
+                    if not hasattr(self, "_approx_update_orbs")
+                    else self._count_approx_update_orbs(self._approx_update_orbs)
+                ),
+                self._func,
+                self.n_param,
+                settings,
+                state,
             )
 
-        # set (approximate) Hessian linear transformation for stability check
-        if self.stability:
-            # get linear transformation function which is continuously updated as the
-            # orbitals move
-            kappa = np.zeros(self.n_param, dtype=np.float64)
-            grad = np.empty(self.n_param, dtype=np.float64)
-            h_diag = np.empty(self.n_param, dtype=np.float64)
-            self._update_orbs(kappa, grad, h_diag)
-
-            settings.stability_hess_x = self._count_stability_hess_x
-            if hasattr(self, "_approx_update_orbs"):
-                settings.stability_settings.approx_hess_x = (
-                    self._approx_stability_hess_x
-                )
-
-        # call solver
-        solver(
-            (
-                self._update_orbs
-                if not hasattr(self, "_approx_update_orbs")
-                else self._count_approx_update_orbs(self._approx_update_orbs)
-            ),
-            self._func,
-            self.n_param,
-            settings,
-            state,
-        )
-
-        # the MO objects keep the orbitals they hold now
-        mo_coeff_evaluated = self.mo_coeff
+            # the MO objects keep the orbitals they hold now
+            mo_coeff_evaluated = self.mo_coeff
 
         # get canonical orbitals
         if self.oao:
@@ -1149,7 +1188,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # the masks of the parameters of either, with which a stability check after
         # the kernel starts from the rotations it would start from at the final
         # orbitals and returns its direction for these
-        if mo:
+        if mo and self.n_param > 0:
             rotation = (
                 np.swapaxes(mo_coeff_evaluated, -1, -2) @ self.s1e @ self.mo_coeff
             )
@@ -1287,7 +1326,10 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         # modifiy masks in case of symmetry
         if self._scf.mol.symmetry:
-            orbsym = self.get_orbsym(self.mo_coeff)
+            # the orbitals are labeled as PySCF's Newton solver labels them, which also
+            # works for an object that is not symmetry-adapted, as one built before the
+            # symmetry of its molecule was switched on
+            orbsym = hf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
             sym_allow = orbsym[:, None] == orbsym
             self.kappa_mask = sym_allow[self.rot_matrix_mask]
             self.rot_matrix_mask[self.rot_matrix_mask] = self.kappa_mask
@@ -1567,7 +1609,8 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
         # modifiy masks in case of symmetry
         if self._scf.mol.symmetry:
-            orbsym = self.get_orbsym(self.mo_coeff)
+            # labeled as the restricted orbitals are
+            orbsym = hf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
             sym_allow = orbsym[:, None] == orbsym
             self.kappa_mask = sym_allow[self.rot_matrix_mask]
             self.rot_matrix_mask[self.rot_matrix_mask] = self.kappa_mask
@@ -1728,7 +1771,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         # modifiy masks in case of symmetry
         if self._scf.mol.symmetry:
-            orbsyma, orbsymb = self.get_orbsym(self.mo_coeff)
+            # labeled as the restricted orbitals are
+            orbsyma, orbsymb = uhf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
             sym_allowa = orbsyma[:, None] == orbsyma
             sym_allowb = orbsymb[:, None] == orbsymb
             sym_allow = np.stack((sym_allowa, sym_allowb))
@@ -1985,6 +2029,9 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
 
 class CASSCFOTR(OTR, newton_casscf.CASSCF):
+
+    # attributes the kernel sets, which PySCF would otherwise report as unknown
+    _keys = {"n_param_orb", "n_param_ci"}
 
     # set while the kernel runs
     ci: Union[np.ndarray, List[np.ndarray]]
