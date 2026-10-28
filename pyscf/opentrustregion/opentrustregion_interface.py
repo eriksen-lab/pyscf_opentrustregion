@@ -599,23 +599,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._adopted_potential = None
         self._drop_adopted_routines()
 
-    def _follow_orbitals(self) -> bool:
+    def _follow_orbitals(self) -> None:
         """
-        this function drops the routines the last kernel adopted once the orbitals are
-        no longer those the kernel left, since the extension objects of these routines
-        keep the orbitals of the kernel, and determines the parameters of the current
-        orbitals, on which the routines of this object then work; it returns whether it
-        dropped them
+        this function keeps the routines the last kernel adopted while the orbitals and
+        occupations are those the kernel left, which the extension objects of these
+        routines keep, and otherwise drops them and determines the parameters of the
+        current orbitals and occupations, on which the routines of this object work
         """
-        if not self._kernel_orbitals.key or self._kernel_orbitals.matches(
-            self._orbs_state()
-        ):
-            return False
+        if self._adopted_routines and self._kernel_orbitals.matches(self._orbs_state()):
+            return
 
         self._drop_adopted_routines()
         self.get_indices()
         self.n_param = int(np.count_nonzero(self.kappa_mask))
-        return True
 
     # raw and counted orbital updates and (approximate) Hessian linear transformations
     _raw_approx_update_orbs = None
@@ -975,11 +971,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 # orbital updating function if it is marked as one
                 @functools.wraps(exact_update_orbs)
                 def wrapped_update_orbs(kappa, grad, h_diag):
-                    # after the kernel, orbitals that replace the ones it left are
-                    # updated by the routine of this object
-                    if self._follow_orbitals():
-                        return self._update_orbs(kappa, grad, h_diag)
-
                     n_jk = self.n_jk
                     func, hess_x = exact_update_orbs(kappa, grad, h_diag)
                     if self._moves(kappa) or self.n_jk > n_jk:
@@ -1216,8 +1207,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         self._warn_on_differing_energy_options()
 
-        # the check examines the current orbitals, also when they replace the ones the
-        # last kernel left
+        # the check examines the current orbitals and occupations, also when they
+        # replace the ones the last kernel left
         self._follow_orbitals()
         stable, direction = super().stability_check()
 

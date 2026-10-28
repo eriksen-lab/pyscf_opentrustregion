@@ -10,6 +10,7 @@ Tests for the PySCF interface to OpenTrustRegion
 
 import io
 import unittest
+from itertools import product
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -508,18 +509,22 @@ class SCFTests(unittest.TestCase):
     def test_cache_is_invalidated_when_orbitals_move(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
         otr.kernel()
+
+        # the routines the kernel adopted from the extension factories give way to the
+        # cached ones of this object once a stability check examines orbitals that
+        # replace the ones the kernel left
+        otr.mo_coeff = otr.mo_coeff.copy()
+        otr.mo_coeff[:, 0] *= -1.0
+        otr.stability_check()
         grad, h_diag = grad_and_h_diag(otr)
         zero = np.zeros(otr.n_param, dtype=np.float64)
-
-        otr._update_orbs(zero, grad, h_diag)
         cached = otr._last_update
 
-        # a zero step alone must not be taken as proof that nothing has changed, also
-        # not by the routines the kernel adopted from the extension factories;
+        # a zero step alone must not be taken as proof that nothing has changed;
         # n_update_orbs only counts updates that move the optimization, so a
         # recomputation shows as a new cached result
         otr.mo_coeff = otr.mo_coeff.copy()
-        otr.mo_coeff[:, 0] *= -1.0
+        otr.mo_coeff[:, 1] *= -1.0
         otr._update_orbs(zero, grad, h_diag)
         self.assertIsNot(otr._last_update, cached)
 
@@ -574,20 +579,37 @@ class SCFTests(unittest.TestCase):
 
                 # placing the same object back at the restricted solution must make the
                 # check report the instability, along with a normalized direction out
-                # of the saddle
+                # of the saddle; the OAO kernel leaves the occupied orbitals last, so
+                # the occupations are placed back with the orbitals
                 otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
+                otr.mo_occ = np.array([rhf.mo_occ / 2, rhf.mo_occ / 2])
                 stable, direction = check_stability_shape(self, otr)
                 self.assertFalse(stable)
                 self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
+
+                # the check examined the restricted solution, and its direction is the
+                # one of lowest curvature there
+                grad, h_diag = grad_and_h_diag(otr)
+                func, hess_x = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
+                self.assertAlmostEqual(func, rhf.e_tot, 9)
+                hess = np.empty((otr.n_param, otr.n_param))
+                for column, unit_vector in zip(hess.T, np.eye(otr.n_param)):
+                    hess_x(unit_vector, column)
+                self.assertAlmostEqual(
+                    float(direction @ hess @ direction),
+                    float(np.linalg.eigvalsh(hess)[0]),
+                    6,
+                )
 
     def test_stability_check_examines_the_current_occupations(self) -> None:
         # the check examines the density of the current occupations and their
         # occupied-virtual rotations, which with symmetry are those between orbitals of
         # the same irrep, also when the occupations are assigned after the kernel and
-        # the update the kernel left is cached
-        for molecule in (mol, mol_sym):
-            with self.subTest(symmetry=molecule.symmetry):
-                otr = mf_to_otr(scf.RHF(molecule))
+        # the update the kernel left is cached; ROHF adopts no routines from the
+        # extension factories
+        for cls, molecule in product((scf.RHF, scf.ROHF), (mol, mol_sym)):
+            with self.subTest(cls=cls.__name__, symmetry=molecule.symmetry):
+                otr = mf_to_otr(cls(molecule))
                 otr.kernel()
                 grad, h_diag = grad_and_h_diag(otr)
                 otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
@@ -608,7 +630,7 @@ class SCFTests(unittest.TestCase):
                 func, _ = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
                 self.assertIs(otr._last_update, cached)
 
-                ref = scf.RHF(molecule)
+                ref = cls(molecule)
                 dm = ref.make_rdm1(otr.mo_coeff, mo_occ)
                 ref_grad = ref.get_grad(otr.mo_coeff, mo_occ, ref.get_fock(dm=dm))
                 if molecule.symmetry:
