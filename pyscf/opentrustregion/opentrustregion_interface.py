@@ -360,6 +360,24 @@ else:
         pass
 
 
+# input options of the PySCF Kohn-Sham objects that define the energy. A converted
+# object evaluates the energy and the gradient through the PySCF object it was
+# converted from but the Hessian itself, so such an option assigned after the
+# conversion reaches only the Hessian
+ks_energy_options = ("xc", "nlc", "disp", "grids", "nlcgrids", "small_rho_cutoff")
+
+
+def option_differs(value: Any, wrapped_value: Any) -> bool:
+    """
+    this function decides whether an option of a converted object differs from that of
+    the object it was converted from, comparing names of functionals without regard to
+    case, as PySCF parses them
+    """
+    if isinstance(value, str) and isinstance(wrapped_value, str):
+        return value.upper() != wrapped_value.upper()
+    return bool(value != wrapped_value)
+
+
 class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # supplied by the PySCF mean-field object this driver wraps
@@ -373,6 +391,31 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.__dict__.update(mf.__dict__)
         self._scf = mf
         self._snapshot_shadowed_settings()
+
+    def _warn_on_differing_energy_options(self) -> None:
+        """
+        this function warns when an option defining the energy differs from that of the
+        PySCF object this object was converted from, which evaluates the energy and the
+        gradient, typically because the option was assigned after the conversion
+        """
+        differing = [
+            option
+            for option in ks_energy_options
+            if hasattr(self._scf, option)
+            and option_differs(getattr(self, option), getattr(self._scf, option))
+        ]
+        if differing:
+            names = ", ".join(differing)
+            verb = "differs" if len(differing) == 1 else "differ"
+            lib.logger.warn(
+                self,
+                f"{names} of this object {verb} from the PySCF object passed to "
+                "mf_to_otr, which evaluates the energy and the gradient, so the value "
+                "assigned here reaches only the Hessian. Unless the Hessian is "
+                f"approximated on purpose, set {names} before mf_to_otr: otherwise the "
+                "solver optimizes the energy for the original value and the stability "
+                "check can report instabilities that this energy does not have.",
+            )
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
@@ -448,6 +491,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         self.build(self.mol)
 
+        # the energy and the gradient are evaluated with the options of the wrapped
+        # object, whereas the Hessian is evaluated with those of this object
+        self._warn_on_differing_energy_options()
+
         mol = self._scf.mol
 
         # call self._scf.get_hcore, self._scf.get_ovlp because they might be overloaded
@@ -513,6 +560,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._finalize()
 
         return self.e_tot
+
+    # stability check function, which examines the Hessian evaluated with the options
+    # of this object
+    def stability_check(self) -> Tuple[bool, np.ndarray]:
+        self._warn_on_differing_energy_options()
+        return super().stability_check()
 
 
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):

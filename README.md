@@ -86,6 +86,25 @@ stable, direction = mf.stability_check()
 RHF, ROHF and UHF are supported, along with their KS counterparts; the appropriate
 class is selected from the object that is passed in.
 
+**Set the functional before the conversion.** The converted object evaluates the energy
+and the gradient through the PySCF object it was converted from, but the Hessian
+itself, as PySCF's own `newton()` does. A Kohn–Sham option defining the energy (`xc`,
+`nlc`, `disp`, `grids`, `nlcgrids`, `small_rho_cutoff`) that is assigned after the
+conversion therefore reaches at most the Hessian: the solver optimizes the energy of the
+original functional, and the stability check can report instabilities that this energy
+does not have. The converted object warns about such a difference when the solver or the
+stability check starts.
+
+```python
+mf = scf.UKS(mol)
+mf.xc = "B3LYP"
+mf = mf_to_otr(mf)
+```
+
+A grid changed in place, as by `mf.grids.level = 4`, reaches both objects, since they
+share it. To approximate the Hessian on purpose with a coarser grid, PySCF releases
+after 2.14 provide `mf.set_second_grids()`, whose grid only the Hessian uses.
+
 ### Orbital localization
 
 The localizers are used exactly like the PySCF classes they derive from:
