@@ -425,6 +425,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         vhf = self._scf.get_veff(self._scf.mol, dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
 
+    # the occupations and the orbitals define the density
+    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
+        return (self.mo_coeff, self.mo_occ)
+
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
@@ -565,6 +569,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # of this object
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         self._warn_on_differing_energy_options()
+
+        # the parameters are the occupied-virtual rotations of the current orbitals,
+        # which canonicalization reorders and which orbitals or occupations assigned
+        # after the kernel replace
+        self.mask, self.mask_symm = self.get_indices()
+        self.n_param = int(np.count_nonzero(self.mask_symm))
+
         return super().stability_check()
 
 

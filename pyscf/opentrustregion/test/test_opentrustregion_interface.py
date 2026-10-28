@@ -562,6 +562,42 @@ class SCFTests(unittest.TestCase):
         self.assertFalse(stable)
         self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
 
+    def test_stability_check_examines_the_current_occupations(self) -> None:
+        # the check examines the density of the current occupations and their
+        # occupied-virtual rotations, which with symmetry are those between orbitals of
+        # the same irrep, also when the occupations are assigned after the kernel and
+        # the update the kernel left is cached
+        for molecule in (mol, mol_sym):
+            with self.subTest(symmetry=molecule.symmetry):
+                otr = mf_to_otr(scf.RHF(molecule))
+                otr.kernel()
+                grad, h_diag = grad_and_h_diag(otr)
+                otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
+
+                # move the highest occupied pair to the lowest virtual orbital
+                mo_occ = otr.mo_occ.copy()
+                homo = np.flatnonzero(mo_occ > 0)[-1]
+                lumo = np.flatnonzero(mo_occ == 0)[0]
+                mo_occ[[homo, lumo]] = mo_occ[[lumo, homo]]
+                otr.mo_occ = mo_occ
+                check_stability_shape(self, otr)
+
+                # the update the check used is reused
+                n_update_orbs = otr.n_update_orbs
+                grad, h_diag = grad_and_h_diag(otr)
+                func, _ = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
+                self.assertEqual(otr.n_update_orbs, n_update_orbs)
+
+                ref = scf.RHF(molecule)
+                dm = ref.make_rdm1(otr.mo_coeff, mo_occ)
+                ref_grad = ref.get_grad(otr.mo_coeff, mo_occ, ref.get_fock(dm=dm))
+                if molecule.symmetry:
+                    occ = mo_occ > 0
+                    orbsym = ref.get_orbsym(otr.mo_coeff)
+                    ref_grad = ref_grad[(orbsym[~occ][:, None] == orbsym[occ]).ravel()]
+                self.assertAlmostEqual(func, ref.energy_tot(dm), 9)
+                np.testing.assert_allclose(grad, 2 * ref_grad, atol=1e-8)
+
     def test_energy_option_assigned_after_conversion_is_reported(self) -> None:
         # the PySCF object passed to mf_to_otr evaluates the energy and the gradient, so
         # an option defining the energy that is assigned afterwards reaches at most the
