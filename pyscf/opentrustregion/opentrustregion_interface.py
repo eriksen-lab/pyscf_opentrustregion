@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 from pyscf import gto, scf, lo, lib
+from pyscf.scf import hf_symm, uhf_symm
 from pyscf.soscf import ciah, newton_ah
 from pyscf.mcscf import casci, mc1step, newton_casscf, addons
 from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
@@ -127,6 +128,7 @@ class OTR:
             "saved_state",
             "n_update_orbs",
             "n_hess_x",
+            "n_param",
         ]
     )
 
@@ -201,6 +203,11 @@ class OTR:
 
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
+        # without parameters, as when symmetry forbids every rotation, there is no
+        # direction to lower the objective along
+        if self.n_param == 0:
+            return True, np.empty(0, dtype=np.float64)
+
         # get Hessian diagonal and linear transformation at current point
         kappa = np.zeros(self.n_param, dtype=np.float64)
         grad = np.empty(self.n_param, dtype=np.float64)
@@ -380,6 +387,9 @@ def option_differs(value: Any, wrapped_value: Any) -> bool:
 
 class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
+    # attributes the kernel sets, which PySCF would otherwise report as unknown
+    _keys = {"h1e", "s1e", "dm", "vhf", "mask", "mask_symm"}
+
     # supplied by the PySCF mean-field object this driver wraps
     mo_occ: np.ndarray
 
@@ -547,8 +557,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         settings = SolverSettings()
         assign_solver_settings(self, settings)
 
-        # call solver
-        solver(self._update_orbs, self._func, self.n_param, settings)
+        # call solver, unless symmetry forbids every rotation, which leaves the
+        # orbitals stationary already
+        if self.n_param > 0:
+            solver(self._update_orbs, self._func, self.n_param, settings)
 
         # get canonical orbitals
         self.converged = True
@@ -603,7 +615,10 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         mask_symm = mask[mask]
         if self._scf.mol.symmetry:
-            orbsym = self.get_orbsym(self.mo_coeff)
+            # the orbitals are labeled as PySCF's Newton solver labels them, which also
+            # works for an object that is not symmetry-adapted, as one built before the
+            # symmetry of its molecule was switched on
+            orbsym = hf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
             sym_allow = orbsym[:, None] == orbsym
             mask_symm = sym_allow[mask]
             mask[mask] = mask_symm
@@ -654,7 +669,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         mask_symm = mask[mask]
         if self._scf.mol.symmetry:
-            orbsyma, orbsymb = self.get_orbsym(self.mo_coeff)
+            # labeled as the restricted orbitals are
+            orbsyma, orbsymb = uhf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
             sym_allowa = orbsyma[:, None] == orbsyma
             sym_allowb = orbsymb[:, None] == orbsymb
             sym_allow = np.stack((sym_allowa, sym_allowb))
@@ -703,6 +719,9 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
 
 class CASSCFOTR(OTR, newton_casscf.CASSCF):
+
+    # attributes the kernel sets, which PySCF would otherwise report as unknown
+    _keys = {"n_param_orb", "n_param_ci"}
 
     # set while the kernel runs
     ci: Union[np.ndarray, List[np.ndarray]]

@@ -390,10 +390,32 @@ class SettingsTests(unittest.TestCase):
 
     def test_settings_are_recognized_keys(self) -> None:
         # PySCF warns about attributes it does not recognize, so every assignable
-        # setting has to be registered on the class
+        # setting has to be registered on the class; PySCF collects the keys of every
+        # class in the method resolution order, so a driver can register its own on top
+        # of those of its base classes
         otr = mf_to_otr(scf.RHF(mol))
+        keys = set().union(*(getattr(cls, "_keys", ()) for cls in type(otr).__mro__))
         for setting in solver_setting_fields + list(stability_setting_aliases.values()):
-            self.assertIn(setting, otr._keys)
+            self.assertIn(setting, keys)
+
+    def test_attributes_set_by_the_kernel_are_recognized_keys(self) -> None:
+        # PySCF also warns about the attributes the kernel sets once the object is
+        # built again, as by a second kernel, unless one of its classes registers them;
+        # it joins the keys of all these classes and skips class attributes and names
+        # starting with an underscore
+        for obj in (
+            mf_to_otr(scf.RHF(mol)),
+            mf_to_otr(scf.UHF(mol_open)),
+            BoysOTR(mol, occ_orbs),
+            casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
+        ):
+            with self.subTest(cls=type(obj).__name__):
+                obj.kernel()
+                keys = set().union(
+                    *(getattr(cls, "_keys", ()) for cls in type(obj).__mro__)
+                )
+                public = {name for name in vars(obj) if not name.startswith("_")}
+                self.assertFalse(public - keys - set(dir(type(obj))))
 
 
 class SCFTests(unittest.TestCase):
@@ -480,6 +502,40 @@ class SCFTests(unittest.TestCase):
         otr_sym = mf_to_otr(scf.RHF(mol_sym))
         otr_sym.kernel()
         self.assertLess(otr_sym.n_param, otr.n_param)
+
+    def test_symmetry_restricts_an_object_that_is_not_symmetry_adapted(self) -> None:
+        # an object of a class that is not symmetry-adapted on a molecule with
+        # symmetry, as one built before the symmetry of its molecule was switched on,
+        # is optimized in the rotations symmetry allows, as one of the symmetry-adapted
+        # class is; PySCF's Newton solver stops short for such an object itself, so the
+        # reference is the symmetry-adapted one
+        mol_open_sym = mol_open.copy()
+        mol_open_sym.symmetry = True
+        mol_open_sym.build(False, False)
+        for plain, adapted, molecule in (
+            (scf.hf.RHF, scf.RHF, mol_sym),
+            (scf.rohf.ROHF, scf.ROHF, mol_open_sym),
+            (scf.uhf.UHF, scf.UHF, mol_open_sym),
+        ):
+            with self.subTest(cls=plain.__name__):
+                otr = self._check(plain(molecule), adapted(molecule))
+                otr_adapted = mf_to_otr(adapted(molecule))
+                otr_adapted.kernel()
+                self.assertEqual(otr.n_param, otr_adapted.n_param)
+
+    def test_symmetry_can_forbid_every_rotation(self) -> None:
+        # in the minimal basis, the orbitals of the carbon atom other than 1s and 2s each
+        # belong to an irrep of their own, so symmetry forbids every occupied-virtual
+        # rotation of the triplet and the kernel keeps the orbitals it starts from
+        carbon = gto.M(atom="C", basis="sto-3g", spin=2, symmetry=True, verbose=0)
+        for cls in (scf.ROHF, scf.UHF):
+            with self.subTest(cls=cls.__name__):
+                ref = cls(carbon).newton().kernel()
+                otr = mf_to_otr(cls(carbon))
+                self.assertAlmostEqual(otr.kernel(), ref, 8)
+                self.assertEqual(otr.n_param, 0)
+                stable, _ = check_stability_shape(self, otr)
+                self.assertTrue(stable)
 
     def test_kernel_from_a_given_density_matrix(self) -> None:
         ref = scf.RHF(mol).newton().kernel()
