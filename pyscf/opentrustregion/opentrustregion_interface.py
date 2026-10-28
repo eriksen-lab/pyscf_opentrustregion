@@ -265,7 +265,7 @@ class OTR:
             if hasattr(self, name)
         }
 
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         """
@@ -281,7 +281,7 @@ class OTR:
         kappa = np.zeros(self.n_param, dtype=np.float64)
         grad = np.empty(self.n_param, dtype=np.float64)
         h_diag = np.empty(self.n_param, dtype=np.float64)
-        self.update_orbs(kappa, grad, h_diag)
+        self._update_orbs(kappa, grad, h_diag)
 
         # initialize settings
         settings = StabilitySettings()
@@ -334,13 +334,13 @@ class LocalizerOTR(OTR):
         return matrix - matrix.conj().T
 
     # cost function
-    def func(self, kappa: np.ndarray) -> float:
+    def _func(self, kappa: np.ndarray) -> float:
         u = ciah.expmat(self.unpack(kappa))
         return self.cost_sign * self.cost_function(u)
 
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
     # function
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -402,7 +402,7 @@ class LocalizerOTR(OTR):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.update_orbs, self.func, self.n_param, settings)
+        solver(self._update_orbs, self._func, self.n_param, settings)
 
         return self.mo_coeff
 
@@ -559,8 +559,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # and keep them alive and which the next kernel drops, so that its factories wrap
     # the routines of this object
     factory_routines = (
-        "func",
-        "update_orbs",
+        "_func",
+        "_update_orbs",
         "approx_update_orbs",
         "raw_approx_update_orbs",
         "project",
@@ -675,12 +675,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             )
 
     # energy function
-    def func(self, kappa: np.ndarray) -> float:
+    def _func(self, kappa: np.ndarray) -> float:
         u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._potential(dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
+
+    # the occupations and the orbitals define the density
+    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
+        return (self.mo_coeff, self.mo_occ)
 
     def _save_update_orbs(self) -> None:
         """
@@ -697,7 +701,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         )
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(
+    def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -922,7 +926,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         if hasattr(self, setting):
                             setattr(mo_settings, setting, getattr(self, setting))
                     # run factory, which rotates the MO coefficients in place
-                    exact_update_orbs, self.func = mo_factory(
+                    exact_update_orbs, self._func = mo_factory(
                         self.mo_coeff,
                         self.s1e,
                         np.count_nonzero(self.mo_occ, axis=-1),
@@ -945,7 +949,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         if hasattr(self, setting):
                             setattr(oao_settings, setting, getattr(self, setting))
                     # run factory and set projection
-                    exact_update_orbs, self.func = oao_factory(
+                    exact_update_orbs, self._func = oao_factory(
                         dm_per_spin_ao,
                         self.s1e,
                         n_particle,
@@ -970,7 +974,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     # after the kernel, orbitals that replace the ones it left are
                     # updated by the routine of this object
                     if self._follow_orbitals():
-                        return self.update_orbs(kappa, grad, h_diag)
+                        return self._update_orbs(kappa, grad, h_diag)
 
                     n_jk = self.n_jk
                     func, hess_x = exact_update_orbs(kappa, grad, h_diag)
@@ -980,7 +984,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
                     return func, self.count_hess_x
 
-                self.update_orbs = wrapped_update_orbs
+                self._update_orbs = wrapped_update_orbs
 
             # define callback functions for approximate Hessians
             if density_qn:
@@ -996,7 +1000,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 # run factory after the factory of its basis, whose object it builds on,
                 # which holds the orbitals it updates in place and provides the exact
                 # Hessian the stability check uses
-                approx_update_orbs, self.func = density_qn_factory(
+                approx_update_orbs, self._func = density_qn_factory(
                     self.evaluate_dm_density_qn, settings, state, density_qn_settings
                 )
 
@@ -1023,10 +1027,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 for setting in rotation_qn_setting_fields:
                     if hasattr(self, setting):
                         setattr(rotation_qn_settings, setting, getattr(self, setting))
-                self.approx_update_orbs, self.func = rotation_qn_factory(
+                self.approx_update_orbs, self._func = rotation_qn_factory(
                     self.n_param,
-                    self.update_orbs,
-                    self.func,
+                    self._update_orbs,
+                    self._func,
                     self.transport,
                     self.init_hess,
                     settings,
@@ -1049,10 +1053,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 for setting in s_gek_setting_fields:
                     if hasattr(self, setting):
                         setattr(s_gek_settings, setting, getattr(self, setting))
-                self.approx_update_orbs, self.func = s_gek_factory(
+                self.approx_update_orbs, self._func = s_gek_factory(
                     self.n_param,
-                    self.update_orbs,
-                    self.func,
+                    self._update_orbs,
+                    self._func,
                     self.change_reference,
                     settings,
                     state,
@@ -1073,7 +1077,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             kappa = np.zeros(self.n_param, dtype=np.float64)
             grad = np.empty(self.n_param, dtype=np.float64)
             h_diag = np.empty(self.n_param, dtype=np.float64)
-            self.update_orbs(kappa, grad, h_diag)
+            self._update_orbs(kappa, grad, h_diag)
 
             settings.stability_hess_x = self.count_stability_hess_x
             if hasattr(self, "approx_update_orbs"):
@@ -1082,11 +1086,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # call solver
         solver(
             (
-                self.update_orbs
+                self._update_orbs
                 if not hasattr(self, "approx_update_orbs")
                 else self.count_approx_update_orbs(self.approx_update_orbs)
             ),
-            self.func,
+            self._func,
             self.n_param,
             settings,
             state,
@@ -2037,7 +2041,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         return energy
 
     # energy function
-    def func(self, x: np.ndarray) -> float:
+    def _func(self, x: np.ndarray) -> float:
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
 
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
@@ -2049,7 +2053,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         return (self.mo_coeff, *self.ci_vectors(self.ci))
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(
+    def _update_orbs(
         self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
@@ -2139,7 +2143,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         assign_solver_settings(self, settings)
 
         # call solver
-        solver(self.update_orbs, self.func, self.n_param, settings)
+        solver(self._update_orbs, self._func, self.n_param, settings)
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)

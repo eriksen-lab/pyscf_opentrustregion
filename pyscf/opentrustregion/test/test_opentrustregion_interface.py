@@ -97,7 +97,7 @@ def gradient_rms(obj: OTR) -> float:
     """
     grad = np.empty(obj.n_param, dtype=np.float64)
     h_diag = np.empty(obj.n_param, dtype=np.float64)
-    obj.update_orbs(np.zeros(obj.n_param, dtype=np.float64), grad, h_diag)
+    obj._update_orbs(np.zeros(obj.n_param, dtype=np.float64), grad, h_diag)
     return np.linalg.norm(grad) / np.sqrt(obj.n_param)
 
 
@@ -116,7 +116,7 @@ def check_derivatives_match_finite_differences(
     # compare equal whatever factor it carried
     np.random.seed(2)
     displacement = 0.05 * (np.random.random(obj.n_param) - 0.5)
-    _, hess_x = obj.update_orbs(displacement, grad, h_diag)
+    _, hess_x = obj._update_orbs(displacement, grad, h_diag)
 
     x = np.random.random(obj.n_param) - 0.5
     x /= np.linalg.norm(x)
@@ -124,14 +124,16 @@ def check_derivatives_match_finite_differences(
     hess_x(x, hx)
 
     step = 1e-5
-    derivative = (obj.func(step * x) - obj.func(-step * x)) / (2 * step)
+    derivative = (obj._func(step * x) - obj._func(-step * x)) / (2 * step)
     test.assertLess(abs(grad @ x - derivative), 1e-5 * abs(derivative))
 
     # the difference formulas are limited by round off in the objective, so both are
     # compared relative to the value they approximate
     step = 1e-4
     curvature = (
-        obj.func(step * x) - 2 * obj.func(np.zeros(obj.n_param)) + obj.func(-step * x)
+        obj._func(step * x)
+        - 2 * obj._func(np.zeros(obj.n_param))
+        + obj._func(-step * x)
     ) / step**2
     test.assertLess(abs(x @ hx - curvature), 1e-4 * abs(curvature))
 
@@ -495,11 +497,11 @@ class SCFTests(unittest.TestCase):
         zero = np.zeros(otr.n_param, dtype=np.float64)
 
         # the kernel canonicalizes at the end, so the first request has to recompute
-        otr.update_orbs(zero, grad, h_diag)
+        otr._update_orbs(zero, grad, h_diag)
         n_after_first = otr.n_update_orbs
 
         # a second request at the same point is served from the cache
-        func, _ = otr.update_orbs(zero, grad, h_diag)
+        func, _ = otr._update_orbs(zero, grad, h_diag)
         self.assertEqual(otr.n_update_orbs, n_after_first)
         self.assertAlmostEqual(func, otr.e_tot, 9)
 
@@ -509,7 +511,7 @@ class SCFTests(unittest.TestCase):
         grad, h_diag = grad_and_h_diag(otr)
         zero = np.zeros(otr.n_param, dtype=np.float64)
 
-        otr.update_orbs(zero, grad, h_diag)
+        otr._update_orbs(zero, grad, h_diag)
         cached = otr._last_update
 
         # a zero step alone must not be taken as proof that nothing has changed, also
@@ -518,7 +520,7 @@ class SCFTests(unittest.TestCase):
         # recomputation shows as a new cached result
         otr.mo_coeff = otr.mo_coeff.copy()
         otr.mo_coeff[:, 0] *= -1.0
-        otr.update_orbs(zero, grad, h_diag)
+        otr._update_orbs(zero, grad, h_diag)
         self.assertIsNot(otr._last_update, cached)
 
     def test_nonzero_step_always_recomputes(self) -> None:
@@ -528,9 +530,9 @@ class SCFTests(unittest.TestCase):
         step = np.zeros(otr.n_param, dtype=np.float64)
         step[0] = 1e-3
 
-        otr.update_orbs(np.zeros(otr.n_param), grad, h_diag)
+        otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
         n_before = otr.n_update_orbs
-        otr.update_orbs(step, grad, h_diag)
+        otr._update_orbs(step, grad, h_diag)
         self.assertEqual(otr.n_update_orbs, n_before + 1)
 
     def test_counters_record_the_work_done(self) -> None:
@@ -577,6 +579,44 @@ class SCFTests(unittest.TestCase):
                 stable, direction = check_stability_shape(self, otr)
                 self.assertFalse(stable)
                 self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
+
+    def test_stability_check_examines_the_current_occupations(self) -> None:
+        # the check examines the density of the current occupations and their
+        # occupied-virtual rotations, which with symmetry are those between orbitals of
+        # the same irrep, also when the occupations are assigned after the kernel and
+        # the update the kernel left is cached
+        for molecule in (mol, mol_sym):
+            with self.subTest(symmetry=molecule.symmetry):
+                otr = mf_to_otr(scf.RHF(molecule))
+                otr.kernel()
+                grad, h_diag = grad_and_h_diag(otr)
+                otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
+
+                # move the highest occupied pair to the lowest virtual orbital
+                mo_occ = otr.mo_occ.copy()
+                homo = np.flatnonzero(mo_occ > 0)[-1]
+                lumo = np.flatnonzero(mo_occ == 0)[0]
+                mo_occ[[homo, lumo]] = mo_occ[[lumo, homo]]
+                otr.mo_occ = mo_occ
+                check_stability_shape(self, otr)
+
+                # the update the check used is reused; n_update_orbs only counts
+                # updates that move the optimization, so reuse shows as an unchanged
+                # cached result
+                cached = otr._last_update
+                grad, h_diag = grad_and_h_diag(otr)
+                func, _ = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
+                self.assertIs(otr._last_update, cached)
+
+                ref = scf.RHF(molecule)
+                dm = ref.make_rdm1(otr.mo_coeff, mo_occ)
+                ref_grad = ref.get_grad(otr.mo_coeff, mo_occ, ref.get_fock(dm=dm))
+                if molecule.symmetry:
+                    occ = mo_occ > 0
+                    orbsym = ref.get_orbsym(otr.mo_coeff)
+                    ref_grad = ref_grad[(orbsym[~occ][:, None] == orbsym[occ]).ravel()]
+                self.assertAlmostEqual(func, ref.energy_tot(dm), 9)
+                np.testing.assert_allclose(grad, 2 * ref_grad, atol=1e-8)
 
     def test_energy_option_assigned_after_conversion_is_reported(self) -> None:
         # the PySCF object passed to mf_to_otr evaluates the energy and the gradient, so
@@ -693,9 +733,9 @@ class LocalizerTests(unittest.TestCase):
 
         # n_update_orbs only counts updates that move the optimization, so reuse shows
         # as an unchanged cached result
-        loc.update_orbs(zero, grad, h_diag)
+        loc._update_orbs(zero, grad, h_diag)
         cached = loc._last_update
-        loc.update_orbs(zero, grad, h_diag)
+        loc._update_orbs(zero, grad, h_diag)
         self.assertIs(loc._last_update, cached)
 
     def test_counters_record_the_work_done(self) -> None:
@@ -778,15 +818,15 @@ class CASSCFTests(unittest.TestCase):
         # the kernel canonicalizes, so the first request recomputes and the second is
         # served from the cache; n_update_orbs only counts updates that move the
         # optimization, so a recomputation shows as a new cached result
-        mc.update_orbs(zero, grad, h_diag)
+        mc._update_orbs(zero, grad, h_diag)
         cached = mc._last_update
-        mc.update_orbs(zero, grad, h_diag)
+        mc._update_orbs(zero, grad, h_diag)
         self.assertIs(mc._last_update, cached)
 
         ci = np.array(mc.ci, copy=True)
         ci[0] = -ci[0]
         mc.ci = ci / np.linalg.norm(ci)
-        mc.update_orbs(zero, grad, h_diag)
+        mc._update_orbs(zero, grad, h_diag)
         self.assertIsNot(mc._last_update, cached)
 
     def test_counters_record_the_work_done(self) -> None:
