@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.soscf import ciah, newton_ah
-from pyscf.mcscf import casci, newton_casscf, addons
+from pyscf.mcscf import casci, mc1step, newton_casscf, addons
 from pyopentrustregion import (
     SolverSettings,
     StabilitySettings,
@@ -43,7 +43,10 @@ from ctypes import Structure
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Tuple, Callable, Optional, Union
+    from typing import Any, Tuple, Callable, List, Optional, Union
+
+    PySCFHessX = Callable[[np.ndarray], np.ndarray]
+    OTRHessX = Callable[[np.ndarray, np.ndarray], None]
 
 
 # fields of the settings structures that are not settings
@@ -120,7 +123,7 @@ stability_setting_aliases = {
 }
 
 
-def setting_was_set_by_user(obj, name) -> bool:
+def setting_was_set_by_user(obj: object, name: str) -> bool:
     """
     this function decides whether a setting whose name PySCF also uses was set
     deliberately, by comparing it against the value recorded when the object was
@@ -134,7 +137,19 @@ def setting_was_set_by_user(obj, name) -> bool:
     return getattr(obj, name) != inherited[name]
 
 
-def assign_stability_settings(obj, stability_settings) -> None:
+def setting_is_assignable(obj: object, setting: str) -> bool:
+    """
+    this function decides whether an attribute that happens to carry a settings name
+    can be handed on as that setting. PySCF uses conv_check as a boolean flag whereas
+    the solver expects a convergence-check function, so a boolean of that name is
+    dropped instead of being passed on, where it would raise inside the ctypes callback
+    """
+    return setting != "conv_check" or not isinstance(getattr(obj, setting, None), bool)
+
+
+def assign_stability_settings(
+    obj: object, stability_settings: StabilitySettings
+) -> None:
     """
     this function copies the stability check settings from an object onto a stability
     settings object
@@ -144,11 +159,11 @@ def assign_stability_settings(obj, stability_settings) -> None:
             alias = stability_setting_aliases[setting]
             if hasattr(obj, alias):
                 setattr(stability_settings, setting, getattr(obj, alias))
-        elif hasattr(obj, setting):
+        elif hasattr(obj, setting) and setting_is_assignable(obj, setting):
             setattr(stability_settings, setting, getattr(obj, setting))
 
 
-def assign_solver_settings(obj, settings) -> None:
+def assign_solver_settings(obj: object, settings: SolverSettings) -> None:
     """
     this function copies the solver settings from an object onto a solver settings
     object, along with the settings of the stability check the solver runs itself
@@ -157,10 +172,7 @@ def assign_solver_settings(obj, settings) -> None:
         if setting in solver_settings_shadowed_by_pyscf:
             if setting_was_set_by_user(obj, setting):
                 setattr(settings, setting, getattr(obj, setting))
-        elif hasattr(obj, setting) and (
-            setting != "conv_check"
-            or not isinstance(getattr(obj, "conv_check", None), bool)
-        ):
+        elif hasattr(obj, setting) and setting_is_assignable(obj, setting):
             setattr(settings, setting, getattr(obj, setting))
     assign_stability_settings(obj, settings.stability_settings)
 
@@ -180,6 +192,12 @@ class OTR:
             "n_hess_x_stability",
         ]
     )
+
+    # supplied by the concrete driver this mixin is combined with
+    mo_coeff: np.ndarray
+
+    # set while the kernel runs
+    n_param: int
 
     # the cost function, gradient, Hessian diagonal and Hessian linear transformation
     # of the last orbital update, keyed by the point they were computed at and reused
@@ -247,6 +265,16 @@ class OTR:
             if hasattr(self, name)
         }
 
+    def update_orbs(
+        self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+    ) -> Tuple[float, OTRHessX]:
+        """
+        this function is supplied by every concrete driver below; it applies a step,
+        writes the gradient and Hessian diagonal in place and returns the objective
+        together with the Hessian linear transformation at the new point
+        """
+        raise NotImplementedError
+
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         # get Hessian diagonal and linear transformation at current point
@@ -275,8 +303,15 @@ class LocalizerOTR(OTR):
     that its kernel takes precedence over the PySCF one.
     """
 
+    # supplied by the pyscf.lo class this driver is combined with
+    mol: gto.Mole
+    init_guess: Optional[str]
+    cost_function: Callable[..., float]
+    get_init_guess: Callable[..., np.ndarray]
+    gen_g_hop: Callable[..., Tuple[np.ndarray, PySCFHessX, np.ndarray]]
+
+    # set while the kernel runs
     norb: int
-    mo_coeff: np.ndarray
 
     # sign that turns the PySCF cost function into a minimization objective; PySCF's
     # gen_g_hop always returns derivatives of the minimization objective, so only the
@@ -287,7 +322,7 @@ class LocalizerOTR(OTR):
     # localizers provide; the OTR equivalent is the stability_check() method
     stability = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._snapshot_shadowed_settings()
 
@@ -307,7 +342,7 @@ class LocalizerOTR(OTR):
     # function
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
+    ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the cost function and its derivatives still apply
         self._moves(kappa)
@@ -324,7 +359,7 @@ class LocalizerOTR(OTR):
         grad[:] = new_grad
         h_diag[:] = new_h_diag
 
-        def raw_hess_x(x, hx):
+        def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             hx[:] = hess_x(x)
 
         self.raw_hess_x = raw_hess_x
@@ -388,25 +423,45 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
     cost_sign = -1.0
 
 
-if hasattr(lo, "FourthMoment"):
-
-    class FourthMomentOTR(LocalizerOTR, lo.FourthMoment):
-        pass
-
-else:
+if not TYPE_CHECKING and not hasattr(lo, "FourthMoment"):
 
     class FourthMomentOTR:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError(
                 "FourthMomentOTR requires PySCF with lo.FourthMoment. "
                 "Please install a compatible PySCF version."
             )
 
+else:
+
+    class FourthMomentOTR(LocalizerOTR, lo.FourthMoment):
+        pass
+
+
+# input options of the PySCF Kohn-Sham objects that define the energy. A converted
+# object evaluates the energy and the gradient through the PySCF object it was
+# converted from but the Hessian itself, so such an option assigned after the
+# conversion reaches only the Hessian
+ks_energy_options = ("xc", "nlc", "disp", "grids", "nlcgrids", "small_rho_cutoff")
+
+
+def option_differs(value: Any, wrapped_value: Any) -> bool:
+    """
+    this function decides whether an option of a converted object differs from that of
+    the object it was converted from, comparing names of functionals without regard to
+    case, as PySCF parses them
+    """
+    if isinstance(value, str) and isinstance(wrapped_value, str):
+        return value.upper() != wrapped_value.upper()
+    return bool(value != wrapped_value)
+
 
 class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
-    mo_coeff: np.ndarray
+    # supplied by the PySCF mean-field object this driver wraps
     mo_occ: np.ndarray
+
+    # set while the kernel runs
     dm: np.ndarray
     vhf: np.ndarray
 
@@ -421,6 +476,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "_last_potential",
             "_adopted_potential",
             "_canonical_rotation",
+            "_kernel_orbitals",
             "raw_approx_update_orbs",
             "raw_approx_hess_x",
             "n_jk_update",
@@ -518,14 +574,44 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # parameters of both, if the last kernel used the MO extension
     _canonical_rotation: Optional[list] = None
 
+    # the orbitals the last kernel left, which the extension objects of the routines it
+    # adopted describe, if it adopted any
+    _kernel_orbitals = LastResult()
+
+    def _drop_adopted_routines(self) -> None:
+        """
+        this function drops the routines the last kernel adopted from the extension
+        factories, so that the routines of this object apply again
+        """
+        self._canonical_rotation = None
+        self._kernel_orbitals = LastResult()
+        for name in self._adopted_routines:
+            self.__dict__.pop(name, None)
+        self._adopted_routines = ()
+
     def _reset(self) -> None:
         super()._reset()
         self._last_potential = LastResult()
         self._adopted_potential = None
-        self._canonical_rotation = None
-        for name in self._adopted_routines:
-            self.__dict__.pop(name, None)
-        self._adopted_routines = ()
+        self._drop_adopted_routines()
+
+    def _follow_orbitals(self) -> bool:
+        """
+        this function drops the routines the last kernel adopted once the orbitals are
+        no longer those the kernel left, since the extension objects of these routines
+        keep the orbitals of the kernel, and determines the parameters of the current
+        orbitals, on which the routines of this object then work; it returns whether it
+        dropped them
+        """
+        if not self._kernel_orbitals.key or self._kernel_orbitals.matches(
+            self._orbs_state()
+        ):
+            return False
+
+        self._drop_adopted_routines()
+        self.get_indices()
+        self.n_param = int(np.count_nonzero(self.kappa_mask))
+        return True
 
     # raw and counted orbital updates and (approximate) Hessian linear transformations
     raw_approx_update_orbs = None
@@ -558,10 +644,35 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.n_hess_x_stability += 1
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
-    def __init__(self, mf: scf.SCF):
+    def __init__(self, mf: scf.SCF) -> None:
         self.__dict__.update(mf.__dict__)
         self._scf = mf
         self._snapshot_shadowed_settings()
+
+    def _warn_on_differing_energy_options(self) -> None:
+        """
+        this function warns when an option defining the energy differs from that of the
+        PySCF object this object was converted from, which evaluates the energy and the
+        gradient, typically because the option was assigned after the conversion
+        """
+        differing = [
+            option
+            for option in ks_energy_options
+            if hasattr(self._scf, option)
+            and option_differs(getattr(self, option), getattr(self._scf, option))
+        ]
+        if differing:
+            names = ", ".join(differing)
+            verb = "differs" if len(differing) == 1 else "differ"
+            lib.logger.warn(
+                self,
+                f"{names} of this object {verb} from the PySCF object passed to "
+                "mf_to_otr, which evaluates the energy and the gradient, so the value "
+                "assigned here reaches only the Hessian. Unless the Hessian is "
+                f"approximated on purpose, set {names} before mf_to_otr: otherwise the "
+                "solver optimizes the energy for the original value and the stability "
+                "check can report instabilities that this energy does not have.",
+            )
 
     # energy function
     def func(self, kappa: np.ndarray) -> float:
@@ -588,7 +699,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-    ) -> Tuple[float, Callable[[np.ndarray], np.ndarray]]:
+    ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the effective potential and Fock matrix need not be rebuilt
         self._moves(kappa)
@@ -651,6 +762,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 mo_occ = self.mo_occ
 
         self.build(self.mol)
+
+        # the energy and the gradient are evaluated with the options of the wrapped
+        # object, whereas the Hessian is evaluated with those of this object
+        self._warn_on_differing_energy_options()
 
         mol = self._scf.mol
 
@@ -784,7 +899,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             # number of parameters in AO basis
             self.n_param = n_particle * self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
         else:
-            self.n_param = np.count_nonzero(self.kappa_mask)
+            self.n_param = int(np.count_nonzero(self.kappa_mask))
 
         # turn on automatic stability check for approximate Hessians
         if (not hasattr(self, "stability") or self.stability is None) and (
@@ -852,6 +967,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 # orbital updating function if it is marked as one
                 @functools.wraps(exact_update_orbs)
                 def wrapped_update_orbs(kappa, grad, h_diag):
+                    # after the kernel, orbitals that replace the ones it left are
+                    # updated by the routine of this object
+                    if self._follow_orbitals():
+                        return self.update_orbs(kappa, grad, h_diag)
+
                     n_jk = self.n_jk
                     func, hess_x = exact_update_orbs(kappa, grad, h_diag)
                     if self._moves(kappa) or self.n_jk > n_jk:
@@ -1023,6 +1143,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             ]
             self.stability_get_extra_trial_vectors = self._canonical_trial_vectors
 
+        # the adopted routines describe the orbitals the kernel leaves, which are
+        # recorded so that the routines are dropped once these orbitals are replaced
+        if self._adopted_routines:
+            self._kernel_orbitals = LastResult.of(self._orbs_state(), None)
+
         return self.e_tot
 
     def _vo_masks(self) -> list:
@@ -1076,7 +1201,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             unit_vector[idx] = 1.0
             vector[:] = self._rotate_canonical(unit_vector, False)
 
+    # stability check function, which examines the Hessian evaluated with the options
+    # of this object
     def stability_check(self) -> Tuple[bool, np.ndarray]:
+        self._warn_on_differing_energy_options()
+
+        # the check examines the current orbitals, also when they replace the ones the
+        # last kernel left
+        self._follow_orbitals()
         stable, direction = super().stability_check()
 
         # the MO objects hold the orbitals before they were canonicalized and
@@ -1103,7 +1235,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         return lib.tag_array(vj - 0.5 * vk, vj=vj, vk=vk)
 
     # fix phases of MO coefficients to improve deterministic behavior
-    def fix_phase(self):
+    def fix_phase(self) -> None:
         abs_mo_coeff = np.abs(self.mo_coeff)
         max_mo_coeff = np.max(abs_mo_coeff, axis=0)
         mask = np.isclose(abs_mo_coeff, max_mo_coeff, atol=1e-12)
@@ -1145,11 +1277,11 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         ]
 
     # function to compute exponential of anti-symmetric matrix
-    def exp_mat(self, matrix):
+    def exp_mat(self, matrix: np.ndarray) -> np.ndarray:
         return ciah.expmat(matrix)
 
     # unpack matrix
-    def unpack(self, kappa):
+    def unpack(self, kappa: np.ndarray) -> np.ndarray:
         matrix = np.zeros(self.rot_matrix_mask.shape, dtype=np.float64)
         matrix[self.rot_matrix_mask] = kappa
         return matrix - matrix.T
@@ -1498,7 +1630,7 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
     # fix phases of MO coefficients to improve deterministic behavior
-    def fix_phase(self):
+    def fix_phase(self) -> None:
         abs_mo_coeff = np.abs(self.mo_coeff)
         max_mo_coeff = np.max(abs_mo_coeff, axis=1)
         for i in range(2):
@@ -1581,11 +1713,11 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         ]
 
     # function to compute exponential of anti-symmetric matrix
-    def exp_mat(self, matrix):
+    def exp_mat(self, matrix: List[np.ndarray]) -> List[np.ndarray]:
         return [ciah.expmat(matrix[0]), ciah.expmat(matrix[1])]
 
     # unpack matrix
-    def unpack(self, kappa):
+    def unpack(self, kappa: np.ndarray) -> List[np.ndarray]:
         n_param_a = np.count_nonzero(self.rot_matrix_mask[0])
         matrix_list = [
             np.zeros(self.rot_matrix_mask.shape[1:], dtype=np.float64),
@@ -1794,7 +1926,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         return mo_occ, mo_coeff
 
 
-def mf_to_otr(mf):
+def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     if isinstance(mf, SecondOrderOTR):
         return mf
@@ -1819,54 +1951,107 @@ def mf_to_otr(mf):
 
 class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
+    # set while the kernel runs
+    ci: Union[np.ndarray, List[np.ndarray]]
+    e_tot: Optional[float]
+    e_cas: Optional[float]
+    n_param_orb: int
+    n_param_ci: int
+
     def __init__(
         self,
         mf_or_mol: Union[gto.Mole, scf.RHF],
-        ncas,
-        nelecas,
-        ncore=None,
-        frozen=None,
-    ):
+        ncas: int,
+        nelecas: Union[int, Tuple[int, int]],
+        ncore: Optional[int] = None,
+        frozen: Optional[Union[int, List[int]]] = None,
+    ) -> None:
         casci.CASBase.__init__(self, mf_or_mol, ncas, nelecas, ncore)
         self.frozen = frozen
 
         self.e_tot = None
-        self.e_cas = None
-        self.ci = None
         self.mo_coeff = self._scf.mo_coeff
         self.mo_energy = self._scf.mo_energy
         self.converged = False
         self._max_stepsize = None
         self._snapshot_shadowed_settings()
 
-    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
-        if self.fcisolver.nroots == 1:
-            return (self.mo_coeff, self.ci)
-        return (self.mo_coeff, *self.ci)
+    @staticmethod
+    def ci_vectors(ci: Union[np.ndarray, List[np.ndarray]]) -> List[np.ndarray]:
+        """
+        this function returns the CI vectors as a list
+        """
+        return [ci] if isinstance(ci, np.ndarray) else ci
+
+    @staticmethod
+    def step_ci(ci: np.ndarray, step: np.ndarray) -> np.ndarray:
+        """
+        this function applies a step to a normalized CI vector; the component of the
+        step along the vector itself only rescales it, which the renormalization then
+        undoes, so it is a redundant direction along which gen_g_hop reports neither a
+        gradient nor a curvature. Removing it keeps the energy consistent with those
+        derivatives, which the renormalization would otherwise break at second order
+        """
+        step = step - (step @ ci) * ci / (ci @ ci)
+        ci = ci + step
+        return ci / np.linalg.norm(ci)
+
+    def displaced_ci(self, x: np.ndarray) -> Union[np.ndarray, List[np.ndarray]]:
+        """
+        this function applies the CI part of a step to the current CI vector, giving
+        the CI vector the energy and its derivatives are both evaluated at
+        """
+        idx_start = self.n_param_orb
+        if isinstance(self.ci, np.ndarray):
+            return self.step_ci(self.ci, x[idx_start:])
+
+        ci = []
+        for c in self.ci:
+            idx_stop = idx_start + c.size
+            ci.append(self.step_ci(c, x[idx_start:idx_stop]))
+            idx_start = idx_stop
+        return ci
+
+    def energy(
+        self, mo_coeff: np.ndarray, ci: Union[np.ndarray, List[np.ndarray]], eris: Any
+    ) -> float:
+        """
+        this function returns the energy of a given CI vector in given orbitals
+        """
+        # the active space Hamiltonian, reusing the integrals already transformed for
+        # these orbitals
+        fcasci = mc1step._fake_h_for_fast_casci(self, mo_coeff, eris)
+        h1eff, energy_core = fcasci.get_h1eff()
+        op = self.fcisolver.absorb_h1e(
+            h1eff, fcasci.get_h2eff(), self.ncas, self.nelecas, 0.5
+        )
+
+        # the expectation value over the states, weighted the way gen_g_hop weights
+        # its derivatives so that energy and derivatives describe one function
+        vectors = self.ci_vectors(ci)
+        energy = energy_core
+        for weight, vector in zip(getattr(self, "weights", [1.0]), vectors):
+            hc = self.fcisolver.contract_2e(op, vector, self.ncas, self.nelecas)
+            energy += weight * np.dot(np.ravel(vector), np.ravel(hc))
+
+        return energy
 
     # energy function
-    def func(self, x):
+    def func(self, x: np.ndarray) -> float:
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
 
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         eris = self.ao2mo(rot_mo_coeff)
 
-        idx_start = self.n_param_orb
-        if self.fcisolver.nroots == 1:
-            ci = self.ci + x[idx_start:]
-            ci /= np.linalg.norm(ci)
-        else:
-            ci = []
-            for c in self.ci:
-                idx_stop = idx_start + c.size
-                ci.append(c + x[idx_start:idx_stop])
-                ci[-1] /= np.linalg.norm(ci[-1])
-                idx_start = idx_stop
+        return self.energy(rot_mo_coeff, self.displaced_ci(x), eris)
 
-        return self.casci(rot_mo_coeff, ci, eris)[0]
+    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
+        return (self.mo_coeff, *self.ci_vectors(self.ci))
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
-    def update_orbs(self, x, grad, h_diag):
+    def update_orbs(
+        self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+    ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals or CI vector since, so the integrals need not be transformed again
         self._moves(x)
@@ -1875,22 +2060,14 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             eris = self.ao2mo(self.mo_coeff)
 
-            idx_start = self.n_param_orb
-            if self.fcisolver.nroots == 1:
-                ci = self.ci + x[idx_start:]
-                ci /= np.linalg.norm(ci)
-                self.ci = ci
-            else:
-                ci = []
-                for c in self.ci:
-                    idx_stop = idx_start + c.size
-                    ci.append(c + x[idx_start:idx_stop])
-                    ci[-1] /= np.linalg.norm(ci[-1])
-                    idx_start = idx_stop
-                self.ci = ci
-                ci = [c.ravel() for c in ci]
+            self.ci = self.displaced_ci(x)
+            ci = (
+                self.ci
+                if isinstance(self.ci, np.ndarray)
+                else [c.ravel() for c in self.ci]
+            )
 
-            energy = self.casci(self.mo_coeff, self.ci, eris)[0]
+            energy = self.energy(self.mo_coeff, self.ci, eris)
             new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
                 self, self.mo_coeff, ci, eris
             )
@@ -1899,17 +2076,29 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             )
         energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
-        grad[:] = 2 * new_grad
-        h_diag[:] = 2 * new_h_diag
+        grad[:] = new_grad
+        h_diag[:] = new_h_diag
 
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            hx[:] = 2 * hess_x(x)
+            hx[:] = hess_x(x)
 
         self.raw_hess_x = raw_hess_x
 
         return energy, self.count_hess_x
 
-    def kernel(self, mo_coeff=None, ci0=None, callback=None):
+    def kernel(
+        self,
+        mo_coeff: Optional[np.ndarray] = None,
+        ci0: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
+        callback: Optional[Callable[..., None]] = None,
+    ) -> Tuple[
+        bool,
+        Optional[float],
+        Optional[float],
+        Union[np.ndarray, List[np.ndarray]],
+        np.ndarray,
+        Optional[np.ndarray],
+    ]:
         # discard anything computed by a previous kernel
         self._reset()
         if mo_coeff is None:
@@ -1925,23 +2114,22 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         # initial guess
         eris = self.ao2mo(mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(mo_coeff, ci0, eris)
-        if self.fcisolver.nroots == 1:
+        if isinstance(fcivec, np.ndarray):
             self.ci = fcivec.ravel()
         else:
             self.ci = [c.ravel() for c in fcivec]
 
         # number of unique orbital rotation parameters
-        self.n_param_orb = np.count_nonzero(
-            self.uniq_var_indices(
-                self.mo_coeff.shape[1], self.ncore, self.ncas, self.frozen
+        self.n_param_orb = int(
+            np.count_nonzero(
+                self.uniq_var_indices(
+                    self.mo_coeff.shape[1], self.ncore, self.ncas, self.frozen
+                )
             )
         )
 
         # number of CI parameters
-        if self.fcisolver.nroots == 1:
-            self.n_param_ci = self.ci.size
-        else:
-            self.n_param_ci = sum(c.size for c in self.ci)
+        self.n_param_ci = sum(c.size for c in self.ci_vectors(self.ci))
 
         # number of parameters
         self.n_param = self.n_param_orb + self.n_param_ci
@@ -1955,7 +2143,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         self.converged = True
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
-        if self.fcisolver.nroots == 1:
+        if isinstance(fcivec, np.ndarray):
             self.ci = fcivec.ravel()
         else:
             self.ci = [c.ravel() for c in fcivec]
@@ -1983,7 +2171,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         )
 
 
-def casscf_to_otr(casscf):
+def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
     if isinstance(casscf, CASSCFOTR):
         return casscf
 
