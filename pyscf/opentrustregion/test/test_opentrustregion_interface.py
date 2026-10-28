@@ -10,6 +10,7 @@ Tests for the PySCF interface to OpenTrustRegion
 
 import io
 import unittest
+from itertools import product
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -567,9 +568,9 @@ class SCFTests(unittest.TestCase):
         # occupied-virtual rotations, which with symmetry are those between orbitals of
         # the same irrep, also when the occupations are assigned after the kernel and
         # the update the kernel left is cached
-        for molecule in (mol, mol_sym):
-            with self.subTest(symmetry=molecule.symmetry):
-                otr = mf_to_otr(scf.RHF(molecule))
+        for cls, molecule in product((scf.RHF, scf.ROHF), (mol, mol_sym)):
+            with self.subTest(cls=cls.__name__, symmetry=molecule.symmetry):
+                otr = mf_to_otr(cls(molecule))
                 otr.kernel()
                 grad, h_diag = grad_and_h_diag(otr)
                 otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
@@ -588,7 +589,7 @@ class SCFTests(unittest.TestCase):
                 func, _ = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
                 self.assertEqual(otr.n_update_orbs, n_update_orbs)
 
-                ref = scf.RHF(molecule)
+                ref = cls(molecule)
                 dm = ref.make_rdm1(otr.mo_coeff, mo_occ)
                 ref_grad = ref.get_grad(otr.mo_coeff, mo_occ, ref.get_fock(dm=dm))
                 if molecule.symmetry:
