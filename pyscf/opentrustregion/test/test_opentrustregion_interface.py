@@ -406,12 +406,21 @@ class SCFTests(unittest.TestCase):
     energies, the cached orbital updates, the derivatives and the stability check
     """
 
-    def _check(self, mf_in: scf.hf.SCF, ref_mf: scf.hf.SCF) -> OTR:
-        ref = ref_mf.newton().kernel()
+    def _check(self, mf_in: scf.hf.SCF, ref_mf: scf.hf.SCF, **settings: Any) -> OTR:
+        ref_newton = ref_mf.newton()
+        ref = ref_newton.kernel()
         otr = mf_to_otr(mf_in)
+        for name, value in settings.items():
+            setattr(otr, name, value)
         e_tot = otr.kernel()
         self.assertAlmostEqual(e_tot, ref, 8)
         self.assertAlmostEqual(otr.e_tot, ref, 8)
+
+        # the orbitals are ordered as PySCF orders them, by energy with the occupied
+        # ones first, which the methods building on them rely on
+        self.assertFalse(np.signbit(otr.mo_occ).any())
+        np.testing.assert_array_equal(otr.mo_occ, ref_newton.mo_occ)
+        np.testing.assert_allclose(otr.mo_energy, ref_newton.mo_energy, atol=1e-4)
 
         # the orbitals must remain a valid, orthonormal set in the AO basis
         ovlp = otr.mol.intor_symmetric("int1e_ovlp")
@@ -456,6 +465,9 @@ class SCFTests(unittest.TestCase):
     def test_rhf(self) -> None:
         self._check(scf.RHF(mol), scf.RHF(mol))
 
+    def test_rhf_in_the_oao_basis(self) -> None:
+        self._check(scf.RHF(mol), scf.RHF(mol), oao=True)
+
     def test_rhf_with_symmetry(self) -> None:
         self._check(scf.RHF(mol_sym), scf.RHF(mol_sym))
 
@@ -464,6 +476,9 @@ class SCFTests(unittest.TestCase):
 
     def test_uhf(self) -> None:
         self._check(scf.UHF(mol_open), scf.UHF(mol_open))
+
+    def test_uhf_in_the_oao_basis(self) -> None:
+        self._check(scf.UHF(mol_open), scf.UHF(mol_open), oao=True)
 
     def test_uhf_with_symmetry(self) -> None:
         mol_open_sym = mol_open.copy()
@@ -579,10 +594,8 @@ class SCFTests(unittest.TestCase):
 
                 # placing the same object back at the restricted solution must make the
                 # check report the instability, along with a normalized direction out
-                # of the saddle; the OAO kernel leaves the occupied orbitals last, so
-                # the occupations are placed back with the orbitals
+                # of the saddle
                 otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
-                otr.mo_occ = np.array([rhf.mo_occ / 2, rhf.mo_occ / 2])
                 stable, direction = check_stability_shape(self, otr)
                 self.assertFalse(stable)
                 self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)

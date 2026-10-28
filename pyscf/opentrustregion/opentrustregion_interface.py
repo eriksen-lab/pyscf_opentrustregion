@@ -1506,8 +1506,12 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
         dm_orth = s_sqrt @ self.dm @ s_sqrt
         mo_occ, mo_coeff_oao = np.linalg.eigh(dm_orth)
-        mo_occ = np.rint(mo_occ)
-        mo_coeff = s_inv_sqrt @ mo_coeff_oao
+
+        # PySCF orders the orbitals with the occupied ones first, so the natural
+        # orbitals are taken in decreasing occupation, which is rounded to a
+        # nonnegative integer
+        mo_occ = np.abs(np.rint(mo_occ[..., ::-1]))
+        mo_coeff = s_inv_sqrt @ mo_coeff_oao[..., ::-1]
         return mo_occ, mo_coeff
 
 
@@ -1623,8 +1627,12 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
         dm_orth = s_sqrt @ (self.dm[0] + self.dm[1]) @ s_sqrt
         mo_occ, mo_coeff_oao = np.linalg.eigh(dm_orth)
-        mo_occ = np.rint(mo_occ)
-        mo_coeff = s_inv_sqrt @ mo_coeff_oao
+
+        # PySCF orders the orbitals with the occupied ones first, so the natural
+        # orbitals are taken in decreasing occupation, which is rounded to a
+        # nonnegative integer
+        mo_occ = np.abs(np.rint(mo_occ[..., ::-1]))
+        mo_coeff = s_inv_sqrt @ mo_coeff_oao[..., ::-1]
         return mo_occ, mo_coeff
 
 
@@ -1922,8 +1930,12 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
         dm_orth = s_sqrt @ self.dm @ s_sqrt
         mo_occ, mo_coeff_oao = np.linalg.eigh(dm_orth)
-        mo_occ = np.rint(mo_occ)
-        mo_coeff = s_inv_sqrt @ mo_coeff_oao
+
+        # PySCF orders the orbitals with the occupied ones first, so the natural
+        # orbitals are taken in decreasing occupation, which is rounded to a
+        # nonnegative integer
+        mo_occ = np.abs(np.rint(mo_occ[..., ::-1]))
+        mo_coeff = s_inv_sqrt @ mo_coeff_oao[..., ::-1]
         return mo_occ, mo_coeff
 
 
