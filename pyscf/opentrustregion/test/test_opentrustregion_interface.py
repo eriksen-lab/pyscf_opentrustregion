@@ -10,8 +10,9 @@ Tests for the PySCF interface to OpenTrustRegion
 
 import io
 import unittest
+from contextlib import contextmanager, redirect_stderr
 from itertools import product
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Generator, Tuple
 
 import numpy as np
 
@@ -139,15 +140,18 @@ def check_derivatives_match_finite_differences(
     test.assertLess(abs(x @ hx - curvature), 1e-4 * abs(curvature))
 
 
-def capture_warnings(obj: Any) -> io.StringIO:
+@contextmanager
+def capture_warnings(obj: Any) -> Generator[io.StringIO, None, None]:
     """
-    this function routes the PySCF log of an object into a buffer, at the verbosity that
-    still includes warnings
+    this function routes the PySCF log of an object into a buffer, at the verbosity
+    that still includes warnings, and discards the copy of every warning PySCF writes
+    to the standard error while the log is not the standard output
     """
     log = io.StringIO()
     obj.stdout = log
     obj.verbose = lib.logger.WARN
-    return log
+    with redirect_stderr(io.StringIO()):
+        yield log
 
 
 def check_stability_shape(test: unittest.TestCase, obj: OTR) -> Tuple[bool, np.ndarray]:
@@ -604,19 +608,18 @@ class SCFTests(unittest.TestCase):
         # an option defining the energy that is assigned afterwards reaches at most the
         # Hessian, which the solver and the stability check warn about
         otr = mf_to_otr(dft.UKS(mol_open, xc="b3lyp"))
-        log = capture_warnings(otr)
+        with capture_warnings(otr) as log:
+            # a replaced grid for the nonlocal correlation, which b3lyp does not use,
+            # leaves the optimization unaffected
+            otr.nlcgrids = dft.gen_grid.Grids(mol_open)
+            otr.kernel()
+            self.assertIn("nlcgrids of this object differs", log.getvalue())
 
-        # a replaced grid for the nonlocal correlation, which b3lyp does not use, leaves
-        # the optimization unaffected
-        otr.nlcgrids = dft.gen_grid.Grids(mol_open)
-        otr.kernel()
-        self.assertIn("nlcgrids of this object differs", log.getvalue())
-
-        log.seek(0)
-        log.truncate()
-        otr.xc = "pbe"
-        otr.stability_check()
-        self.assertIn("xc, nlcgrids of this object differ", log.getvalue())
+            log.seek(0)
+            log.truncate()
+            otr.xc = "pbe"
+            otr.stability_check()
+            self.assertIn("xc, nlcgrids of this object differ", log.getvalue())
 
     def test_energy_option_reaching_the_energy_is_not_reported(self) -> None:
         # an option assigned before the conversion, a functional name differing only in
@@ -625,15 +628,15 @@ class SCFTests(unittest.TestCase):
         uks = dft.UKS(mol_open)
         uks.xc = "b3lyp"
         otr = mf_to_otr(uks)
-        log = capture_warnings(otr)
-        otr.xc = "B3LYP"
-        otr.grids.level = 2
-        # the secondary grid only exists in PySCF releases after 2.14
-        if hasattr(otr, "set_second_grids"):
-            otr.set_second_grids(2)
-        otr.kernel()
-        otr.stability_check()
-        self.assertNotIn("mf_to_otr", log.getvalue())
+        with capture_warnings(otr) as log:
+            otr.xc = "B3LYP"
+            otr.grids.level = 2
+            # the secondary grid only exists in PySCF releases after 2.14
+            if hasattr(otr, "set_second_grids"):
+                otr.set_second_grids(2)
+            otr.kernel()
+            otr.stability_check()
+            self.assertNotIn("mf_to_otr", log.getvalue())
 
 
 class LocalizerTests(unittest.TestCase):
