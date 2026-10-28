@@ -186,7 +186,7 @@ class OTR:
             "_inherited_settings",
             "_last_update",
             "_updated",
-            "raw_hess_x",
+            "_raw_hess_x",
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
@@ -234,16 +234,16 @@ class OTR:
         self._last_update = LastResult()
 
     # Hessian linear transformation of the last orbital update
-    raw_hess_x = None
+    _raw_hess_x = None
 
     # Hessian linear transformation performed for the solver
-    def count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        self.raw_hess_x(x, hx)
+    def _count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self._raw_hess_x(x, hx)
         self.n_hess_x += 1
 
     # Hessian linear transformation performed for a stability check
-    def count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        self.raw_hess_x(x, hx)
+    def _count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self._raw_hess_x(x, hx)
         self.n_hess_x_stability += 1
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
@@ -290,7 +290,11 @@ class OTR:
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
         stable = stability_check(
-            h_diag, self.count_stability_hess_x, self.n_param, settings, kappa=direction
+            h_diag,
+            self._count_stability_hess_x,
+            self.n_param,
+            settings,
+            kappa=direction,
         )
 
         return stable, direction
@@ -362,9 +366,9 @@ class LocalizerOTR(OTR):
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             hx[:] = hess_x(x)
 
-        self.raw_hess_x = raw_hess_x
+        self._raw_hess_x = raw_hess_x
 
-        return self.cost_sign * func, self.count_hess_x
+        return self.cost_sign * func, self._count_hess_x
 
     # kernel function
     def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
@@ -477,8 +481,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "_adopted_potential",
             "_canonical_rotation",
             "_kernel_orbitals",
-            "raw_approx_update_orbs",
-            "raw_approx_hess_x",
+            "_raw_approx_update_orbs",
+            "_raw_approx_hess_x",
             "n_jk_update",
             "n_jk_energy",
             "n_jk_response",
@@ -561,8 +565,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     factory_routines = (
         "_func",
         "_update_orbs",
-        "approx_update_orbs",
-        "raw_approx_update_orbs",
+        "_approx_update_orbs",
+        "_raw_approx_update_orbs",
         "project",
         "precond",
         "stability_get_extra_trial_vectors",
@@ -614,33 +618,33 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         return True
 
     # raw and counted orbital updates and (approximate) Hessian linear transformations
-    raw_approx_update_orbs = None
-    raw_approx_hess_x = None
+    _raw_approx_update_orbs = None
+    _raw_approx_hess_x = None
 
-    def count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        self.raw_approx_hess_x(x, hx)
+    def _count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        self._raw_approx_hess_x(x, hx)
         self.n_hess_x += 1
 
-    def count_approx_update_orbs(self, approx_update_orbs: Callable) -> Callable[
+    def _count_approx_update_orbs(self, approx_update_orbs: Callable) -> Callable[
         [np.ndarray, np.ndarray, np.ndarray],
         Tuple[float, Callable[[np.ndarray, np.ndarray], None]],
     ]:
         def update_orbs(
             kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
         ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-            func, self.raw_approx_hess_x = approx_update_orbs(kappa, grad, h_diag)
-            return func, self.count_approx_hess_x
+            func, self._raw_approx_hess_x = approx_update_orbs(kappa, grad, h_diag)
+            return func, self._count_approx_hess_x
 
         return update_orbs
 
-    def count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+    def _count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         n_jk_response = self.n_jk_response
-        super().count_stability_hess_x(x, hx)
+        super()._count_stability_hess_x(x, hx)
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
-    def approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+    def _approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         n_jk_response = self.n_jk_response
-        self.raw_approx_update_orbs.hess_x(x, hx)
+        self._raw_approx_update_orbs.hess_x(x, hx)
         self.n_hess_x_stability += 1
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
@@ -727,9 +731,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.n_jk_response += 1
             hx[:] = 2 * hess_x(x_full)[self.kappa_mask]
 
-        self.raw_hess_x = raw_hess_x
+        self._raw_hess_x = raw_hess_x
 
-        return energy, self.count_hess_x
+        return energy, self._count_hess_x
 
     # kernel function
     def kernel(
@@ -980,9 +984,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     func, hess_x = exact_update_orbs(kappa, grad, h_diag)
                     if self._moves(kappa) or self.n_jk > n_jk:
                         self._count_update()
-                    self.raw_hess_x = hess_x
+                    self._raw_hess_x = hess_x
 
-                    return func, self.count_hess_x
+                    return func, self._count_hess_x
 
                 self._update_orbs = wrapped_update_orbs
 
@@ -1020,14 +1024,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         self._count_update()
                     return func, hess_x
 
-                self.approx_update_orbs = wrapped_approx_update_orbs
-                self.raw_approx_update_orbs = approx_update_orbs
+                self._approx_update_orbs = wrapped_approx_update_orbs
+                self._raw_approx_update_orbs = approx_update_orbs
             elif rotation_qn:
                 rotation_qn_settings = RotationQNSettings()
                 for setting in rotation_qn_setting_fields:
                     if hasattr(self, setting):
                         setattr(rotation_qn_settings, setting, getattr(self, setting))
-                self.approx_update_orbs, self._func = rotation_qn_factory(
+                self._approx_update_orbs, self._func = rotation_qn_factory(
                     self.n_param,
                     self._update_orbs,
                     self._func,
@@ -1037,7 +1041,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     state,
                     rotation_qn_settings,
                 )
-                self.raw_approx_update_orbs = self.approx_update_orbs
+                self._raw_approx_update_orbs = self._approx_update_orbs
             elif self.s_gek:
                 if self.oao:
                     raise RuntimeError(
@@ -1053,7 +1057,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 for setting in s_gek_setting_fields:
                     if hasattr(self, setting):
                         setattr(s_gek_settings, setting, getattr(self, setting))
-                self.approx_update_orbs, self._func = s_gek_factory(
+                self._approx_update_orbs, self._func = s_gek_factory(
                     self.n_param,
                     self._update_orbs,
                     self._func,
@@ -1062,7 +1066,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     state,
                     s_gek_settings,
                 )
-                self.raw_approx_update_orbs = self.approx_update_orbs
+                self._raw_approx_update_orbs = self._approx_update_orbs
         finally:
             self._adopted_routines = tuple(
                 name
@@ -1079,16 +1083,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             h_diag = np.empty(self.n_param, dtype=np.float64)
             self._update_orbs(kappa, grad, h_diag)
 
-            settings.stability_hess_x = self.count_stability_hess_x
-            if hasattr(self, "approx_update_orbs"):
-                settings.stability_settings.approx_hess_x = self.approx_stability_hess_x
+            settings.stability_hess_x = self._count_stability_hess_x
+            if hasattr(self, "_approx_update_orbs"):
+                settings.stability_settings.approx_hess_x = (
+                    self._approx_stability_hess_x
+                )
 
         # call solver
         solver(
             (
                 self._update_orbs
-                if not hasattr(self, "approx_update_orbs")
-                else self.count_approx_update_orbs(self.approx_update_orbs)
+                if not hasattr(self, "_approx_update_orbs")
+                else self._count_approx_update_orbs(self._approx_update_orbs)
             ),
             self._func,
             self.n_param,
@@ -2086,9 +2092,9 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             hx[:] = hess_x(x)
 
-        self.raw_hess_x = raw_hess_x
+        self._raw_hess_x = raw_hess_x
 
-        return energy, self.count_hess_x
+        return energy, self._count_hess_x
 
     def kernel(
         self,
