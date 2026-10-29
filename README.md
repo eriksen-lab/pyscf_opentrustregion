@@ -23,34 +23,27 @@ work using OpenTrustRegion:
 
 ## Installation
 
-The interface needs `pyscf` and `pyopentrustregion`, the Python interface to the
-OpenTrustRegion library. It is a PySCF extension and is not itself installed: PySCF
-picks it up from the `PYSCF_EXT_PATH` environment variable.
+The interface needs `pyscf` and `pyopentrustregion` 3.0 or later, the Python interface
+to the OpenTrustRegion library. It is a PySCF extension and is not itself installed:
+PySCF picks it up from the `PYSCF_EXT_PATH` environment variable.
 
-### 1. Install OpenTrustRegion
+### 1. Install PySCF and OpenTrustRegion
 
-OpenTrustRegion is a Fortran library that this interface reaches through `ctypes`.
-Building it needs a Fortran compiler, CMake and BLAS/LAPACK.
-
-```sh
-git clone https://github.com/eriksen-lab/opentrustregion
-cd opentrustregion
-pip install .
-```
-
-Confirm the installation with
+Both are available from PyPI:
 
 ```sh
-python3 -m pyopentrustregion.testsuite
+pip install pyscf pyopentrustregion
 ```
 
-A default build produces the solver as a static library and only the testsuite library
-as a shared one, which is what `ctypes` then loads. If you build OpenTrustRegion with
-its testsuite disabled, add `CMAKE_FLAGS='-DBUILD_SHARED_LIBS=ON'` so that a loadable
-shared library is produced.
+Confirm the OpenTrustRegion installation with
 
-None of the optional OpenTrustRegion extensions are needed by this interface, which
-only uses the core solver and stability check.
+```sh
+python3 -m pyopentrustregion.verify_install
+```
+
+The OpenTrustRegion wheels are built with 32-bit integers. To build it from source
+instead, for example with 64-bit integers or from its development branch, follow the
+[OpenTrustRegion installation instructions](https://github.com/eriksen-lab/opentrustregion#installation).
 
 ### 2. Point PySCF at the interface
 
