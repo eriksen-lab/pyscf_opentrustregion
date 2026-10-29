@@ -267,6 +267,15 @@ class OTR:
             if hasattr(self, name)
         }
 
+    @staticmethod
+    def _rotates_too_far(kappa: np.ndarray) -> bool:
+        """
+        this function checks whether a step rotates any pair of orbitals by more than
+        pi / 4, for which the objective functions return an infinite value, so that the
+        solver rejects the step
+        """
+        return bool(np.any(np.abs(kappa) > np.pi / 4))
+
     def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
@@ -346,6 +355,8 @@ class LocalizerOTR(OTR):
 
     # cost function
     def _func(self, kappa: np.ndarray) -> float:
+        if self._rotates_too_far(kappa):
+            return np.inf
         u = ciah.expmat(self.unpack(kappa))
         return self.cost_sign * self.cost_function(u)
 
@@ -715,6 +726,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     # energy function
     def _func(self, kappa: np.ndarray) -> float:
+        if self._rotates_too_far(kappa):
+            return np.inf
         u = self.exp_mat(self.unpack(kappa))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
@@ -2118,8 +2131,11 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         return energy
 
-    # energy function
+    # energy function, which limits only the orbital rotations, since the CI part of a
+    # step is a displacement of the CI vector rather than a rotation angle
     def _func(self, x: np.ndarray) -> float:
+        if self._rotates_too_far(x[: self.n_param_orb]):
+            return np.inf
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
 
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
