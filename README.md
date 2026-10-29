@@ -191,8 +191,10 @@ the `stability_check()` method described below.
 
 Every object exposes a `stability_check()` method, which examines the current point and
 returns whether it is a minimum together with a direction out of the saddle point when
-it is not. It works on an object whose `kernel()` has already run, since that is what
-sets up the parameter space it examines:
+it is not. It only classifies stationary points and warns at any other point. The
+mean-field objects examine the orbitals and occupations they hold, also without a
+preceding `kernel()`, whereas the localizers and CASSCF need their `kernel()` to have
+run, since it sets up the parameter space the check examines:
 
 ```python
 mf.kernel()

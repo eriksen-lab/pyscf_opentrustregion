@@ -223,6 +223,21 @@ class OTR:
         h_diag = np.empty(self.n_param, dtype=np.float64)
         _, hess_x = self._update_orbs(kappa, grad, h_diag)
 
+        # the curvature tells a minimum from a saddle point only at a stationary point,
+        # so a gradient the solver would not accept as converged is reported
+        solver_settings = SolverSettings()
+        assign_solver_settings(self, solver_settings)
+        grad_rms = np.linalg.norm(grad) / np.sqrt(self.n_param)
+        if not grad_rms < solver_settings.conv_tol:
+            lib.logger.warn(
+                self,
+                "The stability check examines a point that is not stationary, since "
+                f"its root mean square gradient {grad_rms:.2e} is not below conv_tol = "
+                f"{solver_settings.conv_tol:.2e}. The objective decreases along the "
+                "gradient there, so the check cannot tell whether the point is a "
+                "minimum or a saddle point.",
+            )
+
         # initialize settings
         settings = StabilitySettings()
         assign_stability_settings(self, settings)
@@ -594,6 +609,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # of this object
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         self._warn_on_differing_energy_options()
+
+        # the one-electron Hamiltonian and the overlap are evaluated as in the kernel,
+        # so that the check also examines orbitals assigned to an object whose kernel
+        # never ran or ran for another molecule
+        mol = self._scf.mol
+        self.h1e = self._scf.get_hcore(mol)
+        self.s1e = self._scf.get_ovlp(mol)
 
         # the parameters are the occupied-virtual rotations of the current orbitals,
         # which canonicalization reorders and which orbitals or occupations assigned

@@ -633,12 +633,34 @@ class SCFTests(unittest.TestCase):
         stable, _ = check_stability_shape(self, otr)
         self.assertTrue(stable)
 
-        # placing the same object back at the restricted solution must make the check
-        # report the instability, along with a normalized direction out of the saddle
-        otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
-        stable, direction = check_stability_shape(self, otr)
-        self.assertFalse(stable)
-        self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
+        # placing the same object back at the restricted solution, or a new object
+        # whose kernel never ran there, must make the check report the instability,
+        # along with a normalized direction out of the saddle
+        new_otr = mf_to_otr(scf.UHF(mol_stretched))
+        new_otr.mo_occ = otr.mo_occ
+        for obj in (otr, new_otr):
+            with self.subTest(kernel_ran=obj is otr):
+                obj.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
+                stable, direction = check_stability_shape(self, obj)
+                self.assertFalse(stable)
+                self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
+
+    def test_stability_check_reports_a_point_that_is_not_stationary(self) -> None:
+        # the curvature tells a minimum from a saddle point only at a stationary point,
+        # so the check warns at the orbitals of the core Hamiltonian guess but not at
+        # the orbitals the kernel converged to
+        otr = mf_to_otr(scf.RHF(mol))
+        mo_energy, otr.mo_coeff = otr.eig(otr.get_hcore(), otr.get_ovlp())
+        otr.mo_occ = otr.get_occ(mo_energy, otr.mo_coeff)
+        with capture_warnings(otr) as log:
+            otr.stability_check()
+            self.assertIn("not stationary", log.getvalue())
+
+            log.seek(0)
+            log.truncate()
+            otr.kernel()
+            otr.stability_check()
+            self.assertNotIn("not stationary", log.getvalue())
 
     def test_stability_check_examines_the_current_occupations(self) -> None:
         # the check examines the density of the current occupations and their
