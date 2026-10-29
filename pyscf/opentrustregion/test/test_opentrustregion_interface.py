@@ -140,6 +140,20 @@ def check_derivatives_match_finite_differences(
     test.assertLess(abs(x @ hx - curvature), 1e-4 * abs(curvature))
 
 
+def check_large_rotation_is_rejected(test: unittest.TestCase, obj: Any) -> None:
+    """
+    this function checks that the objective the solver is handed is infinite for a
+    step which rotates a pair of orbitals by more than pi / 4, so that the solver
+    rejects it, and finite for a rotation just below
+    """
+    obj.kernel()
+    step = np.zeros(obj.n_param, dtype=np.float64)
+    step[0] = 1.01 * np.pi / 4
+    test.assertEqual(obj._func(step), np.inf)
+    step[0] = 0.99 * np.pi / 4
+    test.assertTrue(np.isfinite(obj._func(step)))
+
+
 @contextmanager
 def capture_warnings(obj: Any) -> Generator[io.StringIO, None, None]:
     """
@@ -596,6 +610,9 @@ class SCFTests(unittest.TestCase):
     def test_derivatives_match_finite_differences(self) -> None:
         check_derivatives_match_finite_differences(self, mf_to_otr(scf.RHF(mol)))
 
+    def test_large_rotation_is_rejected(self) -> None:
+        check_large_rotation_is_rejected(self, mf_to_otr(scf.RHF(mol)))
+
     def test_converged_rhf_is_stable(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
         otr.kernel()
@@ -787,6 +804,9 @@ class LocalizerTests(unittest.TestCase):
     def test_derivatives_match_finite_differences(self) -> None:
         check_derivatives_match_finite_differences(self, BoysOTR(mol, occ_orbs))
 
+    def test_large_rotation_is_rejected(self) -> None:
+        check_large_rotation_is_rejected(self, BoysOTR(mol, occ_orbs))
+
     def test_localizer_stability_check(self) -> None:
         loc = BoysOTR(mol, occ_orbs)
         loc.kernel()
@@ -878,6 +898,15 @@ class CASSCFTests(unittest.TestCase):
         check_derivatives_match_finite_differences(
             self, casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
         )
+
+    def test_only_large_orbital_rotations_are_rejected(self) -> None:
+        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        check_large_rotation_is_rejected(self, mc)
+
+        # the CI part of a step displaces the CI vector rather than rotating orbitals
+        step = np.zeros(mc.n_param, dtype=np.float64)
+        step[mc.n_param_orb] = 1.0
+        self.assertTrue(np.isfinite(mc._func(step)))
 
     def test_casscf_stability_check(self) -> None:
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
