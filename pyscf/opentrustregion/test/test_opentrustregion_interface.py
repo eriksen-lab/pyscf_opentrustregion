@@ -689,6 +689,32 @@ class SCFTests(unittest.TestCase):
                     6,
                 )
 
+        # a new object whose kernel never ran must report the instability at the
+        # restricted solution too
+        new_otr = mf_to_otr(scf.UHF(mol_stretched))
+        new_otr.mo_occ = otr.mo_occ
+        new_otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
+        stable, direction = check_stability_shape(self, new_otr)
+        self.assertFalse(stable)
+        self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
+
+    def test_stability_check_reports_a_point_that_is_not_stationary(self) -> None:
+        # the curvature tells a minimum from a saddle point only at a stationary point,
+        # so the check warns at the orbitals of the core Hamiltonian guess but not at
+        # the orbitals the kernel converged to
+        otr = mf_to_otr(scf.RHF(mol))
+        mo_energy, otr.mo_coeff = otr.eig(otr.get_hcore(), otr.get_ovlp())
+        otr.mo_occ = otr.get_occ(mo_energy, otr.mo_coeff)
+        with capture_warnings(otr) as log:
+            otr.stability_check()
+            self.assertIn("not stationary", log.getvalue())
+
+            log.seek(0)
+            log.truncate()
+            otr.kernel()
+            otr.stability_check()
+            self.assertNotIn("not stationary", log.getvalue())
+
     def test_stability_check_examines_the_current_occupations(self) -> None:
         # the check examines the density of the current occupations and their
         # occupied-virtual rotations, which with symmetry are those between orbitals of
