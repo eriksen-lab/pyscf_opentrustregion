@@ -18,6 +18,11 @@ on:
   schedule:
     - cron: '0 5 * * 1'
 
+# a new commit to a pull request cancels the run of its previous commit
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   formatting:
     name: "Formatting • black"
@@ -82,25 +87,43 @@ jobs:
       - name: Install PySCF
         run: pip install pyscf
 
+      # without its dependencies, so that pip keeps the OpenTrustRegion built from main
+      # above instead of resolving the requirement against PyPI
+      - name: Install the interface
+        run: pip install --no-deps .
+
       - name: Type check
         run: |
           pip install mypy==2.3.1
           mypy pyscf
 
+      # the tests and the examples run from outside the checkout, so that they use the
+      # installed package
       - name: Run the interface tests
-        env:
-          PYSCF_EXT_PATH: ${{ github.workspace }}
+        working-directory: ${{ runner.temp }}
         run: |
           python -m unittest -v \
             pyscf.opentrustregion.test.test_opentrustregion_interface
 
       - name: Run the examples
-        working-directory: examples
-        env:
-          PYSCF_EXT_PATH: ${{ github.workspace }}
+        working-directory: ${{ runner.temp }}
         run: |
-          for example in *.py; do
-            echo "::group::${example}"
+          for example in "$GITHUB_WORKSPACE"/examples/*.py; do
+            echo "::group::$(basename "${example}")"
             python "${example}"
             echo "::endgroup::"
           done
+
+  # single check for branch protection to require, so that changes to the jobs above do
+  # not require changes to the required checks; it runs always, since a required check
+  # that is skipped after a failed job counts as passed
+  ci-result:
+    name: "CI result"
+    if: always()
+    needs: [formatting, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that every job succeeded
+        run: |
+          test "${{ needs.formatting.result }}" = success
+          test "${{ needs.test.result }}" = success

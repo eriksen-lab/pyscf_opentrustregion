@@ -1,0 +1,106 @@
+name: Wheels
+
+on:
+  # build and check the distributions on demand, e.g. before a release, without
+  # publishing them
+  workflow_dispatch:
+  # every pull request, so that a change which breaks the distributions or their
+  # combination with PySCF and OpenTrustRegion from PyPI shows before it is merged
+  pull_request:
+    branches:
+      - main
+  # publish the distributions of every release, also of a pre-release changed into one
+  release:
+    types: [released]
+
+# the build job only reads the repository, the publish job requests the token it needs
+# itself
+permissions:
+  contents: read
+
+# one run at a time per ref: a new commit to a pull request cancels the run of its
+# previous commit, while other runs queue
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: "Build and check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout interface
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Build sdist and wheel
+        run: pipx run build
+
+      # a release publishes the version in pyscf/opentrustregion/__init__.py, whatever
+      # its tag names, so stop one whose tag names another version before anything is
+      # uploaded
+      - name: Check that the release tag names the version
+        if: ${{ github.event_name == 'release' }}
+        run: |
+          sdist=$(basename dist/*.tar.gz .tar.gz)
+          version=${sdist#pyscf_opentrustregion-}
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME does not name version $version"
+            exit 1
+          fi
+
+      - name: Check distribution metadata
+        run: pipx run twine check --strict dist/*
+
+      # the wheel is installed as a user installs it, with PySCF and OpenTrustRegion
+      # from PyPI, so that its tests and the examples check the released combination,
+      # which the CI workflow, building OpenTrustRegion from main, does not; they run
+      # from outside the checkout, so that they use the installed package
+      - name: Verify the wheel with its dependencies from PyPI
+        run: |
+          set -e
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python -m unittest -v \
+            pyscf.opentrustregion.test.test_opentrustregion_interface
+          for example in "$GITHUB_WORKSPACE"/examples/*.py; do
+            echo "::group::$(basename "${example}")"
+            /tmp/wheel-venv/bin/python "${example}"
+            echo "::endgroup::"
+          done
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+
+  # a pre-release is never published, since PyPI would take it as the final release of
+  # the version in the package; the released event already leaves pre-releases out,
+  # the check keeps them out regardless of the trigger
+  publish:
+    name: "Publish"
+    needs: build
+    if: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # trusted publishing exchanges this token for a short-lived PyPI credential, so no
+    # long-lived API token is stored in the repository
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

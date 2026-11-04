@@ -23,16 +23,12 @@ work using OpenTrustRegion:
 
 ## Installation
 
-The interface needs `pyscf` and `pyopentrustregion` 3.0 or later, the Python interface
-to the OpenTrustRegion library. It is a PySCF extension and is not itself installed:
-PySCF picks it up from the `PYSCF_EXT_PATH` environment variable.
-
-### 1. Install PySCF and OpenTrustRegion
-
-Both are available from PyPI:
+The interface is a PySCF extension available from PyPI, which installs it together
+with PySCF 2.14 or later and `pyopentrustregion`, the Python interface to the
+OpenTrustRegion library:
 
 ```sh
-pip install pyscf pyopentrustregion
+pip install pyscf-opentrustregion
 ```
 
 Confirm the OpenTrustRegion installation with
@@ -43,20 +39,28 @@ python3 -m pyopentrustregion.verify_install
 
 The OpenTrustRegion wheels are built with 32-bit integers. To build it from source
 instead, for example with 64-bit integers or from its development branch, follow the
-[OpenTrustRegion installation instructions](https://github.com/eriksen-lab/opentrustregion#installation).
+[OpenTrustRegion installation instructions](https://github.com/eriksen-lab/opentrustregion#installation)
+before installing the interface, which then keeps that build.
 
-### 2. Point PySCF at the interface
+### Development version
 
-PySCF discovers extensions through the `PYSCF_EXT_PATH` environment variable, so no
-install step is needed:
+To use or work on the development version, install the interface from a clone in
+editable mode,
 
 ```sh
 git clone https://github.com/eriksen-lab/pyscf_opentrustregion
+pip install -e pyscf_opentrustregion
+```
+
+or, instead of installing it, point PySCF at the clone through the `PYSCF_EXT_PATH`
+environment variable:
+
+```sh
 export PYSCF_EXT_PATH=$PWD/pyscf_opentrustregion:$PYSCF_EXT_PATH
 ```
 
-See the PySCF documentation on
-[extension modules](http://pyscf.org/pyscf/install.html#extension-modules) for details.
+See the PySCF documentation on [extensions](https://pyscf.org/user/extensions.html)
+for details.
 
 ## Usage
 
@@ -121,7 +125,7 @@ mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
 ```
 
-Further examples are in the [`examples`](examples) directory.
+Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) directory.
 
 ## Settings
 
@@ -208,16 +212,16 @@ mf.n_hess_x          # Hessian linear transformations
 
 ## Testing
 
-With `PYSCF_EXT_PATH` set as above, check that PySCF picks the interface up and that
-OpenTrustRegion loads:
+Check that PySCF picks the interface up and that OpenTrustRegion loads:
 
 ```sh
 python3 -c "from pyscf.opentrustregion import mf_to_otr"
 ```
 
-A `ModuleNotFoundError` means `PYSCF_EXT_PATH` is not set, and a `FileNotFoundError`
-means OpenTrustRegion was installed without a loadable shared library. The scripts in
-[`examples`](examples) are a quick end-to-end check.
+A `ModuleNotFoundError` means that the interface is neither installed nor on
+`PYSCF_EXT_PATH`, and a `FileNotFoundError` means OpenTrustRegion was installed without
+a loadable shared library. The scripts in
+[`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) are a quick end-to-end check.
 
 Then run the test suite:
 
