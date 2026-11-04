@@ -1162,7 +1162,6 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         ci0: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
         callback: Optional[Callable[..., None]] = None,
     ) -> Tuple[
-        bool,
         Optional[float],
         Optional[float],
         Union[np.ndarray, List[np.ndarray]],
@@ -1229,14 +1228,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         self._finalize()
 
-        return (
-            self.converged,
-            self.e_tot,
-            self.e_cas,
-            self.ci,
-            self.mo_coeff,
-            self.mo_energy,
-        )
+        return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
 
 
 def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:

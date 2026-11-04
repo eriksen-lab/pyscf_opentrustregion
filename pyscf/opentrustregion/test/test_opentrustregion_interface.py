@@ -1061,11 +1061,23 @@ class CASSCFTests(unittest.TestCase):
     def test_casscf_energy(self) -> None:
         ref = mcscf.CASSCF(mf, 4, 4).run()
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
-        converged, e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
+        e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
         self.assertAlmostEqual(e_tot, ref.e_tot, 7)
         self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
         self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
         self.assertAlmostEqual(float(np.linalg.norm(np.ravel(ci))), 1.0, 9)
+
+    def test_scanner_follows_the_geometry(self) -> None:
+        # a geometry optimization or a scan calls the kernel through a scanner, which
+        # takes the first value the kernel returns as the energy
+        mol_displaced = gto.M(
+            atom="O 0 0 0; H 0 -0.78 0.60; H 0 0.78 0.60", basis="6-31g", verbose=0
+        )
+        ref = mcscf.CASSCF(scf.RHF(mol), 4, 4).as_scanner()
+        mc = casscf_to_otr(mcscf.CASSCF(scf.RHF(mol), 4, 4)).as_scanner()
+        ref(mol)
+        mc(mol)
+        self.assertAlmostEqual(mc(mol_displaced), ref(mol_displaced), 7)
 
     def test_state_averaged_casscf_energy(self) -> None:
         # the states stay orthonormal and so do not collapse onto the ground state, for
