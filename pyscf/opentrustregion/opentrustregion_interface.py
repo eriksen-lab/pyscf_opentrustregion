@@ -12,7 +12,14 @@ from pyscf.scf import hf_symm, uhf_symm, ghf_symm
 from pyscf.soscf import ciah, newton_ah
 from pyscf.x2c import x2c
 from pyscf.x2c import newton_ah as x2c_newton_ah
-from pyscf.mcscf import casci, mc1step, newton_casscf, addons
+from pyscf.mcscf import (
+    casci,
+    casci_symm,
+    mc1step,
+    newton_casscf,
+    newton_casscf_symm,
+    addons,
+)
 from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
 from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
 from ctypes import Structure
@@ -1031,14 +1038,51 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             start += solver.nroots
         return groups
 
+    def _ci_mask(self) -> np.ndarray:
+        """
+        this function returns which CI coefficients of all states are parameters, for a
+        CI solver with point-group symmetry those of the determinants of the symmetry
+        of its states, since the others vanish and its Hamiltonian does not act on them
+        """
+        masks = []
+        for solver, _, states in self._state_groups(self.ci):
+            allowed = getattr(solver, "sym_allowed_idx", None)
+            if allowed is None:
+                mask = np.ones(states.shape, dtype=bool)
+            else:
+                mask = np.zeros(states.shape, dtype=bool)
+                mask[:, np.hstack(allowed)] = True
+            masks.append(mask.ravel())
+        return np.concatenate(masks)
+
+    def _embed(self, x: np.ndarray) -> np.ndarray:
+        """
+        this function returns the vector over the orbital rotations and the CI
+        coefficients of all states, as gen_g_hop orders them, that a vector over the
+        parameters corresponds to
+        """
+        ci_mask = self._ci_mask()
+        full = np.zeros(self.n_param_orb + ci_mask.size)
+        full[: self.n_param_orb] = x[: self.n_param_orb]
+        full[self.n_param_orb :][ci_mask] = x[self.n_param_orb :]
+        return full
+
+    def _restrict(self, full: np.ndarray) -> np.ndarray:
+        """
+        this function returns the vector over the parameters from one over the orbital
+        rotations and the CI coefficients of all states, the adjoint of _embed
+        """
+        ci = full[self.n_param_orb :][self._ci_mask()]
+        return np.concatenate((full[: self.n_param_orb], ci))
+
     def _orthogonal_ci(self, x: np.ndarray) -> np.ndarray:
         """
         this function removes the components along the states of the same CI solver
-        from the CI part of a vector over the parameters; for every state, these only
-        rescale it or mix it with the other states, which the orthonormalization of the
-        displaced states and their diagonalization within the space they span undo, so
-        that they are redundant directions, along which gen_g_hop's derivatives do not
-        describe the energy
+        from the CI part of a vector over the orbital rotations and the CI coefficients
+        of all states; for every state, these only rescale it or mix it with the other
+        states, which the orthonormalization of the displaced states and their
+        diagonalization within the space they span undo, so that they are redundant
+        directions, along which gen_g_hop's derivatives do not describe the energy
         """
         parts, start = [x[: self.n_param_orb]], self.n_param_orb
         for *_, states in self._state_groups(self.ci):
@@ -1057,7 +1101,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         rotating the states into the steps, so that the energy agrees with the
         derivatives
         """
-        x = self._orthogonal_ci(x)
+        x = self._orthogonal_ci(self._embed(x))
         displaced, start = [], self.n_param_orb
         for *_, states in self._state_groups(self.ci):
             moved = states + x[start : start + states.size].reshape(states.shape)
@@ -1143,15 +1187,17 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             self.n_update_orbs += 1
             self._save_orbs_state()
 
-        # gen_g_hop takes the CI part of the Hessian linear transformation of every
-        # state orthogonal only to that state, whereas the steps are orthogonal to all
-        # states of its CI solver; its CI gradient is orthogonal to all of them
-        # already, since the states are eigenstates within the space they span
-        grad[:] = self.saved_grad
-        h_diag[:] = self.saved_h_diag
+        # gen_g_hop extends over all CI coefficients and takes the CI part of the
+        # Hessian linear transformation of every state orthogonal only to that state,
+        # whereas the steps are orthogonal to all states of its CI solver; its CI
+        # gradient is orthogonal to all of them already, since the states are
+        # eigenstates within the space they span
+        grad[:] = self._restrict(self.saved_grad)
+        h_diag[:] = self._restrict(self.saved_h_diag)
 
         def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            hx[:] = self._orthogonal_ci(self.saved_hess_x(self._orthogonal_ci(x)))
+            x_full = self._orthogonal_ci(self._embed(x))
+            hx[:] = self._restrict(self._orthogonal_ci(self.saved_hess_x(x_full)))
             self.n_hess_x += 1
 
         return self.saved_func, hess_x
@@ -1178,6 +1224,11 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         if ci0 is None:
             ci0 = self.ci
 
+        # a symmetry-adapted object labels the orbitals by symmetry first, as PySCF's
+        # kernel does, since its orbital rotations and the CI solver need the labels
+        if isinstance(self, newton_casscf_symm.CASSCF):
+            mo_coeff = self.mo_coeff = casci_symm.label_symmetry_(self, mo_coeff)
+
         # initial guess
         eris = self.ao2mo(mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(mo_coeff, ci0, eris)
@@ -1196,7 +1247,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         )
 
         # number of CI parameters
-        self.n_param_ci = sum(c.size for c in self.ci_vectors(self.ci))
+        self.n_param_ci = int(np.count_nonzero(self._ci_mask()))
 
         # number of parameters
         self.n_param = self.n_param_orb + self.n_param_ci
@@ -1238,7 +1289,16 @@ def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
     if not isinstance(casscf, newton_casscf.CASSCF):
         casscf = casscf.newton()
 
-    casscf_otr = CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas)
+    # the class of the PySCF object is mixed in as in mf_to_otr, e.g. for symmetry,
+    # without a state average, which is applied again below so that it comes first
+    pyscf_class = (
+        casscf._base_class
+        if isinstance(casscf, addons.StateAverageMCSCFSolver)
+        else casscf.__class__
+    )
+    casscf_otr = lib.set_class(
+        CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas), (CASSCFOTR, pyscf_class)
+    )
     casscf_otr.__dict__.update(casscf.__dict__)
     casscf_otr._snapshot_shadowed_settings()
 

@@ -57,11 +57,12 @@ mol_sym: gto.Mole
 mol_open: gto.Mole
 mol_open_sym: gto.Mole
 mf: scf.hf.RHF
+mf_sym: scf.hf.RHF
 occ_orbs: np.ndarray
 
 
 def setUpModule() -> None:
-    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, mf_sym, occ_orbs
     mol = gto.M(
         atom="""
             O  0.000  0.000  0.000
@@ -83,13 +84,14 @@ def setUpModule() -> None:
     mol_open_sym.build(False, False)
 
     mf = scf.RHF(mol).run()
+    mf_sym = scf.RHF(mol_sym).run()
     occ_orbs = mf.mo_coeff[:, : mol.nelec[0]]
 
 
 def tearDownModule() -> None:
-    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, mf_sym, occ_orbs
     mol.stdout.close()
-    del mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
+    del mol, mol_sym, mol_open, mol_open_sym, mf, mf_sym, occ_orbs
 
 
 def grad_and_h_diag(obj: OTR) -> Tuple[np.ndarray, np.ndarray]:
@@ -166,6 +168,18 @@ def singlet_and_triplet_solvers() -> List[Any]:
     """
     solvers = [fci.direct_spin1.FCI(mol), fci.direct_spin1.FCI(mol)]
     solvers[1].spin = 2
+    return solvers
+
+
+def solvers_of_different_symmetry() -> List[Any]:
+    """
+    this function returns symmetry-adapted CI solvers for the lowest state of A1 and
+    the lowest state of B1 symmetry, over which a state average mixes states of
+    different point-group symmetry
+    """
+    solvers = [fci.direct_spin1_symm.FCI(mol_sym), fci.direct_spin1_symm.FCI(mol_sym)]
+    solvers[0].wfnsym = "A1"
+    solvers[1].wfnsym = "B1"
     return solvers
 
 
@@ -1059,13 +1073,23 @@ class CASSCFTests(unittest.TestCase):
         self.assertIs(casscf_to_otr(mc), mc)
 
     def test_casscf_energy(self) -> None:
-        ref = mcscf.CASSCF(mf, 4, 4).run()
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
-        e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
-        self.assertAlmostEqual(e_tot, ref.e_tot, 7)
-        self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
-        self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
-        self.assertAlmostEqual(float(np.linalg.norm(np.ravel(ci))), 1.0, 9)
+        # with symmetry, the parameters are the rotations between orbitals of the same
+        # irreducible representation and the CI coefficients of the determinants of
+        # the symmetry of the state
+        n_param_orb, n_param_ci = {}, {}
+        for mf_in in (mf, mf_sym):
+            with self.subTest(symmetry=mf_in.mol.symmetry):
+                ref = mcscf.CASSCF(mf_in, 4, 4).run()
+                mc = casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))
+                e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
+                self.assertAlmostEqual(e_tot, ref.e_tot, 7)
+                self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
+                self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
+                self.assertAlmostEqual(float(np.linalg.norm(np.ravel(ci))), 1.0, 9)
+                n_param_orb[mf_in.mol.symmetry] = mc.n_param_orb
+                n_param_ci[mf_in.mol.symmetry] = mc.n_param_ci
+        self.assertLess(n_param_orb[True], n_param_orb[False])
+        self.assertLess(n_param_ci[True], n_param_ci[False])
 
     def test_scanner_follows_the_geometry(self) -> None:
         # a geometry optimization or a scan calls the kernel through a scanner, which
@@ -1082,28 +1106,37 @@ class CASSCFTests(unittest.TestCase):
     def test_state_averaged_casscf_energy(self) -> None:
         # the states stay orthonormal and so do not collapse onto the ground state, for
         # equal and unequal weights, for states of several CI solvers, here of
-        # different spin, and for either order of the conversion and the state
-        # averaging; the energies of the individual states, at which the averaged
-        # energy is not stationary, converge more slowly than the averaged energy
-        for name, average in (
-            ("equal weights", lambda mc: mcscf.state_average_(mc, [0.5, 0.5])),
-            ("unequal weights", lambda mc: mcscf.state_average_(mc, [0.6, 0.4])),
+        # different spin or of different point-group symmetry, and for either order of
+        # the conversion and the state averaging; the energies of the individual
+        # states, at which the averaged energy is not stationary, converge more slowly
+        # than the averaged energy
+        for name, mf_in, average in (
+            ("equal weights", mf, lambda mc: mcscf.state_average_(mc, [0.5, 0.5])),
+            ("unequal weights", mf, lambda mc: mcscf.state_average_(mc, [0.6, 0.4])),
             (
                 "singlet and triplet",
+                mf,
                 lambda mc: mcscf.state_average_mix_(
                     mc, singlet_and_triplet_solvers(), [0.6, 0.4]
                 ),
             ),
+            (
+                "states of different symmetry",
+                mf_sym,
+                lambda mc: mcscf.state_average_mix_(
+                    mc, solvers_of_different_symmetry(), [0.6, 0.4]
+                ),
+            ),
         ):
-            ref = average(mcscf.CASSCF(mf, 4, 4)).run()
+            ref = average(mcscf.CASSCF(mf_in, 4, 4)).run()
             for order, mc in (
                 (
                     "conversion of the average",
-                    casscf_to_otr(average(mcscf.CASSCF(mf, 4, 4))),
+                    casscf_to_otr(average(mcscf.CASSCF(mf_in, 4, 4))),
                 ),
                 (
                     "average of the conversion",
-                    average(casscf_to_otr(mcscf.CASSCF(mf, 4, 4))),
+                    average(casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))),
                 ),
             ):
                 with self.subTest(average=name, order=order):
@@ -1157,20 +1190,36 @@ class CASSCFTests(unittest.TestCase):
 
     def test_derivatives_match_finite_differences(self) -> None:
         # for unequal weights, the Hessian lacks the response of the eigenstates within
-        # the space the states span, so only the gradient is compared, except for the
-        # singlet and the triplet, each the only state of its CI solver
-        for name, average, curvature in (
-            ("single state", lambda mc: mc, True),
-            ("equal weights", lambda mc: mcscf.state_average_(mc, [0.5, 0.5]), True),
+        # the space the states span, so only the gradient is compared, except for
+        # states of several CI solvers, each the only state of its solver
+        for name, mf_in, average, curvature in (
+            ("single state", mf, lambda mc: mc, True),
+            ("symmetry", mf_sym, lambda mc: mc, True),
+            (
+                "equal weights",
+                mf,
+                lambda mc: mcscf.state_average_(mc, [0.5, 0.5]),
+                True,
+            ),
             (
                 "unequal weights",
+                mf,
                 lambda mc: mcscf.state_average_(mc, [0.6, 0.4]),
                 False,
             ),
             (
                 "singlet and triplet",
+                mf,
                 lambda mc: mcscf.state_average_mix_(
                     mc, singlet_and_triplet_solvers(), [0.6, 0.4]
+                ),
+                True,
+            ),
+            (
+                "states of different symmetry",
+                mf_sym,
+                lambda mc: mcscf.state_average_mix_(
+                    mc, solvers_of_different_symmetry(), [0.6, 0.4]
                 ),
                 True,
             ),
@@ -1178,7 +1227,7 @@ class CASSCFTests(unittest.TestCase):
             with self.subTest(average=name):
                 check_derivatives_match_finite_differences(
                     self,
-                    average(casscf_to_otr(mcscf.CASSCF(mf, 4, 4))),
+                    average(casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))),
                     curvature=curvature,
                 )
 
