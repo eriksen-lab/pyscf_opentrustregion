@@ -463,21 +463,6 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
     cost_sign = -1.0
 
 
-if not TYPE_CHECKING and not hasattr(lo, "FourthMoment"):
-
-    class FourthMomentOTR:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            raise RuntimeError(
-                "FourthMomentOTR requires PySCF with lo.FourthMoment. "
-                "Please install a compatible PySCF version."
-            )
-
-else:
-
-    class FourthMomentOTR(LocalizerOTR, lo.FourthMoment):
-        pass
-
-
 # input options of the PySCF Kohn-Sham objects that define the energy. A converted
 # object evaluates the energy and the gradient through the PySCF object it was
 # converted from but the Hessian itself, so such an option assigned after the
@@ -2344,61 +2329,100 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         """
         return [ci] if isinstance(ci, np.ndarray) else ci
 
-    @staticmethod
-    def step_ci(ci: np.ndarray, step: np.ndarray) -> np.ndarray:
+    def _state_groups(
+        self, ci: Union[np.ndarray, List[np.ndarray]]
+    ) -> List[Tuple[Any, Union[int, Tuple[int, int]], np.ndarray]]:
         """
-        this function applies a step to a normalized CI vector; the component of the
-        step along the vector itself only rescales it, which the renormalization then
-        undoes, so it is a redundant direction along which gen_g_hop reports neither a
-        gradient nor a curvature. Removing it keeps the energy consistent with those
-        derivatives, which the renormalization would otherwise break at second order
+        this function returns, for every CI solver, the solver, its numbers of active
+        electrons and the CI vectors of its states as the rows of a matrix; in a state
+        average over several CI solvers, each solves for its own states, whose CI
+        vectors belong to the space of that solver, independently of the others
         """
-        step = step - (step @ ci) * ci / (ci @ ci)
-        ci = ci + step
-        return ci / np.linalg.norm(ci)
+        vectors = [np.ravel(c) for c in self.ci_vectors(ci)]
+        if not isinstance(self.fcisolver, addons.StateAverageMixFCISolver):
+            return [(self.fcisolver, self.nelecas, np.array(vectors))]
+
+        groups, start = [], 0
+        for solver in self.fcisolver.fcisolvers:
+            nelec = self.fcisolver._get_nelec(solver, self.nelecas)
+            groups.append(
+                (solver, nelec, np.array(vectors[start : start + solver.nroots]))
+            )
+            start += solver.nroots
+        return groups
+
+    def _orthogonal_ci(self, x: np.ndarray) -> np.ndarray:
+        """
+        this function removes the components along the states of the same CI solver
+        from the CI part of a vector over the parameters; for every state, these only
+        rescale it or mix it with the other states, which the orthonormalization of the
+        displaced states and their diagonalization within the space they span undo, so
+        that they are redundant directions, along which gen_g_hop's derivatives do not
+        describe the energy
+        """
+        parts, start = [x[: self.n_param_orb]], self.n_param_orb
+        for *_, states in self._state_groups(self.ci):
+            x_ci = x[start : start + states.size].reshape(states.shape)
+            parts.append((x_ci - (x_ci @ states.T) @ states).ravel())
+            start += states.size
+        return np.concatenate(parts)
 
     def displaced_ci(self, x: np.ndarray) -> Union[np.ndarray, List[np.ndarray]]:
         """
-        this function applies the CI part of a step to the current CI vector, giving
-        the CI vector the energy and its derivatives are both evaluated at
+        this function applies the CI part of a step to the current CI vectors, giving
+        the CI vectors the energy and its derivatives are both evaluated at; the
+        displaced states of every CI solver are orthonormalized symmetrically, which
+        keeps them from collapsing onto one another, as normalizing each of them alone
+        would not, and for steps orthogonal to these states agrees to second order with
+        rotating the states into the steps, so that the energy agrees with the
+        derivatives
         """
-        idx_start = self.n_param_orb
-        if isinstance(self.ci, np.ndarray):
-            return self.step_ci(self.ci, x[idx_start:])
+        x = self._orthogonal_ci(x)
+        displaced, start = [], self.n_param_orb
+        for *_, states in self._state_groups(self.ci):
+            moved = states + x[start : start + states.size].reshape(states.shape)
+            overlap_values, overlap_vectors = np.linalg.eigh(moved @ moved.T)
+            displaced.extend(
+                (overlap_vectors / np.sqrt(overlap_values)) @ overlap_vectors.T @ moved
+            )
+            start += states.size
+        return displaced[0] if isinstance(self.ci, np.ndarray) else displaced
 
-        ci = []
-        for c in self.ci:
-            idx_stop = idx_start + c.size
-            ci.append(self.step_ci(c, x[idx_start:idx_stop]))
-            idx_start = idx_stop
-        return ci
-
-    def energy(
+    def eigenstates(
         self, mo_coeff: np.ndarray, ci: Union[np.ndarray, List[np.ndarray]], eris: Any
-    ) -> float:
+    ) -> Tuple[float, List[np.ndarray]]:
         """
-        this function returns the energy of a given CI vector in given orbitals
+        this function returns the energy of given CI vectors in given orbitals and the
+        eigenstates of the active space Hamiltonian within the space the CI vectors of
+        every CI solver span, in increasing energy for every solver; the energy is that
+        of these eigenstates, weighted the way gen_g_hop weights its derivatives, whose
+        gradient at the eigenstates is the derivative of this energy, and which equals
+        the weighted energy of the CI vectors themselves for a single state of every
+        solver or equal weights
         """
         # the active space Hamiltonian, reusing the integrals already transformed for
         # these orbitals
         fcasci = mc1step._fake_h_for_fast_casci(self, mo_coeff, eris)
         h1eff, energy_core = fcasci.get_h1eff()
-        op = self.fcisolver.absorb_h1e(
-            h1eff, fcasci.get_h2eff(), self.ncas, self.nelecas, 0.5
-        )
+        h2eff = fcasci.get_h2eff()
 
-        # the expectation value over the states, weighted the way gen_g_hop weights
-        # its derivatives so that energy and derivatives describe one function
-        vectors = self.ci_vectors(ci)
-        energy = energy_core
-        for weight, vector in zip(getattr(self, "weights", [1.0]), vectors):
-            hc = self.fcisolver.contract_2e(op, vector, self.ncas, self.nelecas)
-            energy += weight * np.dot(np.ravel(vector), np.ravel(hc))
+        # the Hamiltonian within the space the CI vectors of every solver span
+        energies: List[float] = []
+        eigenstates: List[np.ndarray] = []
+        for solver, nelec, states in self._state_groups(ci):
+            op = solver.absorb_h1e(h1eff, h2eff, self.ncas, nelec, 0.5)
+            h_states = np.array(
+                [np.ravel(solver.contract_2e(op, c, self.ncas, nelec)) for c in states]
+            )
+            group_energies, rotation = np.linalg.eigh(states @ h_states.T)
+            energies.extend(group_energies)
+            eigenstates.extend(rotation.T @ states)
 
-        return energy
+        energy = energy_core + float(np.dot(getattr(self, "weights", [1.0]), energies))
+        return energy, eigenstates
 
     # energy function, which limits only the orbital rotations, since the CI part of a
-    # step is a displacement of the CI vector rather than a rotation angle
+    # step is a displacement of the CI vectors rather than a rotation angle
     def _func(self, x: np.ndarray) -> float:
         if self._rotates_too_far(x[: self.n_param_orb]):
             return np.inf
@@ -2407,7 +2431,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         eris = self.ao2mo(rot_mo_coeff)
 
-        return self.energy(rot_mo_coeff, self.displaced_ci(x), eris)
+        return self.eigenstates(rot_mo_coeff, self.displaced_ci(x), eris)[0]
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         return (self.mo_coeff, *self.ci_vectors(self.ci))
@@ -2417,34 +2441,35 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
         # reuse the cached update when the step is zero and nothing has moved the
-        # orbitals or CI vector since, so the integrals need not be transformed again
+        # orbitals or CI vectors since, so the integrals need not be transformed again
         self._moves(x)
         if np.any(x) or not self._last_update.matches(self._orbs_state()):
             u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             eris = self.ao2mo(self.mo_coeff)
 
-            self.ci = self.displaced_ci(x)
-            ci = (
-                self.ci
-                if isinstance(self.ci, np.ndarray)
-                else [c.ravel() for c in self.ci]
-            )
+            # the states move on as the eigenstates within the space the displaced CI
+            # vectors span, at which gen_g_hop's derivatives are those of the energy
+            energy, states = self.eigenstates(self.mo_coeff, self.displaced_ci(x), eris)
+            self.ci = states[0] if isinstance(self.ci, np.ndarray) else states
 
-            energy = self.energy(self.mo_coeff, self.ci, eris)
             new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
-                self, self.mo_coeff, ci, eris
+                self, self.mo_coeff, self.ci, eris
             )
             self._last_update = LastResult.of(
                 self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
             )
         energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
+        # gen_g_hop takes the CI part of the Hessian linear transformation of every
+        # state orthogonal only to that state, whereas the steps are orthogonal to all
+        # states of its CI solver; its CI gradient is orthogonal to all of them
+        # already, since the states are eigenstates within the space they span
         grad[:] = new_grad
         h_diag[:] = new_h_diag
 
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            hx[:] = hess_x(x)
+            hx[:] = self._orthogonal_ci(hess_x(self._orthogonal_ci(x)))
 
         self._raw_hess_x = raw_hess_x
 
@@ -2549,9 +2574,5 @@ def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
     if isinstance(casscf, addons.StateAverageMCSCFSolver):
         wfnsym = getattr(casscf, "wfnsym", None)
         casscf_otr = casscf_otr.state_average_(casscf.weights, wfnsym)
-        raise RuntimeError(
-            "State-averaged CASSCF calculations currently do not work with the "
-            "OpenTrustRegion solver"
-        )
 
     return casscf_otr

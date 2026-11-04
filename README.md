@@ -7,7 +7,7 @@ This package is a [PySCF](https://github.com/pyscf/pyscf) extension that replace
 PySCF's own second-order orbital optimizers with
 [OpenTrustRegion](https://github.com/eriksen-lab/opentrustregion), a second-order
 trust region optimizer. Hartree–Fock, Kohn–Sham DFT, orbital localization and
-state-specific CASSCF are supported.
+CASSCF are supported.
 
 Objects produced by this interface remain fully usable as the PySCF objects they were
 built from, so they can be passed to any PySCF routine that expects the original class.
@@ -136,6 +136,9 @@ from pyscf.opentrustregion import casscf_to_otr
 mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
 ```
+
+State-averaged CASSCF, also over several CI solvers (`mcscf.state_average_` and
+`mcscf.state_average_mix_`), is converted the same way.
 
 Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) directory.
 

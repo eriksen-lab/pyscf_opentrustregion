@@ -13,12 +13,12 @@ import unittest
 from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 from itertools import product
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import scipy.linalg
 
-from pyscf import gto, scf, dft, lo, mcscf, lib
+from pyscf import gto, scf, dft, fci, lo, mcscf, lib
 from pyscf.pbc import gto as pbcgto, scf as pbcscf
 from pyscf.scf import dhf
 from pyscf.x2c import x2c
@@ -159,13 +159,24 @@ def kramers_rotation(n_occ: int, a: np.ndarray, c: np.ndarray) -> np.ndarray:
     return scipy.linalg.expm(generator - generator.conj().T)
 
 
+def singlet_and_triplet_solvers() -> List[Any]:
+    """
+    this function returns CI solvers for the lowest singlet and the lowest triplet
+    state, over which a state average mixes states of different spin
+    """
+    solvers = [fci.direct_spin1.FCI(mol), fci.direct_spin1.FCI(mol)]
+    solvers[1].spin = 2
+    return solvers
+
+
 def check_derivatives_match_finite_differences(
     test: unittest.TestCase, obj: Any, curvature: bool = True, **kernel_args: Any
 ) -> None:
     """
-    this function checks that the gradient and, unless the Hessian is approximate, the
-    Hessian linear transformation an orbital update reports are the derivatives of the
-    objective the solver is handed, which a mismatched factor on either would break
+    this function checks that the energy, the gradient and, unless the Hessian is
+    approximate, the Hessian linear transformation an orbital update reports are the
+    objective the solver is handed at the point the update moves to and its
+    derivatives, which a mismatched factor on either derivative would break
     """
     obj.kernel(**kernel_args)
     grad, h_diag = grad_and_h_diag(obj)
@@ -174,7 +185,8 @@ def check_derivatives_match_finite_differences(
     # compare equal whatever factor it carried
     np.random.seed(2)
     displacement = 0.05 * (np.random.random(obj.n_param) - 0.5)
-    _, hess_x = obj._update_orbs(displacement, grad, h_diag)
+    func, hess_x = obj._update_orbs(displacement, grad, h_diag)
+    test.assertAlmostEqual(func, obj._func(np.zeros(obj.n_param)), 10)
 
     x = np.random.random(obj.n_param) - 0.5
     x /= np.linalg.norm(x)
@@ -1128,10 +1140,6 @@ class CASSCFTests(unittest.TestCase):
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
         self.assertIs(casscf_to_otr(mc), mc)
 
-    def test_casscf_to_otr_rejects_state_averaging(self) -> None:
-        mc = mcscf.state_average_(mcscf.CASSCF(mf, 4, 4), [0.5, 0.5])
-        self.assertRaises(RuntimeError, casscf_to_otr, mc)
-
     def test_casscf_energy(self) -> None:
         ref = mcscf.CASSCF(mf, 4, 4).run()
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
@@ -1141,16 +1149,40 @@ class CASSCFTests(unittest.TestCase):
         self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
         self.assertAlmostEqual(float(np.linalg.norm(np.ravel(ci))), 1.0, 9)
 
-    def test_ci_vectors_covers_one_and_several_roots(self) -> None:
-        # a single root keeps the CI vector as one array and several roots as a list
-        # of them. Nothing else in the suite reaches the several root shape, since a
-        # state averaged calculation is rejected outright
-        single = np.array([0.6, 0.8])
-        self.assertEqual(len(CASSCFOTR.ci_vectors(single)), 1)
-        self.assertIs(CASSCFOTR.ci_vectors(single)[0], single)
-
-        several = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
-        self.assertIs(CASSCFOTR.ci_vectors(several), several)
+    def test_state_averaged_casscf_energy(self) -> None:
+        # the states stay orthonormal and so do not collapse onto the ground state, for
+        # equal and unequal weights, for states of several CI solvers, here of
+        # different spin, and for either order of the conversion and the state
+        # averaging; the energies of the individual states, at which the averaged
+        # energy is not stationary, converge more slowly than the averaged energy
+        for name, average in (
+            ("equal weights", lambda mc: mcscf.state_average_(mc, [0.5, 0.5])),
+            ("unequal weights", lambda mc: mcscf.state_average_(mc, [0.6, 0.4])),
+            (
+                "singlet and triplet",
+                lambda mc: mcscf.state_average_mix_(
+                    mc, singlet_and_triplet_solvers(), [0.6, 0.4]
+                ),
+            ),
+        ):
+            ref = average(mcscf.CASSCF(mf, 4, 4)).run()
+            for order, mc in (
+                (
+                    "conversion of the average",
+                    casscf_to_otr(average(mcscf.CASSCF(mf, 4, 4))),
+                ),
+                (
+                    "average of the conversion",
+                    average(casscf_to_otr(mcscf.CASSCF(mf, 4, 4))),
+                ),
+            ):
+                with self.subTest(average=name, order=order):
+                    mc.kernel()
+                    self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
+                    np.testing.assert_allclose(mc.e_states, ref.e_states, atol=1e-4)
+                    self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
+                    stable, _ = check_stability_shape(self, mc)
+                    self.assertTrue(stable)
 
     def test_casscf_orbitals_stay_orthonormal(self) -> None:
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
@@ -1195,9 +1227,31 @@ class CASSCFTests(unittest.TestCase):
         self.assertGreater(mc.n_hess_x, 0)
 
     def test_derivatives_match_finite_differences(self) -> None:
-        check_derivatives_match_finite_differences(
-            self, casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
-        )
+        # for unequal weights, the Hessian lacks the response of the eigenstates within
+        # the space the states span, so only the gradient is compared, except for the
+        # singlet and the triplet, each the only state of its CI solver
+        for name, average, curvature in (
+            ("single state", lambda mc: mc, True),
+            ("equal weights", lambda mc: mcscf.state_average_(mc, [0.5, 0.5]), True),
+            (
+                "unequal weights",
+                lambda mc: mcscf.state_average_(mc, [0.6, 0.4]),
+                False,
+            ),
+            (
+                "singlet and triplet",
+                lambda mc: mcscf.state_average_mix_(
+                    mc, singlet_and_triplet_solvers(), [0.6, 0.4]
+                ),
+                True,
+            ),
+        ):
+            with self.subTest(average=name):
+                check_derivatives_match_finite_differences(
+                    self,
+                    average(casscf_to_otr(mcscf.CASSCF(mf, 4, 4))),
+                    curvature=curvature,
+                )
 
     def test_only_large_orbital_rotations_are_rejected(self) -> None:
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
