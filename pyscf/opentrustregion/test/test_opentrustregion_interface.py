@@ -13,7 +13,7 @@ import unittest
 from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 from itertools import product
-from typing import Any, Dict, Generator, List, Tuple
+from typing import Any, Generator, List, Tuple
 
 import numpy as np
 import scipy.linalg
@@ -260,30 +260,27 @@ def check_stability_shape(test: unittest.TestCase, obj: OTR) -> Tuple[bool, np.n
     return stable, direction
 
 
-class DummySettingsHolder:
+class DummySettingsHolder(OTR):
     """
-    this class stands in for a PySCF object carrying settings, so that the settings
-    assignment can be tested without constructing a solver object
+    this class stands in for a converted object carrying settings, so that the
+    settings assignment can be tested without constructing a PySCF object
     """
 
     # the settings a test assigns are arbitrary by design, so they cannot be declared
     def __getattr__(self, name: str) -> Any:
         raise AttributeError(name)
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        object.__setattr__(self, name, value)
-
     def __init__(self, **kwargs: Any) -> None:
         self.__dict__.update(kwargs)
-        self._inherited_settings: Dict[str, Any] = {}
 
     def inherit(self, **kwargs: Any) -> "DummySettingsHolder":
         """
-        this function assigns settings and records them as inherited from PySCF, the
-        way a conversion function does before the user gets to see the object
+        this function copies settings onto the object and records those whose names
+        PySCF also uses as inherited from PySCF, the way a conversion function does
+        before the user gets to see the object
         """
         self.__dict__.update(kwargs)
-        self._inherited_settings.update(kwargs)
+        self._snapshot_shadowed_settings()
         return self
 
 
@@ -341,11 +338,14 @@ class SettingsTests(unittest.TestCase):
         self.assertAlmostEqual(settings.conv_tol, SolverSettings().conv_tol, 12)
 
     def test_assigned_conv_tol_overrides_solver_default(self) -> None:
-        obj = DummySettingsHolder().inherit(conv_tol=1e-9)
-        obj.conv_tol = 1e-7
-        settings = SolverSettings()
-        assign_solver_settings(obj, settings)
-        self.assertAlmostEqual(settings.conv_tol, 1e-7, 12)
+        # also a value equal to the inherited one counts as assigned
+        for value in (1e-7, 1e-9):
+            with self.subTest(value=value):
+                obj = DummySettingsHolder().inherit(conv_tol=1e-9)
+                obj.conv_tol = value
+                settings = SolverSettings()
+                assign_solver_settings(obj, settings)
+                self.assertAlmostEqual(settings.conv_tol, value, 12)
 
     def test_setting_was_set_by_user(self) -> None:
         obj = DummySettingsHolder().inherit(conv_tol=1e-9)

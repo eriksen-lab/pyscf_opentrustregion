@@ -72,15 +72,10 @@ stability_setting_aliases = {
 def setting_was_set_by_user(obj: object, name: str) -> bool:
     """
     this function decides whether a setting whose name PySCF also uses was set
-    deliberately, by comparing it against the value recorded when the object was
-    constructed
+    deliberately, that is assigned after the object was constructed rather than
+    inherited from PySCF, also when the value assigned equals the inherited one
     """
-    if not hasattr(obj, name):
-        return False
-    inherited = getattr(obj, "_inherited_settings", {})
-    if name not in inherited:
-        return True
-    return getattr(obj, name) != inherited[name]
+    return hasattr(obj, name) and name not in getattr(obj, "_inherited_settings", ())
 
 
 def setting_is_assignable(obj: object, setting: str) -> bool:
@@ -190,15 +185,21 @@ class OTR:
 
     def _snapshot_shadowed_settings(self) -> None:
         """
-        this function records the settings whose names PySCF also uses, so that a later
-        assignment can be told apart from a value inherited from PySCF; it must run
-        after any copying of another object's attributes
+        this function records the settings whose names PySCF also uses as inherited
+        from PySCF until they are assigned; it must run after any copying of another
+        object's attributes, which bypasses __setattr__
         """
-        self._inherited_settings = {
-            name: getattr(self, name)
-            for name in solver_settings_shadowed_by_pyscf
-            if hasattr(self, name)
-        }
+        self._inherited_settings = frozenset(
+            name for name in solver_settings_shadowed_by_pyscf if hasattr(self, name)
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # an assignment makes a setting whose name PySCF also uses one chosen for the
+        # solver, also when it assigns the value inherited from PySCF
+        inherited = self.__dict__.get("_inherited_settings", frozenset())
+        if name in inherited:
+            super().__setattr__("_inherited_settings", inherited - {name})
+        super().__setattr__(name, value)
 
     @staticmethod
     def _rotates_too_far(kappa: np.ndarray) -> bool:
