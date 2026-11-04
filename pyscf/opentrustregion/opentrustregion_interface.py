@@ -11,8 +11,11 @@ import numpy as np
 from dataclasses import dataclass
 import scipy as sc
 from pyscf import gto, scf, lo, lib
-from pyscf.scf import hf_symm, uhf_symm
+from pyscf.pbc import gto as pbcgto
+from pyscf.scf import hf_symm, uhf_symm, ghf_symm
 from pyscf.soscf import ciah, newton_ah
+from pyscf.x2c import x2c
+from pyscf.x2c import newton_ah as x2c_newton_ah
 from pyscf.mcscf import casci, mc1step, newton_casscf, addons
 from pyopentrustregion import (
     SolverSettings,
@@ -501,9 +504,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # solver setting deciding whether the solver checks the stability of its solution
     stability: Optional[bool]
 
+    # quasi-Newton method, which selects density QN or rotation QN, if any
+    qn_method: Optional[str]
+
     # set while the kernel runs
     dm: np.ndarray
     vhf: np.ndarray
+    complex_orbitals: bool
 
     _keys = set(
         mo_setting_fields
@@ -544,6 +551,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             "vc_mask",
             "vo_mask",
             "oc_mask",
+            "complex_orbitals",
         ]
     )
 
@@ -673,8 +681,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             return
 
         self._drop_adopted_routines()
-        self.get_indices()
-        self.n_param = int(np.count_nonzero(self.kappa_mask))
+        self._set_parameters()
 
     # raw and counted orbital updates and (approximate) Hessian linear transformations;
     # the raw orbital update is the object a factory returns, whose Hessian linear
@@ -739,11 +746,74 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 "check can report instabilities that this energy does not have.",
             )
 
-    # energy function
+    def _set_parameters(self) -> None:
+        """
+        this function sets up the parameters of the current orbitals, the
+        occupied-virtual rotations symmetry allows, which for complex orbitals are
+        complex, so that their real and imaginary parts are the parameters
+        """
+        self.complex_orbitals = bool(np.iscomplexobj(self.mo_coeff))
+        self.get_indices()
+        self.n_param = (1 + self.complex_orbitals) * int(
+            np.count_nonzero(self.kappa_mask)
+        )
+
+    def _rotation(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function returns the rotation parameters of the allowed occupied-virtual
+        pairs from the parameter vector, which holds their real parts followed by
+        their imaginary parts for complex orbitals
+        """
+        if self.complex_orbitals:
+            n_pairs = kappa.size // 2
+            return kappa[:n_pairs] + 1j * kappa[n_pairs:]
+        return kappa
+
+    def _parameters(self, rotation: np.ndarray) -> np.ndarray:
+        """
+        this function returns the parameter vector of quantities over the allowed
+        occupied-virtual pairs, the inverse of _rotation
+        """
+        if self.complex_orbitals:
+            return np.concatenate((rotation.real, rotation.imag))
+        return rotation
+
+    def _embed(self, rotation: np.ndarray) -> np.ndarray:
+        """
+        this function returns the vector over the occupied-virtual pairs of PySCF's
+        derivatives that the rotations correspond to
+        """
+        full = np.zeros(self.kappa_mask.shape, dtype=rotation.dtype)
+        full[self.kappa_mask] = rotation
+        return full
+
+    def _restrict(self, full: np.ndarray) -> np.ndarray:
+        """
+        this function returns the derivatives with respect to the rotations from those
+        over the occupied-virtual pairs of PySCF, the adjoint of _embed
+        """
+        return full[self.kappa_mask]
+
+    def _restrict_diagonal(self, h_diag: np.ndarray) -> np.ndarray:
+        """
+        this function returns the Hessian diagonal of the rotations from that over the
+        occupied-virtual pairs of PySCF
+        """
+        return h_diag[self.kappa_mask]
+
+    def _canonicalize(self, fock: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the energies and the canonical orbitals within the
+        occupied and within the virtual orbitals, which the PySCF object determines
+        """
+        return self._scf.canonicalize(self.mo_coeff, self.mo_occ, fock)
+
+    # energy function, which limits the modulus of the rotations
     def _func(self, kappa: np.ndarray) -> float:
-        if self._rotates_too_far(kappa):
+        rotation = self._rotation(kappa)
+        if self._rotates_too_far(rotation):
             return np.inf
-        u = self.exp_mat(self.unpack(kappa))
+        u = self.exp_mat(self.unpack(rotation))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._potential(dm)
@@ -776,7 +846,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._moves(kappa)
         if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
             # perform orbital rotation and get new fock matrix
-            u = self.exp_mat(self.unpack(kappa))
+            u = self.exp_mat(self.unpack(self._rotation(kappa)))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
             self.vhf = self._potential(self.dm)
@@ -785,14 +855,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self._save_update_orbs()
         energy, new_grad, new_h_diag, hess_x = self._last_update.value
 
-        grad[:] = 2 * new_grad[self.kappa_mask]
-        h_diag[:] = 2 * new_h_diag[self.kappa_mask]
+        # PySCF's quantities are half the derivatives with respect to the rotations;
+        # for complex orbitals, the real and imaginary parts of the gradient are the
+        # derivatives with respect to the real and imaginary parts of the rotations,
+        # which share the diagonal of the Hessian
+        grad[:] = 2 * self._parameters(self._restrict(new_grad))
+        h_diag_rotations = self._restrict_diagonal(new_h_diag)
+        h_diag[:] = 2 * np.tile(h_diag_rotations, 1 + self.complex_orbitals)
 
         def raw_hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            x_full = np.zeros_like(self.kappa_mask, dtype=np.float64)
-            x_full[self.kappa_mask] = x
+            x_full = self._embed(self._rotation(x))
             self.n_jk_response += 1
-            hx[:] = 2 * hess_x(x_full)[self.kappa_mask]
+            hx[:] = 2 * self._parameters(self._restrict(hess_x(x_full)))
 
         self._raw_hess_x = raw_hess_x
 
@@ -803,18 +877,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self,
         mo_coeff: Optional[np.ndarray] = None,
         mo_occ: Optional[np.ndarray] = None,
-        dm: Optional[np.ndarray] = None,
+        dm0: Optional[np.ndarray] = None,
     ) -> float:
         # discard anything computed by a previous kernel
         self._reset()
 
-        if dm is not None:
-            if isinstance(dm, str):
+        if dm0 is not None:
+            if isinstance(dm0, str):
                 lib.logger.debug(
                     self,
-                    f"OpenTrustRegion solver reads density matrix from chkfile {dm}",
+                    f"OpenTrustRegion solver reads density matrix from chkfile {dm0}",
                 )
-                dm = self.from_chk(dm)
+                dm0 = self.from_chk(dm0)
 
         elif mo_coeff is not None and mo_occ is None:
             lib.logger.warn(
@@ -823,7 +897,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 "mo_occ is not found in the arguments.",
             )
             lib.logger.warn(self, "The given argument is treated as density matrix.")
-            dm = mo_coeff
+            dm0 = mo_coeff
             mo_coeff = mo_occ = None
 
         else:
@@ -874,9 +948,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if not hasattr(self, "s_gek"):
             self.s_gek = False
 
-        # exact orbital updates of RHF and UHF in the MO basis come from the MO
-        # extension; the approximate Hessians build on them
-        mo = not self.oao and not isinstance(self, ROHFOTR)
+        # the extensions work on the real orbitals of molecular RHF, ROHF and UHF,
+        # which the orbitals of the initial guess show to be real
+        periodic = isinstance(mol, pbcgto.Cell)
+        extensions = self.oao or qn_method is not None or self.s_gek
+        if extensions and (periodic or not isinstance(self, (RHFOTR, ROHFOTR, UHFOTR))):
+            raise NotImplementedError(
+                "OAO, the quasi-Newton methods and S-GEK are not currently "
+                "implemented for GHF, X2C and periodic systems."
+            )
 
         # orthogonalize the AO basis for the eigensolver as PySCF's own kernel does,
         # which removes linearly dependent AOs, if this version of PySCF supports it
@@ -894,8 +974,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     "dependent AOs."
                 )
 
-        # get initial guess
+        # get initial guess, either orbitals with their density or the eigenvectors of
+        # the Fock matrix of a density
         if mo_coeff is not None and mo_occ is not None:
+            density_guess = False
             dm = self.make_rdm1(mo_coeff, mo_occ)
             vhf = self._potential(dm)
             self._count_update()
@@ -906,6 +988,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             mo_tmp = None
 
         else:
+            density_guess = True
+            dm = dm0
             if dm is None:
                 lib.logger.debug(
                     self,
@@ -920,12 +1004,30 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             mo_energy, mo_coeff = self.eig(fock, self.s1e, **eig_kwargs)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
 
-            # the MO extension evaluates the density of these orbitals itself
-            if not mo:
-                dm = self.make_rdm1(mo_coeff, mo_occ)
-                vhf = self._potential(dm)
-                self._count_update()
-                self.dm, self.vhf = dm, vhf
+        # exact orbital updates of RHF and UHF in the MO basis come from the MO
+        # extension, which rotates real orbitals and evaluates responses at a density,
+        # which PySCF's response functions of periodic systems do not take; the
+        # approximate Hessians build on them
+        complex_orbitals = np.iscomplexobj(mo_coeff)
+        mo = (
+            not self.oao
+            and isinstance(self, (RHFOTR, UHFOTR))
+            and not periodic
+            and not complex_orbitals
+        )
+        if extensions and complex_orbitals:
+            raise NotImplementedError(
+                "OAO, the quasi-Newton methods and S-GEK are not currently "
+                "implemented for complex orbitals."
+            )
+
+        # the MO extension evaluates the density of the orbitals of a density guess
+        # itself, whereas the routines of this object start from it
+        if density_guess and not mo:
+            dm = self.make_rdm1(mo_coeff, mo_occ)
+            vhf = self._potential(dm)
+            self._count_update()
+            self.dm, self.vhf = dm, vhf
 
         # share the in-core integrals the wrapped object has just built for the
         # initial potential so that the responses, which go through this object,
@@ -947,8 +1049,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             )
             self.mo_occ = np.take_along_axis(np.asarray(self.mo_occ), order, axis=-1)
 
-        # get indices of all mixed occupation combinations
-        self.get_indices()
+        # get the parameters, the occupied-virtual rotations, which are complex for
+        # complex orbitals
+        self._set_parameters()
 
         # irreps of the MOs, whose occupied-virtual rotations between orbitals of the
         # same irrep are the parameters of the MO extension
@@ -967,12 +1070,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # number of particles for OAO and density QN
         n_particle = 1 if isinstance(self, RHFOTR) else 2
 
-        # number of parameters
+        # number of parameters in AO basis
         if self.oao:
-            # number of parameters in AO basis
             self.n_param = n_particle * self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
-        else:
-            self.n_param = int(np.count_nonzero(self.kappa_mask))
 
         # turn on automatic stability check for approximate Hessians
         if (not hasattr(self, "stability") or self.stability is None) and (
@@ -1200,17 +1300,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # refer to
         if mo and orbsym is not None:
             self.mo_coeff = lib.tag_array(self.mo_coeff, orbsym=orbsym)
-        self.mo_energy, self.mo_coeff = self._scf.canonicalize(
-            self.mo_coeff, self.mo_occ, fock
-        )
+        self.mo_energy, self.mo_coeff = self._canonicalize(fock)
         masks_evaluated = self._vo_masks() if mo else []
         self._finalize()
 
         # finalizing may reorder the orbitals within the occupied and the virtual
         # ones, which with symmetry changes the irrep at every orbital index, so the
-        # masks of the parameters are determined anew for the final orbitals
+        # parameters are set up anew for the final orbitals
         if not self.oao:
-            self.get_indices()
+            self._set_parameters()
 
         # get the rotation from the orbitals of the MO objects to the final ones with
         # the masks of the parameters of either, with which a stability check after
@@ -1316,6 +1414,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         return stable, direction
 
 
+def unit_phases(values: np.ndarray) -> np.ndarray:
+    """
+    this function returns the phases of values, their signs for real values, with that
+    of a vanishing value taken as one
+    """
+    phases = np.ones_like(values)
+    nonzero = values != 0
+    phases[nonzero] = values[nonzero] / np.abs(values[nonzero])
+    return phases
+
+
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
     def _build_potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
@@ -1339,9 +1448,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         idx = np.argmax(mask, axis=0)
         cols = np.arange(self.mo_coeff.shape[1])
         vals = self.mo_coeff[idx, cols]
-        signs = np.sign(vals)
-        signs[signs == 0] = 1
-        self.mo_coeff *= signs[np.newaxis, :]
+        self.mo_coeff *= unit_phases(vals).conj()[np.newaxis, :]
 
     def get_indices(self) -> None:
         # get occupation indices
@@ -1380,11 +1487,11 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
     def exp_mat(self, matrix: np.ndarray) -> np.ndarray:
         return ciah.expmat(matrix)
 
-    # unpack matrix
-    def unpack(self, kappa: np.ndarray) -> np.ndarray:
-        matrix = np.zeros(self.rot_matrix_mask.shape, dtype=np.float64)
-        matrix[self.rot_matrix_mask] = kappa
-        return matrix - matrix.T
+    # unpack the rotations into an anti-Hermitian matrix over the orbitals
+    def unpack(self, rotation: np.ndarray) -> np.ndarray:
+        matrix = np.zeros(self.rot_matrix_mask.shape, dtype=rotation.dtype)
+        matrix[self.rot_matrix_mask] = rotation
+        return matrix - matrix.conj().T
 
     # unpack matrix into virtual-occupied block
     def unpack_vo(self, kappa: np.ndarray) -> np.ndarray:
@@ -1614,6 +1721,11 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         return mo_occ, mo_coeff
 
 
+# PySCF's ROHF Hessian lacks the terms proportional to the gradient, which vanish at a
+# stationary point, so that it is approximate away from one, which only slows the
+# convergence; PySCF releases up to 2.14 also lack orbital-rotation terms that persist
+# at a stationary point (pyscf#3448), so that the stability check of an ROHF point,
+# like PySCF's own, is approximate with those releases
 class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
     fix_phase = RHFOTR.fix_phase
@@ -1747,9 +1859,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             idx = np.argmax(mask, axis=0)
             cols = np.arange(self.mo_coeff.shape[2])
             vals = self.mo_coeff[i, idx, cols]
-            signs = np.sign(vals)
-            signs[signs == 0] = 1
-            self.mo_coeff[i] *= signs[np.newaxis, :]
+            self.mo_coeff[i] *= unit_phases(vals).conj()[np.newaxis, :]
 
     def _build_potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
         """
@@ -1826,18 +1936,15 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
     def exp_mat(self, matrix: List[np.ndarray]) -> List[np.ndarray]:
         return [ciah.expmat(matrix[0]), ciah.expmat(matrix[1])]
 
-    # unpack matrix
-    def unpack(self, kappa: np.ndarray) -> List[np.ndarray]:
+    # unpack the rotations into an anti-Hermitian matrix over the orbitals of each spin
+    def unpack(self, rotation: np.ndarray) -> List[np.ndarray]:
         n_param_a = np.count_nonzero(self.rot_matrix_mask[0])
-        matrix_list = [
-            np.zeros(self.rot_matrix_mask.shape[1:], dtype=np.float64),
-            np.zeros(self.rot_matrix_mask.shape[1:], dtype=np.float64),
+        matrices = [
+            np.zeros(mask.shape, dtype=rotation.dtype) for mask in self.rot_matrix_mask
         ]
-        matrix_list[0][self.rot_matrix_mask[0]] = kappa[:n_param_a]
-        matrix_list[1][self.rot_matrix_mask[1]] = kappa[n_param_a:]
-        matrix_list[0] -= matrix_list[0].T
-        matrix_list[1] -= matrix_list[1].T
-        return matrix_list
+        matrices[0][self.rot_matrix_mask[0]] = rotation[:n_param_a]
+        matrices[1][self.rot_matrix_mask[1]] = rotation[n_param_a:]
+        return [matrix - matrix.conj().T for matrix in matrices]
 
     # unpack matrix into virtual-occupied block
     def unpack_vo(self, kappa: np.ndarray) -> List[np.ndarray]:
@@ -2040,6 +2147,128 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         return mo_occ, mo_coeff
 
 
+class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
+
+    fix_phase = RHFOTR.fix_phase
+    exp_mat = RHFOTR.exp_mat
+
+    unpack = RHFOTR.unpack
+
+    # get indices of all occupied-virtual combinations of the spin orbitals
+    def get_indices(self) -> None:
+        occ_idx = self.mo_occ > 0
+        self.rot_matrix_mask = ~occ_idx[:, None] & occ_idx
+        self.kappa_mask = self.rot_matrix_mask[self.rot_matrix_mask]
+        if self._scf.mol.symmetry:
+            # labeled as PySCF's Newton solver labels the spin orbitals
+            orbsym = ghf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
+            sym_allow = orbsym[:, None] == orbsym
+            self.kappa_mask = sym_allow[self.rot_matrix_mask]
+            self.rot_matrix_mask[self.rot_matrix_mask] = self.kappa_mask
+
+
+# Kramers-restricted X2C keeps every odd spinor the time reverse of the even one before
+# it, which the antiunitary time reversal maintains for rotations that turn the even
+# spinors by a matrix and their partners by its complex conjugate. For every pair of a
+# virtual and an occupied Kramers pair, the rotations are A between the even spinors
+# and C of the even occupied spinor into the odd virtual one, whose time reverse turns
+# the odd occupied spinor into the even virtual one by -conj(C); PySCF's own
+# second-order solver turns both spinors of a pair alike and omits C, which keeps the
+# pairs only for real rotations
+class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
+
+    exp_mat = RHFOTR.exp_mat
+
+    # fix phases of MO coefficients to improve deterministic behavior, giving the
+    # partner of every even spinor the conjugate phase, which keeps it its time reverse
+    def fix_phase(self) -> None:
+        even = self.mo_coeff[:, ::2]
+        abs_even = np.abs(even)
+        mask = np.isclose(abs_even, np.max(abs_even, axis=0), atol=1e-12)
+        idx = np.argmax(mask, axis=0)
+        phases = unit_phases(even[idx, np.arange(even.shape[1])])
+        self.mo_coeff[:, ::2] *= phases.conj()[np.newaxis, :]
+        self.mo_coeff[:, 1::2] *= phases[np.newaxis, :]
+
+    # get indices of all combinations of a virtual and an occupied Kramers pair, each
+    # of which has the rotations A and C
+    def get_indices(self) -> None:
+        occ_pairs = self.mo_occ[::2] > 0
+        self.rot_matrix_mask = ~occ_pairs[:, None] & occ_pairs
+        self.kappa_mask = np.ones(
+            2 * int(np.count_nonzero(self.rot_matrix_mask)), dtype=bool
+        )
+
+    def _vo_block(self, rotation: np.ndarray) -> np.ndarray:
+        """
+        this function returns the virtual-occupied block of the rotation generator over
+        the spinors from the rotations A followed by the rotations C
+        """
+        n_occ = int(np.count_nonzero(self.mo_occ > 0))
+        n_vir = self.mo_occ.size - n_occ
+        n_rotations = rotation.size // 2
+        a = rotation[:n_rotations].reshape(n_vir // 2, n_occ // 2)
+        c = rotation[n_rotations:].reshape(n_vir // 2, n_occ // 2)
+        block = np.empty((n_vir, n_occ), dtype=rotation.dtype)
+        block[::2, ::2] = a
+        block[1::2, 1::2] = a.conj()
+        block[1::2, ::2] = c
+        block[::2, 1::2] = -c.conj()
+        return block
+
+    # unpack the rotations into an anti-Hermitian matrix over the spinors
+    def unpack(self, rotation: np.ndarray) -> np.ndarray:
+        occidx = self.mo_occ > 0
+        matrix = np.zeros(2 * (self.mo_occ.size,), dtype=rotation.dtype)
+        matrix[np.ix_(~occidx, occidx)] = self._vo_block(rotation)
+        return matrix - matrix.conj().T
+
+    def _embed(self, rotation: np.ndarray) -> np.ndarray:
+        return self._vo_block(rotation).ravel()
+
+    def _restrict(self, full: np.ndarray) -> np.ndarray:
+        n_occ = int(np.count_nonzero(self.mo_occ > 0))
+        block = full.reshape(-1, n_occ)
+        a = block[::2, ::2] + block[1::2, 1::2].conj()
+        c = block[1::2, ::2] - block[::2, 1::2].conj()
+        return np.concatenate((a.ravel(), c.ravel()))
+
+    def _restrict_diagonal(self, h_diag: np.ndarray) -> np.ndarray:
+        n_occ = int(np.count_nonzero(self.mo_occ > 0))
+        block = h_diag.reshape(-1, n_occ)
+        a = block[::2, ::2] + block[1::2, 1::2]
+        c = block[1::2, ::2] + block[::2, 1::2]
+        return np.concatenate((a.ravel(), c.ravel()))
+
+    # canonical orbitals within the occupied and within the virtual Kramers pairs from
+    # the quaternion eigensolver of the PySCF object, which returns them as pairs,
+    # since PySCF's generic canonicalization mixes the degenerate partners of a pair
+    def _canonicalize(self, fock: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mo_energy = np.empty(self.mo_occ.size)
+        mo_coeff = np.empty_like(self.mo_coeff)
+        for idx in (self.mo_occ > 0, self.mo_occ == 0):
+            orbs = self.mo_coeff[:, idx]
+            # the eigensolver takes the even spinors before their partners
+            basis = np.hstack((orbs[:, ::2], orbs[:, 1::2]))
+            mo_energy[idx], mo_coeff[:, idx] = self._scf._eigh(fock, self.s1e, x=basis)
+        return mo_energy, mo_coeff
+
+
+class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
+
+    fix_phase = RHFOTR.fix_phase
+    exp_mat = RHFOTR.exp_mat
+    unpack = RHFOTR.unpack
+
+    # get indices of all occupied-virtual combinations of the spinors, which
+    # point-group symmetry can not restrict, since PySCF has no symmetry labels for
+    # spinors
+    def get_indices(self) -> None:
+        occ_idx = self.mo_occ > 0
+        self.rot_matrix_mask = ~occ_idx[:, None] & occ_idx
+        self.kappa_mask = self.rot_matrix_mask[self.rot_matrix_mask]
+
+
 def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     if isinstance(mf, SecondOrderOTR):
@@ -2047,12 +2276,27 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     assert isinstance(mf, scf.hf.SCF)
 
-    if mf.istype("ROHF"):
-        cls = ROHFOTR
+    # the spinor classes of X2C carry the names of the nonrelativistic classes, so they
+    # are told apart by their type first, and an ROHF class also carries the name of
+    # RHF, from which it derives; the four-component classes and those with k-points
+    # are not supported
+    cls: Optional[type[SecondOrderOTR]] = None
+    if isinstance(mf, x2c.RHF):
+        cls = X2CRHFOTR
+    elif isinstance(mf, x2c.UHF):
+        cls = X2CUHFOTR
+    elif mf.istype("RHF"):
+        cls = ROHFOTR if mf.istype("ROHF") else RHFOTR
     elif mf.istype("UHF"):
         cls = UHFOTR
-    else:
-        cls = RHFOTR
+    elif mf.istype("GHF"):
+        cls = GHFOTR
+    if cls is None:
+        raise TypeError(
+            "mf_to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham "
+            "counterparts, also at the Gamma point of periodic systems, and spinor "
+            f"X2C, but not {type(mf).__module__}.{type(mf).__name__}."
+        )
 
     mf = lib.set_class(cls(mf), (cls, mf.__class__))
     if hasattr(mf, "stability") and callable(mf.stability):

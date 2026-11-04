@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyscf-opentrustregion"
+dynamic = ["version"]
+description = "PySCF interface to OpenTrustRegion, a Reusable Library for Second-Order Trust Region Orbital Optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Jonas Greiner", email = "jongr@kemi.dtu.dk" }]
+keywords = [
+    "pyscf",
+    "optimization",
+    "trust-region",
+    "orbital-optimization",
+    "quantum-chemistry",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+# a new major version of OpenTrustRegion changes its interfaces
+dependencies = ["numpy", "pyscf>=2.14", "pyopentrustregion>=3.0,<4"]
+
+[project.urls]
+Homepage = "https://github.com/eriksen-lab/pyscf_opentrustregion"
+Repository = "https://github.com/eriksen-lab/pyscf_opentrustregion"
+Issues = "https://github.com/eriksen-lab/pyscf_opentrustregion/issues"
+
+# the package lives in PySCF's namespace, for which this repository has no
+# __init__.py, so that it is installed with its tests into the pyscf package of the
+# PySCF installation
+[tool.setuptools.packages.find]
+include = ["pyscf.opentrustregion*"]
+
+# the version is read from the package without importing it, which would need PySCF
+[tool.setuptools.dynamic]
+version = { attr = "pyscf.opentrustregion.__version__" }

@@ -1,6 +1,11 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 
+# Packaging
+build/
+dist/
+*.egg-info/
+
 # IDEs
 .vscode/
 

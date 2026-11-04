@@ -11,17 +11,25 @@ Tests for the PySCF interface to OpenTrustRegion
 import io
 import unittest
 from contextlib import contextmanager, redirect_stderr
+from unittest import mock
 from itertools import product
-from typing import Any, Dict, Generator, Tuple
+from typing import Any, Dict, Generator, Optional, Tuple
 
 import numpy as np
+import scipy.linalg
 
 from pyscf import gto, scf, dft, lo, mcscf, lib
+from pyscf.pbc import gto as pbcgto, scf as pbcscf
+from pyscf.scf import dhf
+from pyscf.x2c import x2c
 
 from pyscf.opentrustregion import (
     RHFOTR,
     ROHFOTR,
     UHFOTR,
+    GHFOTR,
+    X2CRHFOTR,
+    X2CUHFOTR,
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,
@@ -31,10 +39,10 @@ from pyscf.opentrustregion import (
 from pyscf.opentrustregion.opentrustregion_interface import (
     CASSCFOTR,
     OTR,
+    SecondOrderOTR,
     assign_solver_settings,
     assign_stability_settings,
     non_setting_fields,
-    setting_fields,
     setting_is_assignable,
     setting_was_set_by_user,
     solver_setting_fields,
@@ -47,12 +55,13 @@ from pyopentrustregion import SolverSettings, StabilitySettings
 mol: gto.Mole
 mol_sym: gto.Mole
 mol_open: gto.Mole
+mol_open_sym: gto.Mole
 mf: scf.hf.RHF
 occ_orbs: np.ndarray
 
 
 def setUpModule() -> None:
-    global mol, mol_sym, mol_open, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
     mol = gto.M(
         atom="""
             O  0.000  0.000  0.000
@@ -69,15 +78,18 @@ def setUpModule() -> None:
     mol_open = mol.copy()
     mol_open.spin = 2
     mol_open.build(False, False)
+    mol_open_sym = mol_open.copy()
+    mol_open_sym.symmetry = True
+    mol_open_sym.build(False, False)
 
     mf = scf.RHF(mol).run()
     occ_orbs = mf.mo_coeff[:, : mol.nelec[0]]
 
 
 def tearDownModule() -> None:
-    global mol, mol_sym, mol_open, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
     mol.stdout.close()
-    del mol, mol_sym, mol_open, mf, occ_orbs
+    del mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
 
 
 def grad_and_h_diag(obj: OTR) -> Tuple[np.ndarray, np.ndarray]:
@@ -103,15 +115,59 @@ def gradient_rms(obj: OTR) -> float:
     return np.linalg.norm(grad) / np.sqrt(obj.n_param)
 
 
+def complex_guess(mf: scf.hf.SCF) -> np.ndarray:
+    """
+    this function returns the initial guess of a mean-field object with a small
+    imaginary part added, which keeps the density matrix Hermitian but makes the
+    orbitals complex
+    """
+    dm = mf.get_init_guess()
+    rng = np.random.default_rng(1)
+    imag = 0.01 * rng.standard_normal(dm.shape[-2:])
+    imag = imag - imag.T
+    return dm + 1j * (imag if dm.ndim == 2 else np.array([imag, imag]))
+
+
+def kramers_pairing_error(molecule: gto.Mole, mo_coeff: np.ndarray) -> float:
+    """
+    this function returns how far the odd spinors deviate from the time reverses of the
+    even ones before them, which Kramers-restricted orbitals are, with the time
+    reversal acting on the spinor basis as PySCF maps it
+    """
+    tr_map = np.asarray(molecule.time_reversal_map())
+    signs = np.where(tr_map < 0, -1, 1)
+    reversed_even = np.zeros_like(mo_coeff[:, ::2])
+    reversed_even[abs(tr_map) - 1] = signs[:, None] * mo_coeff[:, ::2].conj()
+    return float(abs(mo_coeff[:, 1::2] - reversed_even).max())
+
+
+def kramers_rotation(n_occ: int, a: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """
+    this function returns the unitary rotation of Kramers-paired spinors, the occupied
+    before the virtual ones, by the rotations a between the even spinors, their
+    conjugates between the odd ones, c of an even occupied spinor into an odd virtual
+    one and -conj(c) of an odd occupied spinor into an even virtual one
+    """
+    n_vir = 2 * a.shape[0]
+    block = np.empty((n_vir, n_occ), dtype=np.complex128)
+    block[::2, ::2] = a
+    block[1::2, 1::2] = a.conj()
+    block[1::2, ::2] = c
+    block[::2, 1::2] = -c.conj()
+    generator = np.zeros(2 * (n_occ + n_vir,), dtype=np.complex128)
+    generator[n_occ:, :n_occ] = block
+    return scipy.linalg.expm(generator - generator.conj().T)
+
+
 def check_derivatives_match_finite_differences(
-    test: unittest.TestCase, obj: Any
+    test: unittest.TestCase, obj: Any, curvature: bool = True, **kernel_args: Any
 ) -> None:
     """
-    this function checks that the gradient and the Hessian linear transformation an
-    orbital update reports are the derivatives of the objective the solver is handed,
-    which a mismatched factor on either would break
+    this function checks that the gradient and, unless the Hessian is approximate, the
+    Hessian linear transformation an orbital update reports are the derivatives of the
+    objective the solver is handed, which a mismatched factor on either would break
     """
-    obj.kernel()
+    obj.kernel(**kernel_args)
     grad, h_diag = grad_and_h_diag(obj)
 
     # step away from the stationary point, where the gradient vanishes and would
@@ -128,6 +184,8 @@ def check_derivatives_match_finite_differences(
     step = 1e-5
     derivative = (obj._func(step * x) - obj._func(-step * x)) / (2 * step)
     test.assertLess(abs(grad @ x - derivative), 1e-5 * abs(derivative))
+    if not curvature:
+        return
 
     # the difference formulas are limited by round off in the objective, so both are
     # compared relative to the value they approximate
@@ -215,75 +273,24 @@ class SettingsTests(unittest.TestCase):
             for field in non_setting_fields:
                 self.assertNotIn(field, fields)
 
-        # the settings the library exposes, pinned so that adding or removing one
-        # upstream shows up here rather than silently changing what the interface
-        # passes through and what the README documents
+        # a setting the solver and the stability check share is read from a stability_
+        # attribute for the stability check or from its plain name for both, so a new
+        # shared setting upstream needs a decision here, whereas any other new setting
+        # becomes assignable on its own
+        shared_on_purpose = {
+            "precond",
+            "project",
+            "logger",
+            "hess_symm",
+            "seed",
+            "verbose",
+        }
         self.assertEqual(
-            solver_setting_fields,
-            [
-                "precond",
-                "precond_pd",
-                "project",
-                "get_extra_trial_vectors",
-                "conv_check",
-                "stability_hess_x",
-                "logger",
-                "stability",
-                "line_search",
-                "refresh_hess",
-                "grad_noise",
-                "hess_symm",
-                "conv_tol",
-                "start_trust_radius",
-                "global_red_factor",
-                "local_red_factor",
-                "n_random_trial_vectors",
-                "n_extra_trial_vectors",
-                "n_macro",
-                "n_micro",
-                "jacobi_davidson_start",
-                "seed",
-                "verbose",
-                "subsystem_solver",
-                "trust_region_shape",
-            ],
+            set(solver_setting_fields) & set(stability_setting_fields),
+            set(stability_setting_aliases) | shared_on_purpose,
         )
-        self.assertEqual(
-            stability_setting_fields,
-            [
-                "precond",
-                "project",
-                "approx_hess_x",
-                "get_extra_trial_vectors",
-                "conv_check",
-                "logger",
-                "hess_symm",
-                "stop_on_instability",
-                "conv_tol",
-                "stability_thresh",
-                "n_random_trial_vectors",
-                "n_extra_trial_vectors",
-                "n_iter",
-                "jacobi_davidson_start",
-                "seed",
-                "verbose",
-                "diag_solver",
-            ],
-        )
-
-        # the field list must be derived from the ctypes structure rather than hard
-        # coded, so that a new solver setting becomes assignable on its own
-        from pyopentrustregion.python_interface import SolverSettingsC
-
-        self.assertEqual(
-            setting_fields(SolverSettingsC),
-            [
-                field[0]
-                for field in SolverSettingsC._fields_
-                if field[0] != "stability_settings"
-                and field[0] not in non_setting_fields
-            ],
-        )
+        for setting, alias in stability_setting_aliases.items():
+            self.assertEqual(alias, "stability_" + setting)
 
     def test_plain_setting_is_copied(self) -> None:
         obj = DummySettingsHolder(n_macro=17, start_trust_radius=0.25)
@@ -400,13 +407,6 @@ class SettingsTests(unittest.TestCase):
         self.assertAlmostEqual(settings.conv_tol, 1e-4, 12)
         self.assertEqual(settings.n_iter, 17)
 
-    def test_every_alias_target_is_a_shared_field(self) -> None:
-        # an alias only earns its existence for a name both settings objects use
-        for setting, alias in stability_setting_aliases.items():
-            self.assertIn(setting, stability_setting_fields)
-            self.assertIn(setting, solver_setting_fields)
-            self.assertEqual(alias, "stability_" + setting)
-
     def test_settings_are_recognized_keys(self) -> None:
         # PySCF warns about attributes it does not recognize, so every assignable
         # setting has to be registered on the class; PySCF collects the keys of every
@@ -426,6 +426,7 @@ class SettingsTests(unittest.TestCase):
             mf_to_otr(scf.RHF(mol)),
             mf_to_otr(scf.ROHF(mol_open)),
             mf_to_otr(scf.UHF(mol_open)),
+            mf_to_otr(x2c.UHF(mol)),
             BoysOTR(mol, occ_orbs),
             casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
         ):
@@ -444,13 +445,19 @@ class SCFTests(unittest.TestCase):
     energies, the cached orbital updates, the derivatives and the stability check
     """
 
-    def _check(self, mf_in: scf.hf.SCF, ref_mf: scf.hf.SCF, **settings: Any) -> OTR:
+    def _check(
+        self,
+        mf_in: scf.hf.SCF,
+        ref_mf: scf.hf.SCF,
+        dm0: Optional[np.ndarray] = None,
+        **settings: Any,
+    ) -> SecondOrderOTR:
         ref_newton = ref_mf.newton()
         ref = ref_newton.kernel()
         otr = mf_to_otr(mf_in)
         for name, value in settings.items():
             setattr(otr, name, value)
-        e_tot = otr.kernel()
+        e_tot = otr.kernel(dm0=dm0)
         self.assertAlmostEqual(e_tot, ref, 8)
         self.assertAlmostEqual(otr.e_tot, ref, 8)
 
@@ -461,13 +468,15 @@ class SCFTests(unittest.TestCase):
         np.testing.assert_allclose(otr.mo_energy, ref_newton.mo_energy, atol=1e-4)
 
         # the orbitals must remain a valid, orthonormal set in the AO basis
-        ovlp = otr.mol.intor_symmetric("int1e_ovlp")
+        ovlp = otr.get_ovlp()
         mo_coeff = np.asarray(otr.mo_coeff)
         if mo_coeff.ndim == 2:
             mo_coeff = mo_coeff[None]
         for coeff in mo_coeff:
             self.assertAlmostEqual(
-                abs(coeff.T @ ovlp @ coeff - np.eye(coeff.shape[1])).max(), 0.0, 8
+                abs(coeff.conj().T @ ovlp @ coeff - np.eye(coeff.shape[1])).max(),
+                0.0,
+                8,
             )
 
         # check if the gradient is converged
@@ -479,8 +488,11 @@ class SCFTests(unittest.TestCase):
             (scf.RHF(mol), RHFOTR),
             (scf.ROHF(mol_open), ROHFOTR),
             (scf.UHF(mol_open), UHFOTR),
+            (scf.GHF(mol_open), GHFOTR),
             (dft.RKS(mol, xc="b3lyp"), RHFOTR),
             (dft.UKS(mol_open, xc="b3lyp"), UHFOTR),
+            (dft.GKS(mol_open, xc="b3lyp"), GHFOTR),
+            (x2c.UHF(mol), X2CUHFOTR),
         ):
             with self.subTest(mf=mf_in.__class__.__name__):
                 otr = mf_to_otr(mf_in)
@@ -492,6 +504,19 @@ class SCFTests(unittest.TestCase):
     def test_mf_to_otr_is_idempotent(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
         self.assertIs(mf_to_otr(otr), otr)
+
+    def test_mf_to_otr_rejects_unsupported_classes(self) -> None:
+        # neither four-component calculations nor those at k-points are supported
+        cell = pbcgto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            a=np.eye(3) * 4.0,
+            basis="gth-szv",
+            pseudo="gth-pade",
+            verbose=0,
+        )
+        for mf_in in (scf.DHF(mol), pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1]))):
+            with self.subTest(mf=mf_in.__class__.__name__):
+                self.assertRaises(TypeError, mf_to_otr, mf_in)
 
     def test_mf_to_otr_stability_is_a_setting(self) -> None:
         # stability is a boolean solver setting, so the PySCF method of that name has
@@ -519,16 +544,174 @@ class SCFTests(unittest.TestCase):
         self._check(scf.UHF(mol_open), scf.UHF(mol_open), oao=True)
 
     def test_uhf_with_symmetry(self) -> None:
-        mol_open_sym = mol_open.copy()
-        mol_open_sym.symmetry = True
-        mol_open_sym.build(False, False)
         self._check(scf.UHF(mol_open_sym), scf.UHF(mol_open_sym))
+
+    def test_ghf(self) -> None:
+        self._check(scf.GHF(mol_open), scf.GHF(mol_open))
+
+    def test_ghf_with_symmetry(self) -> None:
+        self._check(scf.GHF(mol_open_sym), scf.GHF(mol_open_sym))
 
     def test_rks(self) -> None:
         self._check(dft.RKS(mol, xc="b3lyp"), dft.RKS(mol, xc="b3lyp"))
 
     def test_uks(self) -> None:
         self._check(dft.UKS(mol_open, xc="b3lyp"), dft.UKS(mol_open, xc="b3lyp"))
+
+    def test_gks(self) -> None:
+        self._check(dft.GKS(mol_open, xc="b3lyp"), dft.GKS(mol_open, xc="b3lyp"))
+
+    def test_complex_orbitals_return_to_the_real_minimum(self) -> None:
+        # from complex orbitals, the solver optimizes the real and imaginary parts of
+        # the rotations and returns to the real minimum
+        for cls, molecule in (
+            (scf.RHF, mol),
+            (scf.RHF, mol_sym),
+            (scf.ROHF, mol_open),
+            (scf.UHF, mol_open),
+            (scf.GHF, mol),
+        ):
+            with self.subTest(cls=cls.__name__, symmetry=molecule.symmetry):
+                otr = self._check(
+                    cls(molecule), cls(molecule), dm0=complex_guess(cls(molecule))
+                )
+                self.assertTrue(otr.complex_orbitals)
+
+    @unittest.skipIf(dhf.zquatev is None, "Kramers-restricted X2C requires zquatev")
+    def test_kramers_restricted_x2c(self) -> None:
+        # the reference is PySCF's SCF rather than its second-order solver, which turns
+        # both spinors of a Kramers pair alike; the parameters are the rotations A and
+        # C of every combination of a virtual and an occupied Kramers pair, and the
+        # canonical orbitals the kernel returns remain Kramers pairs
+        ref = x2c.RHF(mol)
+        ref.kernel()
+        otr = mf_to_otr(x2c.RHF(mol))
+        self.assertIsInstance(otr, X2CRHFOTR)
+        self.assertAlmostEqual(otr.kernel(), ref.e_tot, 8)
+        self.assertLess(gradient_rms(otr), SolverSettings().conv_tol)
+        self.assertLess(kramers_pairing_error(mol, otr.mo_coeff), 1e-10)
+        n_occ_pairs = mol.nelectron // 2
+        n_vir_pairs = otr.mo_coeff.shape[1] // 2 - n_occ_pairs
+        self.assertEqual(otr.n_param, 4 * n_vir_pairs * n_occ_pairs)
+        stable, _ = check_stability_shape(self, otr)
+        self.assertTrue(stable)
+
+    @unittest.skipIf(dhf.zquatev is None, "Kramers-restricted X2C requires zquatev")
+    def test_kramers_restricted_x2c_derivatives(self) -> None:
+        # the step the derivatives are checked at keeps every odd spinor the time
+        # reverse of the even one before it, as only the conjugate rotation of the
+        # partners does for complex rotations
+        otr = mf_to_otr(x2c.RHF(mol))
+        check_derivatives_match_finite_differences(self, otr)
+        self.assertLess(kramers_pairing_error(mol, otr.mo_coeff), 1e-10)
+
+    @unittest.skipIf(dhf.zquatev is None, "Kramers-restricted X2C requires zquatev")
+    def test_kramers_restricted_x2c_returns_from_a_perturbation(self) -> None:
+        # from the minimum perturbed by complex rotations of both kinds, which a solver
+        # lacking either could not undo, the solver returns to the minimum, with the
+        # orbitals Kramers pairs throughout
+        ref = x2c.RHF(mol)
+        ref.kernel()
+        n_occ = mol.nelectron
+        n_vir_pairs = (ref.mo_coeff.shape[1] - n_occ) // 2
+        rng = np.random.default_rng(3)
+        a, c = (
+            0.05
+            * (
+                rng.standard_normal((n_vir_pairs, n_occ // 2))
+                + 1j * rng.standard_normal((n_vir_pairs, n_occ // 2))
+            )
+            for _ in range(2)
+        )
+        perturbed = ref.mo_coeff @ kramers_rotation(n_occ, a, c)
+        otr = mf_to_otr(x2c.RHF(mol))
+        e_tot = otr.kernel(mo_coeff=perturbed, mo_occ=ref.mo_occ)
+        self.assertAlmostEqual(e_tot, ref.e_tot, 8)
+        self.assertLess(kramers_pairing_error(mol, otr.mo_coeff), 1e-10)
+
+    def test_x2c(self) -> None:
+        otr = self._check(x2c.UHF(mol), x2c.UHF(mol))
+        self.assertTrue(otr.complex_orbitals)
+        stable, _ = check_stability_shape(self, otr)
+        self.assertTrue(stable)
+
+    def test_spin_orbit_x2c_in_the_ghf_basis(self) -> None:
+        otr = self._check(scf.GHF(mol).x2c(), scf.GHF(mol).x2c())
+        self.assertTrue(otr.complex_orbitals)
+
+    def test_extensions_reject_orbitals_they_do_not_support(self) -> None:
+        # the extensions work on the real orbitals of RHF, ROHF and UHF, so they are
+        # rejected for GHF, X2C and complex orbitals
+        for name, mf_in, setting, value, kernel_args in (
+            ("GHF", scf.GHF(mol_open), "oao", True, {}),
+            ("X2C", x2c.UHF(mol), "s_gek", True, {}),
+            (
+                "complex",
+                scf.RHF(mol),
+                "qn_method",
+                "bfgs",
+                {"dm0": complex_guess(scf.RHF(mol))},
+            ),
+        ):
+            with self.subTest(case=name):
+                otr = mf_to_otr(mf_in)
+                setattr(otr, setting, value)
+                self.assertRaises(NotImplementedError, otr.kernel, **kernel_args)
+
+    def test_linear_dependencies(self) -> None:
+        # PySCF removes the linear dependencies of a basis, here at a threshold raised
+        # so that one function goes, which leaves fewer orbitals than atomic orbitals
+        with mock.patch.object(scf.hf, "overlap_zero_eigenvalue_threshold", 0.1):
+            for cls, molecule in (
+                (scf.RHF, mol),
+                (scf.ROHF, mol_open),
+                (scf.UHF, mol_open),
+                (scf.GHF, mol_open),
+            ):
+                with self.subTest(cls=cls.__name__):
+                    otr = self._check(cls(molecule), cls(molecule))
+                    n_orbitals = otr.mo_coeff.shape[-1]
+                    self.assertLess(n_orbitals, (1 + otr.istype("GHF")) * molecule.nao)
+
+    def test_solvent_model(self) -> None:
+        self._check(scf.RHF(mol).ddCOSMO(), scf.RHF(mol).ddCOSMO())
+
+    def test_periodic_gamma_point(self) -> None:
+        cell = pbcgto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            a=np.eye(3) * 4.0,
+            basis="gth-szv",
+            pseudo="gth-pade",
+            verbose=0,
+        )
+        self._check(pbcscf.RHF(cell), pbcscf.RHF(cell))
+
+        # PySCF evaluates the responses of periodic systems only at the orbitals of the
+        # object, whereas the extensions evaluate them at a density
+        otr = mf_to_otr(pbcscf.RHF(cell))
+        otr.qn_method = "arh"
+        self.assertRaises(NotImplementedError, otr.kernel)
+
+    def test_scanners_follow_the_geometry(self) -> None:
+        # a geometry optimization or a scan calls the kernel through a scanner, which
+        # hands it the density matrix of the previous geometry
+        mol_displaced = gto.M(
+            atom="O 0 0 0; H 0 -0.78 0.60; H 0 0.78 0.60", basis="6-31g", verbose=0
+        )
+        ref = scf.RHF(mol).newton().as_scanner()
+        otr = mf_to_otr(scf.RHF(mol)).as_scanner()
+        ref(mol)
+        otr(mol)
+        self.assertAlmostEqual(otr(mol_displaced), ref(mol_displaced), 8)
+
+        grad_ref = scf.RHF(mol).nuc_grad_method().as_scanner()
+        grad_otr = mf_to_otr(scf.RHF(mol)).nuc_grad_method().as_scanner()
+        grad_ref(mol)
+        grad_otr(mol)
+        e_ref, g_ref = grad_ref(mol_displaced)
+        e_otr, g_otr = grad_otr(mol_displaced)
+        self.assertAlmostEqual(e_otr, e_ref, 8)
+        self.assertAlmostEqual(abs(g_otr - g_ref).max(), 0.0, 5)
 
     def test_symmetry_restricts_the_parameter_count(self) -> None:
         # symmetry forbidden rotations must be excluded from the parameter vector
@@ -544,9 +727,6 @@ class SCFTests(unittest.TestCase):
         # is optimized in the rotations symmetry allows, as one of the symmetry-adapted
         # class is; PySCF's Newton solver stops short for such an object itself, so the
         # reference is the symmetry-adapted one
-        mol_open_sym = mol_open.copy()
-        mol_open_sym.symmetry = True
-        mol_open_sym.build(False, False)
         for plain, adapted, molecule in (
             (scf.hf.RHF, scf.RHF, mol_sym),
             (scf.rohf.ROHF, scf.ROHF, mol_open_sym),
@@ -559,9 +739,10 @@ class SCFTests(unittest.TestCase):
                 self.assertEqual(otr.n_param, otr_adapted.n_param)
 
     def test_symmetry_can_forbid_every_rotation(self) -> None:
-        # in the minimal basis, the orbitals of the carbon atom other than 1s and 2s each
-        # belong to an irrep of their own, so symmetry forbids every occupied-virtual
-        # rotation of the triplet and the kernel keeps the orbitals it starts from
+        # in the minimal basis, the orbitals of the carbon atom other than 1s and 2s
+        # each belong to an irrep of their own, so symmetry forbids every
+        # occupied-virtual rotation of the triplet and the kernel keeps the orbitals it
+        # starts from
         carbon = gto.M(atom="C", basis="sto-3g", spin=2, symmetry=True, verbose=0)
         for cls in (scf.ROHF, scf.UHF):
             with self.subTest(cls=cls.__name__):
@@ -571,12 +752,6 @@ class SCFTests(unittest.TestCase):
                 self.assertEqual(otr.n_param, 0)
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
-
-    def test_kernel_from_a_given_density_matrix(self) -> None:
-        ref = scf.RHF(mol).newton().kernel()
-        otr = mf_to_otr(scf.RHF(mol))
-        e_tot = otr.kernel(dm=mf.make_rdm1())
-        self.assertAlmostEqual(e_tot, ref, 8)
 
     def test_repeated_zero_step_reuses_the_update(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
@@ -636,16 +811,60 @@ class SCFTests(unittest.TestCase):
         self.assertGreater(otr.n_hess_x, 0)
 
     def test_derivatives_match_finite_differences(self) -> None:
-        check_derivatives_match_finite_differences(self, mf_to_otr(scf.RHF(mol)))
+        # the gradient and Hessian PySCF provides for GHF are doubled as those of the
+        # restricted classes are; PySCF's ROHF Hessian lacks the terms proportional to
+        # the gradient, so only the gradient is compared for ROHF away from the
+        # stationary point
+        for mf_in, curvature in (
+            (scf.RHF(mol), True),
+            (scf.RHF(mol_sym), True),
+            (scf.ROHF(mol_open), False),
+            (scf.GHF(mol_open), True),
+        ):
+            with self.subTest(cls=mf_in.__class__.__name__):
+                check_derivatives_match_finite_differences(
+                    self, mf_to_otr(mf_in), curvature=curvature
+                )
+
+    def test_complex_derivatives_match_finite_differences(self) -> None:
+        # the real and imaginary parts of PySCF's gradient and Hessian are the
+        # derivatives with respect to those of the rotations, doubled as for real
+        # orbitals; for ROHF, whose Hessian is approximate, only the gradient is compared
+        for name, mf_in, kernel_args in (
+            ("RHF", scf.RHF(mol), {"dm0": complex_guess(scf.RHF(mol))}),
+            (
+                "RHF symmetry",
+                scf.RHF(mol_sym),
+                {"dm0": complex_guess(scf.RHF(mol_sym))},
+            ),
+            ("ROHF", scf.ROHF(mol_open), {"dm0": complex_guess(scf.ROHF(mol_open))}),
+            ("UHF", scf.UHF(mol_open), {"dm0": complex_guess(scf.UHF(mol_open))}),
+            ("GHF", scf.GHF(mol_open), {"dm0": complex_guess(scf.GHF(mol_open))}),
+            ("X2C", x2c.UHF(mol), {}),
+            ("GHF X2C", scf.GHF(mol).x2c(), {}),
+        ):
+            with self.subTest(case=name):
+                otr = mf_to_otr(mf_in)
+                check_derivatives_match_finite_differences(
+                    self, otr, curvature=name != "ROHF", **kernel_args
+                )
+                self.assertTrue(otr.complex_orbitals)
+                self.assertEqual(otr.n_param, 2 * np.count_nonzero(otr.kappa_mask))
 
     def test_large_rotation_is_rejected(self) -> None:
         check_large_rotation_is_rejected(self, mf_to_otr(scf.RHF(mol)))
 
-    def test_converged_rhf_is_stable(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
+    def test_large_complex_rotation_is_rejected(self) -> None:
+        # the limit applies to the modulus of a complex rotation, which exceeds pi / 4
+        # with real and imaginary parts below it
+        otr = mf_to_otr(x2c.UHF(mol))
         otr.kernel()
-        stable, _ = check_stability_shape(self, otr)
-        self.assertTrue(stable)
+        n_pairs = otr.n_param // 2
+        step = np.zeros(otr.n_param, dtype=np.float64)
+        step[0] = step[n_pairs] = 0.6
+        self.assertEqual(otr._func(step), np.inf)
+        step[0] = step[n_pairs] = 0.5
+        self.assertTrue(np.isfinite(otr._func(step)))
 
     def test_unstable_solution_is_detected(self) -> None:
         # a stretched singlet has a lower energy broken symmetry UHF solution, so the

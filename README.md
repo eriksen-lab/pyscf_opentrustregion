@@ -23,47 +23,44 @@ work using OpenTrustRegion:
 
 ## Installation
 
-The interface needs `pyscf` and `pyopentrustregion`, the Python interface to the
-OpenTrustRegion library. It is a PySCF extension and is not itself installed: PySCF
-picks it up from the `PYSCF_EXT_PATH` environment variable.
-
-### 1. Install OpenTrustRegion
-
-OpenTrustRegion is a Fortran library that this interface reaches through `ctypes`.
-Building it needs a Fortran compiler, CMake and BLAS/LAPACK.
+The interface is a PySCF extension available from PyPI, which installs it together
+with PySCF 2.14 or later and `pyopentrustregion`, the Python interface to the
+OpenTrustRegion library:
 
 ```sh
-git clone https://github.com/eriksen-lab/opentrustregion
-cd opentrustregion
-pip install .
+pip install pyscf-opentrustregion
 ```
 
-Confirm the installation with
+Confirm the OpenTrustRegion installation with
 
 ```sh
-python3 -m pyopentrustregion.testsuite
+python3 -m pyopentrustregion.verify_install
 ```
 
-A default build produces the solver as a static library and only the testsuite library
-as a shared one, which is what `ctypes` then loads. If you build OpenTrustRegion with
-its testsuite disabled, add `CMAKE_FLAGS='-DBUILD_SHARED_LIBS=ON'` so that a loadable
-shared library is produced.
+The OpenTrustRegion wheels are built with 32-bit integers. To build it from source
+instead, for example with 64-bit integers or from its development branch, follow the
+[OpenTrustRegion installation instructions](https://github.com/eriksen-lab/opentrustregion#installation)
+before installing the interface, which then keeps that build.
 
-None of the optional OpenTrustRegion extensions are needed by this interface, which
-only uses the core solver and stability check.
+### Development version
 
-### 2. Point PySCF at the interface
-
-PySCF discovers extensions through the `PYSCF_EXT_PATH` environment variable, so no
-install step is needed:
+To use or work on the development version, install the interface from a clone in
+editable mode,
 
 ```sh
 git clone https://github.com/eriksen-lab/pyscf_opentrustregion
+pip install -e pyscf_opentrustregion
+```
+
+or, instead of installing it, point PySCF at the clone through the `PYSCF_EXT_PATH`
+environment variable:
+
+```sh
 export PYSCF_EXT_PATH=$PWD/pyscf_opentrustregion:$PYSCF_EXT_PATH
 ```
 
-See the PySCF documentation on
-[extension modules](http://pyscf.org/pyscf/install.html#extension-modules) for details.
+See the PySCF documentation on [extensions](https://pyscf.org/user/extensions.html)
+for details.
 
 ## Usage
 
@@ -83,8 +80,20 @@ mf.kernel()
 stable, direction = mf.stability_check()
 ```
 
-RHF, ROHF and UHF are supported, along with their KS counterparts; the appropriate
-class is selected from the object that is passed in.
+RHF, ROHF, UHF and GHF are supported, along with their KS counterparts and spinor X2C
+(`scf.X2C(mol)`), Kramers-restricted and unrestricted; the appropriate class is selected
+from the object that is passed in. Complex orbitals, as from a complex initial guess or with spin–orbit
+coupling (`scf.GHF(mol).x2c()`), are optimized through the real and imaginary parts of
+their rotations. Objects with a solvent model, such as `scf.RHF(mol).ddCOSMO()`, and
+periodic calculations at the Γ point are supported as well. The converted object also
+works in PySCF's scanners, which geometry optimizations and scans run, e.g. with
+geomeTRIC:
+
+```python
+from pyscf.geomopt.geometric_solver import optimize
+
+mol_eq = optimize(mf_to_otr(scf.RHF(mol)))
+```
 
 **Set the functional before the conversion.** The converted object evaluates the energy
 and the gradient through the PySCF object it was converted from, but the Hessian
@@ -128,7 +137,7 @@ mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
 ```
 
-Further examples are in the [`examples`](examples) directory.
+Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) directory.
 
 ## Settings
 
@@ -201,8 +210,11 @@ mf.kernel()
 stable, direction = mf.stability_check()
 ```
 
-Note that the solver escapes saddle points on its own, so a converged result is
-normally already a minimum.
+For complex orbitals, the direction holds the real parts of the rotations followed by
+their imaginary parts. The ROHF Hessian of PySCF 2.14 and earlier is approximate also
+at a stationary point, so that the check of an ROHF point can misjudge curvatures close
+to zero there. Note that the solver escapes saddle points on its own, so a converged
+result is normally already a minimum.
 
 ## Diagnostics
 
@@ -215,16 +227,16 @@ mf.n_hess_x          # Hessian linear transformations
 
 ## Testing
 
-With `PYSCF_EXT_PATH` set as above, check that PySCF picks the interface up and that
-OpenTrustRegion loads:
+Check that PySCF picks the interface up and that OpenTrustRegion loads:
 
 ```sh
 python3 -c "from pyscf.opentrustregion import mf_to_otr"
 ```
 
-A `ModuleNotFoundError` means `PYSCF_EXT_PATH` is not set, and a `FileNotFoundError`
-means OpenTrustRegion was installed without a loadable shared library. The scripts in
-[`examples`](examples) are a quick end-to-end check.
+A `ModuleNotFoundError` means that the interface is neither installed nor on
+`PYSCF_EXT_PATH`, and a `FileNotFoundError` means OpenTrustRegion was installed without
+a loadable shared library. The scripts in
+[`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) are a quick end-to-end check.
 
 Then run the test suite:
 
