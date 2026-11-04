@@ -68,6 +68,11 @@ stability_setting_aliases = {
     "jacobi_davidson_start": "stability_jacobi_davidson_start",
 }
 
+# the error code, named as in OpenTrustRegion, with which the solver reports that it
+# reached the maximum number of macro iterations, which pyopentrustregion states only
+# in the message of the RuntimeError it raises
+error_solver_max_iter = 102
+
 
 def setting_was_set_by_user(obj: object, name: str) -> bool:
     """
@@ -133,6 +138,7 @@ class OTR:
             "n_update_orbs",
             "n_hess_x",
             "n_param",
+            "converged",
         ]
     )
 
@@ -141,6 +147,7 @@ class OTR:
 
     # set while the kernel runs
     n_param: int
+    converged: bool
 
     # cached result of the last orbital update, reused when the solver asks for the
     # same point again, together with the point it was computed at
@@ -219,6 +226,30 @@ class OTR:
         together with the Hessian linear transformation at the new point
         """
         raise NotImplementedError
+
+    def _func(self, kappa: np.ndarray) -> float:
+        """
+        this function is supplied by every concrete driver below; it returns the
+        objective at a step from the current point without applying the step
+        """
+        raise NotImplementedError
+
+    def _solve(self) -> None:
+        """
+        this function runs the solver from the current point with the settings of this
+        object and records whether it converged; like PySCF's own solvers, it stops at
+        the last point without raising once the maximum number of macro iterations is
+        reached, which the solver reports itself
+        """
+        settings = SolverSettings()
+        assign_solver_settings(self, settings)
+        self.converged = False
+        try:
+            solver(self._update_orbs, self._func, self.n_param, settings)
+            self.converged = True
+        except RuntimeError as error:
+            if f"(code {error_solver_max_iter})" not in str(error):
+                raise
 
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
@@ -362,12 +393,8 @@ class LocalizerOTR(OTR):
             u0 = self.get_init_guess(None)
         self.mo_coeff = self.mo_coeff @ u0
 
-        # initialize settings
-        settings = SolverSettings()
-        assign_solver_settings(self, settings)
-
         # call solver
-        solver(self._update_orbs, self._func, self.n_param, settings)
+        self._solve()
 
         return self.mo_coeff
 
@@ -649,17 +676,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # complex orbitals
         self._set_parameters()
 
-        # initialize settings
-        settings = SolverSettings()
-        assign_solver_settings(self, settings)
-
         # call solver, unless symmetry forbids every rotation, which leaves the
         # orbitals stationary already
         if self.n_param > 0:
-            solver(self._update_orbs, self._func, self.n_param, settings)
+            self._solve()
+        else:
+            self.converged = True
 
         # get canonical orbitals
-        self.converged = True
         self.e_tot = self._func(np.zeros(self.n_param, dtype=np.float64))
         dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
@@ -1253,13 +1277,8 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         # number of parameters
         self.n_param = self.n_param_orb + self.n_param_ci
 
-        # initialize settings
-        settings = SolverSettings()
-        assign_solver_settings(self, settings)
-
         # call solver
-        solver(self._update_orbs, self._func, self.n_param, settings)
-        self.converged = True
+        self._solve()
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
         if isinstance(fcivec, np.ndarray):

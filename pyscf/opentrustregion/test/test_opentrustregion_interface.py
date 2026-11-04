@@ -463,6 +463,24 @@ class SettingsTests(unittest.TestCase):
                 public = {name for name in vars(obj) if not name.startswith("_")}
                 self.assertFalse(public - keys - set(dir(type(obj))))
 
+    def test_kernel_returns_without_convergence(self) -> None:
+        # like PySCF's own kernels, a kernel that runs out of macro iterations returns
+        # and reports that it did not converge, whereas other errors are raised
+        def failing_conv_check() -> bool:
+            raise ValueError
+
+        for obj in (
+            mf_to_otr(scf.RHF(mol)),
+            BoysOTR(mol, occ_orbs),
+            casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
+        ):
+            with self.subTest(cls=type(obj).__name__):
+                obj.n_macro = 1
+                obj.kernel()
+                self.assertFalse(obj.converged)
+                obj.conv_check = failing_conv_check
+                self.assertRaises(RuntimeError, obj.kernel)
+
 
 class SCFTests(unittest.TestCase):
     """
@@ -476,6 +494,7 @@ class SCFTests(unittest.TestCase):
         ref = ref_mf.newton().kernel()
         otr = mf_to_otr(mf_in)
         e_tot = otr.kernel(**kernel_args)
+        self.assertTrue(otr.converged)
         self.assertAlmostEqual(e_tot, ref, 8)
         self.assertAlmostEqual(otr.e_tot, ref, 8)
 
