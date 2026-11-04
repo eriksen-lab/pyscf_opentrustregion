@@ -80,11 +80,14 @@ mf.kernel()
 stable, direction = mf.stability_check()
 ```
 
-RHF, ROHF, UHF and GHF with real orbitals are supported, along with their KS
-counterparts; the appropriate class is selected from the object that is passed in. This
-includes objects with a solvent model, such as `scf.RHF(mol).ddCOSMO()`, and periodic
-calculations at the Γ point. The converted object also works in PySCF's scanners, which
-geometry optimizations and scans run, e.g. with geomeTRIC:
+RHF, ROHF, UHF and GHF are supported, along with their KS counterparts and spinor X2C
+(`scf.X2C(mol)`), Kramers-restricted and unrestricted; the appropriate class is selected
+from the object that is passed in. Complex orbitals, as from a complex initial guess or with spin–orbit
+coupling (`scf.GHF(mol).x2c()`), are optimized through the real and imaginary parts of
+their rotations. Objects with a solvent model, such as `scf.RHF(mol).ddCOSMO()`, and
+periodic calculations at the Γ point are supported as well. The converted object also
+works in PySCF's scanners, which geometry optimizations and scans run, e.g. with
+geomeTRIC:
 
 ```python
 from pyscf.geomopt.geometric_solver import optimize
@@ -207,8 +210,11 @@ mf.kernel()
 stable, direction = mf.stability_check()
 ```
 
-Note that the solver escapes saddle points on its own, so a converged result is
-normally already a minimum.
+For complex orbitals, the direction holds the real parts of the rotations followed by
+their imaginary parts. The ROHF Hessian of PySCF 2.14 and earlier is approximate also
+at a stationary point, so that the check of an ROHF point can misjudge curvatures close
+to zero there. Note that the solver escapes saddle points on its own, so a converged
+result is normally already a minimum.
 
 ## Diagnostics
 
