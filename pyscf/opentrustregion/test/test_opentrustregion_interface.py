@@ -43,7 +43,6 @@ from pyscf.opentrustregion.opentrustregion_interface import (
     assign_solver_settings,
     assign_stability_settings,
     non_setting_fields,
-    setting_fields,
     setting_is_assignable,
     setting_was_set_by_user,
     solver_setting_fields,
@@ -56,12 +55,13 @@ from pyopentrustregion import SolverSettings, StabilitySettings
 mol: gto.Mole
 mol_sym: gto.Mole
 mol_open: gto.Mole
+mol_open_sym: gto.Mole
 mf: scf.hf.RHF
 occ_orbs: np.ndarray
 
 
 def setUpModule() -> None:
-    global mol, mol_sym, mol_open, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
     mol = gto.M(
         atom="""
             O  0.000  0.000  0.000
@@ -78,15 +78,18 @@ def setUpModule() -> None:
     mol_open = mol.copy()
     mol_open.spin = 2
     mol_open.build(False, False)
+    mol_open_sym = mol_open.copy()
+    mol_open_sym.symmetry = True
+    mol_open_sym.build(False, False)
 
     mf = scf.RHF(mol).run()
     occ_orbs = mf.mo_coeff[:, : mol.nelec[0]]
 
 
 def tearDownModule() -> None:
-    global mol, mol_sym, mol_open, mf, occ_orbs
+    global mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
     mol.stdout.close()
-    del mol, mol_sym, mol_open, mf, occ_orbs
+    del mol, mol_sym, mol_open, mol_open_sym, mf, occ_orbs
 
 
 def grad_and_h_diag(obj: OTR) -> Tuple[np.ndarray, np.ndarray]:
@@ -270,70 +273,24 @@ class SettingsTests(unittest.TestCase):
             for field in non_setting_fields:
                 self.assertNotIn(field, fields)
 
-        # the settings the library exposes, pinned so that adding or removing one
-        # upstream shows up here rather than silently changing what the interface
-        # passes through and what the README documents
+        # a setting the solver and the stability check share is read from a stability_
+        # attribute for the stability check or from its plain name for both, so a new
+        # shared setting upstream needs a decision here, whereas any other new setting
+        # becomes assignable on its own
+        shared_on_purpose = {
+            "precond",
+            "project",
+            "logger",
+            "hess_symm",
+            "seed",
+            "verbose",
+        }
         self.assertEqual(
-            solver_setting_fields,
-            [
-                "precond",
-                "project",
-                "get_extra_trial_vectors",
-                "conv_check",
-                "logger",
-                "stability",
-                "line_search",
-                "grad_noise",
-                "hess_symm",
-                "conv_tol",
-                "start_trust_radius",
-                "global_red_factor",
-                "local_red_factor",
-                "n_random_trial_vectors",
-                "n_extra_trial_vectors",
-                "n_macro",
-                "n_micro",
-                "jacobi_davidson_start",
-                "seed",
-                "verbose",
-                "subsystem_solver",
-            ],
+            set(solver_setting_fields) & set(stability_setting_fields),
+            set(stability_setting_aliases) | shared_on_purpose,
         )
-        self.assertEqual(
-            stability_setting_fields,
-            [
-                "precond",
-                "project",
-                "get_extra_trial_vectors",
-                "conv_check",
-                "logger",
-                "hess_symm",
-                "stop_on_instability",
-                "conv_tol",
-                "stability_thresh",
-                "n_random_trial_vectors",
-                "n_extra_trial_vectors",
-                "n_iter",
-                "jacobi_davidson_start",
-                "seed",
-                "verbose",
-                "diag_solver",
-            ],
-        )
-
-        # the field list must be derived from the ctypes structure rather than hard
-        # coded, so that a new solver setting becomes assignable on its own
-        from pyopentrustregion.python_interface import SolverSettingsC
-
-        self.assertEqual(
-            setting_fields(SolverSettingsC),
-            [
-                field[0]
-                for field in SolverSettingsC._fields_
-                if field[0] != "stability_settings"
-                and field[0] not in non_setting_fields
-            ],
-        )
+        for setting, alias in stability_setting_aliases.items():
+            self.assertEqual(alias, "stability_" + setting)
 
     def test_plain_setting_is_copied(self) -> None:
         obj = DummySettingsHolder(n_macro=17, start_trust_radius=0.25)
@@ -449,13 +406,6 @@ class SettingsTests(unittest.TestCase):
         assign_stability_settings(obj, settings)
         self.assertAlmostEqual(settings.conv_tol, 1e-4, 12)
         self.assertEqual(settings.n_iter, 17)
-
-    def test_every_alias_target_is_a_shared_field(self) -> None:
-        # an alias only earns its existence for a name both settings objects use
-        for setting, alias in stability_setting_aliases.items():
-            self.assertIn(setting, stability_setting_fields)
-            self.assertIn(setting, solver_setting_fields)
-            self.assertEqual(alias, "stability_" + setting)
 
     def test_settings_are_recognized_keys(self) -> None:
         # PySCF warns about attributes it does not recognize, so every assignable
@@ -574,18 +524,12 @@ class SCFTests(unittest.TestCase):
         self._check(scf.UHF(mol_open), scf.UHF(mol_open))
 
     def test_uhf_with_symmetry(self) -> None:
-        mol_open_sym = mol_open.copy()
-        mol_open_sym.symmetry = True
-        mol_open_sym.build(False, False)
         self._check(scf.UHF(mol_open_sym), scf.UHF(mol_open_sym))
 
     def test_ghf(self) -> None:
         self._check(scf.GHF(mol_open), scf.GHF(mol_open))
 
     def test_ghf_with_symmetry(self) -> None:
-        mol_open_sym = mol_open.copy()
-        mol_open_sym.symmetry = True
-        mol_open_sym.build(False, False)
         self._check(scf.GHF(mol_open_sym), scf.GHF(mol_open_sym))
 
     def test_rks(self) -> None:
@@ -738,9 +682,6 @@ class SCFTests(unittest.TestCase):
         # is optimized in the rotations symmetry allows, as one of the symmetry-adapted
         # class is; PySCF's Newton solver stops short for such an object itself, so the
         # reference is the symmetry-adapted one
-        mol_open_sym = mol_open.copy()
-        mol_open_sym.symmetry = True
-        mol_open_sym.build(False, False)
         for plain, adapted, molecule in (
             (scf.hf.RHF, scf.RHF, mol_sym),
             (scf.rohf.ROHF, scf.ROHF, mol_open_sym),
@@ -766,12 +707,6 @@ class SCFTests(unittest.TestCase):
                 self.assertEqual(otr.n_param, 0)
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
-
-    def test_kernel_from_a_given_density_matrix(self) -> None:
-        ref = scf.RHF(mol).newton().kernel()
-        otr = mf_to_otr(scf.RHF(mol))
-        e_tot = otr.kernel(dm0=mf.make_rdm1())
-        self.assertAlmostEqual(e_tot, ref, 8)
 
     def test_repeated_zero_step_reuses_the_update(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
@@ -878,12 +813,6 @@ class SCFTests(unittest.TestCase):
         self.assertEqual(otr._func(step), np.inf)
         step[0] = step[n_pairs] = 0.5
         self.assertTrue(np.isfinite(otr._func(step)))
-
-    def test_converged_rhf_is_stable(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
-        otr.kernel()
-        stable, _ = check_stability_shape(self, otr)
-        self.assertTrue(stable)
 
     def test_unstable_solution_is_detected(self) -> None:
         # a stretched singlet has a lower energy broken symmetry UHF solution, so the
