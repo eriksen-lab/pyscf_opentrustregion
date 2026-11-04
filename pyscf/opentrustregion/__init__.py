@@ -16,6 +16,7 @@ from pyscf.opentrustregion.opentrustregion_interface import (
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,
+    FourthMomentOTR,
     mf_to_otr,
     casscf_to_otr,
 )

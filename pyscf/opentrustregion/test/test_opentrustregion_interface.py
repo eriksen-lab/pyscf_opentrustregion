@@ -33,6 +33,7 @@ from pyscf.opentrustregion import (
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,
+    FourthMomentOTR,
     mf_to_otr,
     casscf_to_otr,
 )
@@ -952,6 +953,10 @@ class LocalizerTests(unittest.TestCase):
         (BoysOTR, lo.Boys, 1.0),
         (PipekMezeyOTR, lo.PipekMezey, -1.0),
         (EdmistonRuedenbergOTR, lo.EdmistonRuedenberg, -1.0),
+    ) + (
+        ((FourthMomentOTR, lo.FourthMoment, 1.0),)
+        if hasattr(lo, "FourthMoment")
+        else ()
     )
 
     def _objective(self, cls: type, mo_coeff: np.ndarray, sign: float) -> float:
@@ -960,7 +965,7 @@ class LocalizerTests(unittest.TestCase):
     def test_localizer_stability_is_a_setting(self) -> None:
         # the boolean solver setting shadows the stability() method the pyscf.lo class
         # provides, which only holds while the driver precedes it in the base list
-        for cls in (BoysOTR, PipekMezeyOTR, EdmistonRuedenbergOTR):
+        for cls, _, _ in self.localizers:
             with self.subTest(cls=cls.__name__):
                 loc = cls(mol, occ_orbs)
                 self.assertFalse(callable(loc.stability))
@@ -1031,7 +1036,9 @@ class LocalizerTests(unittest.TestCase):
         self.assertGreater(loc.n_hess_x, 0)
 
     def test_derivatives_match_finite_differences(self) -> None:
-        check_derivatives_match_finite_differences(self, BoysOTR(mol, occ_orbs))
+        for cls, _, _ in self.localizers:
+            with self.subTest(cls=cls.__name__):
+                check_derivatives_match_finite_differences(self, cls(mol, occ_orbs))
 
     def test_large_rotation_is_rejected(self) -> None:
         check_large_rotation_is_rejected(self, BoysOTR(mol, occ_orbs))

@@ -380,6 +380,21 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
     cost_sign = -1.0
 
 
+if not TYPE_CHECKING and not hasattr(lo, "FourthMoment"):
+
+    class FourthMomentOTR:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError(
+                "FourthMomentOTR requires PySCF with lo.FourthMoment. "
+                "Please install a compatible PySCF version."
+            )
+
+else:
+
+    class FourthMomentOTR(LocalizerOTR, lo.FourthMoment):
+        pass
+
+
 # input options of the PySCF Kohn-Sham objects that define the energy. A converted
 # object evaluates the energy and the gradient through the PySCF object it was
 # converted from but the Hessian itself, so such an option assigned after the

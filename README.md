@@ -125,6 +125,9 @@ loc = BoysOTR(mol, mf.mo_coeff[:, : mol.nelec[0]])
 mo_loc = loc.kernel()
 ```
 
+`FourthMomentOTR` localizes by the fourth moment and requires a PySCF that provides
+`lo.FourthMoment`.
+
 ### CASSCF
 
 `casscf_to_otr` converts a PySCF CASSCF object:
