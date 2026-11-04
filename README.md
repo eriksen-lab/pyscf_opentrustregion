@@ -80,8 +80,17 @@ mf.kernel()
 stable, direction = mf.stability_check()
 ```
 
-RHF, ROHF and UHF are supported, along with their KS counterparts; the appropriate
-class is selected from the object that is passed in.
+RHF, ROHF, UHF and GHF with real orbitals are supported, along with their KS
+counterparts; the appropriate class is selected from the object that is passed in. This
+includes objects with a solvent model, such as `scf.RHF(mol).ddCOSMO()`, and periodic
+calculations at the Γ point. The converted object also works in PySCF's scanners, which
+geometry optimizations and scans run, e.g. with geomeTRIC:
+
+```python
+from pyscf.geomopt.geometric_solver import optimize
+
+mol_eq = optimize(mf_to_otr(scf.RHF(mol)))
+```
 
 **Set the functional before the conversion.** The converted object evaluates the energy
 and the gradient through the PySCF object it was converted from, but the Hessian

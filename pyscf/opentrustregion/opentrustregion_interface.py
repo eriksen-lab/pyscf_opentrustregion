@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import numpy as np
 from pyscf import gto, scf, lo, lib
-from pyscf.scf import hf_symm, uhf_symm
+from pyscf.scf import hf_symm, uhf_symm, ghf_symm
 from pyscf.soscf import ciah, newton_ah
+from pyscf.x2c import x2c
 from pyscf.mcscf import casci, mc1step, newton_casscf, addons
 from pyopentrustregion import SolverSettings, StabilitySettings, solver, stability_check
 from pyopentrustregion.python_interface import SolverSettingsC, StabilitySettingsC
@@ -505,15 +506,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self,
         mo_coeff: Optional[np.ndarray] = None,
         mo_occ: Optional[np.ndarray] = None,
-        dm: Optional[np.ndarray] = None,
+        dm0: Optional[np.ndarray] = None,
     ) -> float:
-        if dm is not None:
-            if isinstance(dm, str):
+        if dm0 is not None:
+            if isinstance(dm0, str):
                 lib.logger.debug(
                     self,
-                    f"OpenTrustRegion solver reads density matrix from chkfile {dm}",
+                    f"OpenTrustRegion solver reads density matrix from chkfile {dm0}",
                 )
-                dm = self.from_chk(dm)
+                dm0 = self.from_chk(dm0)
 
         elif mo_coeff is not None and mo_occ is None:
             lib.logger.warn(
@@ -522,7 +523,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 "mo_occ is not found in the arguments.",
             )
             lib.logger.warn(self, "The given argument is treated as density matrix.")
-            dm = mo_coeff
+            dm0 = mo_coeff
             mo_coeff = mo_occ = None
 
         else:
@@ -554,6 +555,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             mo_tmp = None
 
         else:
+            dm = dm0
             if dm is None:
                 lib.logger.debug(
                     self,
@@ -571,6 +573,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.dm, self.vhf = dm, vhf
 
         self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
+
+        # OpenTrustRegion optimizes real parameters, so complex orbitals, as from a
+        # complex initial guess or a Hamiltonian with spin-orbit coupling, can not be
+        # rotated
+        if np.iscomplexobj(self.mo_coeff):
+            raise TypeError(
+                "OpenTrustRegion optimizes real orbitals only, but the orbitals are "
+                "complex."
+            )
 
         # fix phases of MO coefficients to improve deterministic behavior
         self.fix_phase()
@@ -730,6 +741,35 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         return [matrix - matrix.T for matrix in matrices]
 
 
+class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
+
+    fix_phase = RHFOTR.fix_phase
+    exp_mat = RHFOTR.exp_mat
+
+    # get indices of all occupied-virtual combinations of the spin orbitals
+    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+        occidx = self.mo_occ > 0
+        viridx = ~occidx
+        mask = viridx[:, None] & occidx
+
+        mask_symm = mask[mask]
+        if self._scf.mol.symmetry:
+            # labeled as PySCF's Newton solver labels the spin orbitals
+            orbsym = ghf_symm.get_orbsym(self._scf.mol, self.mo_coeff)
+            sym_allow = orbsym[:, None] == orbsym
+            mask_symm = sym_allow[mask]
+            mask[mask] = mask_symm
+
+        return mask, mask_symm
+
+    # unpack matrix over the spin orbitals, of which there are twice as many as
+    # atomic orbitals
+    def unpack(self, kappa: np.ndarray) -> np.ndarray:
+        matrix = np.zeros(2 * (self.mo_coeff.shape[1],), dtype=np.float64)
+        matrix[self.mask] = kappa
+        return matrix - matrix.T
+
+
 def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     if isinstance(mf, SecondOrderOTR):
@@ -737,12 +777,26 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     assert isinstance(mf, scf.hf.SCF)
 
-    if mf.istype("ROHF"):
+    # the spinor classes of X2C carry the names of the nonrelativistic classes, but
+    # their orbitals are complex, as are those of every class not listed here, such as
+    # those with k-points or four-component ones
+    cls: Optional[type[SecondOrderOTR]] = None
+    if isinstance(mf, x2c.SCF):
+        pass
+    elif mf.istype("ROHF"):
         cls = ROHFOTR
     elif mf.istype("UHF"):
         cls = UHFOTR
-    else:
+    elif mf.istype("GHF"):
+        cls = GHFOTR
+    elif mf.istype("RHF"):
         cls = RHFOTR
+    if cls is None:
+        raise TypeError(
+            "mf_to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham "
+            "counterparts, also at the Gamma point of periodic systems, but not "
+            f"{type(mf).__module__}.{type(mf).__name__}."
+        )
 
     mf = lib.set_class(cls(mf), (cls, mf.__class__))
     if hasattr(mf, "stability") and callable(mf.stability):

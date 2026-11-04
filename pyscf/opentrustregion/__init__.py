@@ -10,6 +10,7 @@ from pyscf.opentrustregion.opentrustregion_interface import (
     RHFOTR,
     ROHFOTR,
     UHFOTR,
+    GHFOTR,
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,

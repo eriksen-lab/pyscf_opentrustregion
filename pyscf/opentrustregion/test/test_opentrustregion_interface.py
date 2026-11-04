@@ -17,11 +17,13 @@ from typing import Any, Dict, Generator, Tuple
 import numpy as np
 
 from pyscf import gto, scf, dft, lo, mcscf, lib
+from pyscf.pbc import gto as pbcgto, scf as pbcscf
 
 from pyscf.opentrustregion import (
     RHFOTR,
     ROHFOTR,
     UHFOTR,
+    GHFOTR,
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,
@@ -446,7 +448,7 @@ class SCFTests(unittest.TestCase):
         self.assertAlmostEqual(otr.e_tot, ref, 8)
 
         # the orbitals must remain a valid, orthonormal set in the AO basis
-        ovlp = otr.mol.intor_symmetric("int1e_ovlp")
+        ovlp = otr.get_ovlp()
         mo_coeff = np.asarray(otr.mo_coeff)
         if mo_coeff.ndim == 2:
             mo_coeff = mo_coeff[None]
@@ -464,8 +466,10 @@ class SCFTests(unittest.TestCase):
             (scf.RHF(mol), RHFOTR),
             (scf.ROHF(mol_open), ROHFOTR),
             (scf.UHF(mol_open), UHFOTR),
+            (scf.GHF(mol_open), GHFOTR),
             (dft.RKS(mol, xc="b3lyp"), RHFOTR),
             (dft.UKS(mol_open, xc="b3lyp"), UHFOTR),
+            (dft.GKS(mol_open, xc="b3lyp"), GHFOTR),
         ):
             with self.subTest(mf=mf_in.__class__.__name__):
                 otr = mf_to_otr(mf_in)
@@ -477,6 +481,31 @@ class SCFTests(unittest.TestCase):
     def test_mf_to_otr_is_idempotent(self) -> None:
         otr = mf_to_otr(scf.RHF(mol))
         self.assertIs(mf_to_otr(otr), otr)
+
+    def test_mf_to_otr_rejects_complex_orbitals(self) -> None:
+        # four-component and spinor X2C orbitals are complex, as are those at k-points,
+        # and the spinor X2C classes carry the names of the nonrelativistic ones
+        cell = pbcgto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            a=np.eye(3) * 4.0,
+            basis="gth-szv",
+            pseudo="gth-pade",
+            verbose=0,
+        )
+        for mf_in in (
+            scf.DHF(mol),
+            scf.X2C(mol),
+            pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1])),
+        ):
+            with self.subTest(mf=mf_in.__class__.__name__):
+                self.assertRaises(TypeError, mf_to_otr, mf_in)
+
+    def test_kernel_rejects_complex_orbitals(self) -> None:
+        # orbitals of a supported class become complex from a complex initial guess or
+        # a Hamiltonian with spin-orbit coupling, which real parameters can not rotate
+        dm = scf.GHF(mol_open).get_init_guess()
+        otr = mf_to_otr(scf.GHF(mol_open))
+        self.assertRaises(TypeError, otr.kernel, dm0=dm.astype(np.complex128))
 
     def test_mf_to_otr_stability_is_a_setting(self) -> None:
         # stability is a boolean solver setting, so the PySCF method of that name has
@@ -508,6 +537,52 @@ class SCFTests(unittest.TestCase):
 
     def test_uks(self) -> None:
         self._check(dft.UKS(mol_open, xc="b3lyp"), dft.UKS(mol_open, xc="b3lyp"))
+
+    def test_ghf(self) -> None:
+        self._check(scf.GHF(mol_open), scf.GHF(mol_open))
+
+    def test_ghf_with_symmetry(self) -> None:
+        mol_open_sym = mol_open.copy()
+        mol_open_sym.symmetry = True
+        mol_open_sym.build(False, False)
+        self._check(scf.GHF(mol_open_sym), scf.GHF(mol_open_sym))
+
+    def test_gks(self) -> None:
+        self._check(dft.GKS(mol_open, xc="b3lyp"), dft.GKS(mol_open, xc="b3lyp"))
+
+    def test_solvent_model(self) -> None:
+        self._check(scf.RHF(mol).ddCOSMO(), scf.RHF(mol).ddCOSMO())
+
+    def test_periodic_gamma_point(self) -> None:
+        cell = pbcgto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            a=np.eye(3) * 4.0,
+            basis="gth-szv",
+            pseudo="gth-pade",
+            verbose=0,
+        )
+        self._check(pbcscf.RHF(cell), pbcscf.RHF(cell))
+
+    def test_scanners_follow_the_geometry(self) -> None:
+        # a geometry optimization or a scan calls the kernel through a scanner, which
+        # hands it the density matrix of the previous geometry
+        mol_displaced = gto.M(
+            atom="O 0 0 0; H 0 -0.78 0.60; H 0 0.78 0.60", basis="6-31g", verbose=0
+        )
+        ref = scf.RHF(mol).newton().as_scanner()
+        otr = mf_to_otr(scf.RHF(mol)).as_scanner()
+        ref(mol)
+        otr(mol)
+        self.assertAlmostEqual(otr(mol_displaced), ref(mol_displaced), 8)
+
+        grad_ref = scf.RHF(mol).nuc_grad_method().as_scanner()
+        grad_otr = mf_to_otr(scf.RHF(mol)).nuc_grad_method().as_scanner()
+        grad_ref(mol)
+        grad_otr(mol)
+        e_ref, g_ref = grad_ref(mol_displaced)
+        e_otr, g_otr = grad_otr(mol_displaced)
+        self.assertAlmostEqual(e_otr, e_ref, 8)
+        self.assertAlmostEqual(abs(g_otr - g_ref).max(), 0.0, 5)
 
     def test_symmetry_restricts_the_parameter_count(self) -> None:
         # symmetry forbidden rotations must be excluded from the parameter vector
@@ -554,7 +629,7 @@ class SCFTests(unittest.TestCase):
     def test_kernel_from_a_given_density_matrix(self) -> None:
         ref = scf.RHF(mol).newton().kernel()
         otr = mf_to_otr(scf.RHF(mol))
-        e_tot = otr.kernel(dm=mf.make_rdm1())
+        e_tot = otr.kernel(dm0=mf.make_rdm1())
         self.assertAlmostEqual(e_tot, ref, 8)
 
     def test_repeated_zero_step_reuses_the_update(self) -> None:
@@ -608,7 +683,11 @@ class SCFTests(unittest.TestCase):
         self.assertGreater(otr.n_hess_x, 0)
 
     def test_derivatives_match_finite_differences(self) -> None:
-        check_derivatives_match_finite_differences(self, mf_to_otr(scf.RHF(mol)))
+        # the gradient and Hessian PySCF provides for GHF are doubled as those of the
+        # restricted classes are
+        for mf_in in (scf.RHF(mol), scf.GHF(mol_open)):
+            with self.subTest(cls=mf_in.__class__.__name__):
+                check_derivatives_match_finite_differences(self, mf_to_otr(mf_in))
 
     def test_large_rotation_is_rejected(self) -> None:
         check_large_rotation_is_rejected(self, mf_to_otr(scf.RHF(mol)))
