@@ -32,8 +32,10 @@ if TYPE_CHECKING:
     OTRHessX = Callable[[np.ndarray, np.ndarray], None]
 
 
-# fields of the settings structures that are not settings
-non_setting_fields = ("initialized", "context")
+# fields of the settings structures that are not settings of an object: the
+# initialization flag and the host context of the C structures, and the logging
+# function, which always writes to the PySCF log of the object
+non_setting_fields = ("initialized", "context", "logger")
 
 
 def setting_fields(settings_c: type[Structure]) -> list[str]:
@@ -93,6 +95,18 @@ def setting_is_assignable(obj: object, setting: str) -> bool:
     return setting != "conv_check" or not isinstance(getattr(obj, setting, None), bool)
 
 
+def assign_pyscf_logger(
+    obj: object, settings: Union[SolverSettings, StabilitySettings]
+) -> None:
+    """
+    this function hands the messages of the solver or the stability check to the PySCF
+    log of an object, so that its output and verbosity control them as they control
+    those of PySCF; the library hands on only the messages at its verbosity, which is
+    that of the object
+    """
+    settings.logger = lambda message: lib.logger.log(obj, "%s", message)
+
+
 def assign_stability_settings(
     obj: object, stability_settings: StabilitySettings
 ) -> None:
@@ -107,6 +121,7 @@ def assign_stability_settings(
                 setattr(stability_settings, setting, getattr(obj, alias))
         elif hasattr(obj, setting) and setting_is_assignable(obj, setting):
             setattr(stability_settings, setting, getattr(obj, setting))
+    assign_pyscf_logger(obj, stability_settings)
 
 
 def assign_solver_settings(obj: object, settings: SolverSettings) -> None:
@@ -120,6 +135,7 @@ def assign_solver_settings(obj: object, settings: SolverSettings) -> None:
                 setattr(settings, setting, getattr(obj, setting))
         elif hasattr(obj, setting) and setting_is_assignable(obj, setting):
             setattr(settings, setting, getattr(obj, setting))
+    assign_pyscf_logger(obj, settings)
     assign_stability_settings(obj, settings.stability_settings)
 
 

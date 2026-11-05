@@ -147,7 +147,9 @@ Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_op
 Solver settings are set as attributes on the converted object, using the names
 documented in the
 [OpenTrustRegion README](https://github.com/eriksen-lab/opentrustregion#usage).
-Anything left unset keeps the solver's own default.
+Anything left unset keeps the solver's own default. The solver writes its output to the
+PySCF log of the object, which `verbose` and the output file control as for PySCF's own
+output.
 
 ```python
 mf = mf_to_otr(scf.RHF(mol))

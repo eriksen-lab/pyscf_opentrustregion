@@ -303,7 +303,6 @@ class SettingsTests(unittest.TestCase):
         shared_on_purpose = {
             "precond",
             "project",
-            "logger",
             "hess_symm",
             "seed",
             "verbose",
@@ -433,6 +432,23 @@ class SettingsTests(unittest.TestCase):
         self.assertAlmostEqual(settings.conv_tol, 1e-4, 12)
         self.assertEqual(settings.n_iter, 17)
 
+    def test_messages_go_to_the_pyscf_log(self) -> None:
+        # the solver, its stability check and the stability check on its own write
+        # their messages to the PySCF log of the object
+        log = io.StringIO()
+        obj = DummySettingsHolder(stdout=log, verbose=lib.logger.WARN)
+        settings = SolverSettings()
+        assign_solver_settings(obj, settings)
+        stability_settings = StabilitySettings()
+        assign_stability_settings(obj, stability_settings)
+        for logger in (
+            settings.logger,
+            settings.stability_settings.logger,
+            stability_settings.logger,
+        ):
+            logger("message")
+        self.assertEqual(log.getvalue(), 3 * "message\n")
+
     def test_settings_are_recognized_keys(self) -> None:
         # PySCF warns about attributes it does not recognize, so every assignable
         # setting has to be registered on the class; PySCF collects the keys of every
@@ -465,7 +481,8 @@ class SettingsTests(unittest.TestCase):
 
     def test_kernel_returns_without_convergence(self) -> None:
         # like PySCF's own kernels, a kernel that runs out of macro iterations returns
-        # and reports that it did not converge, whereas other errors are raised
+        # and reports that it did not converge, which the solver also writes to the
+        # PySCF log, whereas other errors are raised
         def failing_conv_check() -> bool:
             raise ValueError
 
@@ -474,10 +491,11 @@ class SettingsTests(unittest.TestCase):
             BoysOTR(mol, occ_orbs),
             casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
         ):
-            with self.subTest(cls=type(obj).__name__):
+            with self.subTest(cls=type(obj).__name__), capture_warnings(obj) as log:
                 obj.n_macro = 1
                 obj.kernel()
                 self.assertFalse(obj.converged)
+                self.assertIn("has not converged", log.getvalue())
                 obj.conv_check = failing_conv_check
                 self.assertRaises(RuntimeError, obj.kernel)
 
