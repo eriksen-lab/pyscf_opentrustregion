@@ -1151,7 +1151,7 @@ class CASSCFTests(unittest.TestCase):
         n_param_orb, n_param_ci = {}, {}
         for mf_in in (mf, mf_sym):
             with self.subTest(symmetry=mf_in.mol.symmetry):
-                ref = mcscf.CASSCF(mf_in, 4, 4).run()
+                ref = mcscf.CASSCF(mf_in, 4, 4).run(conv_tol=1e-10)
                 mc = to_otr(mcscf.CASSCF(mf_in, 4, 4))
                 e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
                 self.assertAlmostEqual(e_tot, ref.e_tot, 7)
@@ -1201,7 +1201,7 @@ class CASSCFTests(unittest.TestCase):
                 ),
             ),
         ):
-            ref = average(mcscf.CASSCF(mf_in, 4, 4)).run()
+            ref = average(mcscf.CASSCF(mf_in, 4, 4)).run(conv_tol=1e-10)
             for order, mc in (
                 (
                     "conversion of the average",
