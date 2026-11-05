@@ -147,7 +147,6 @@ class OTR:
         + stability_setting_fields
         + list(stability_setting_aliases.values())
         + [
-            "_inherited_settings",
             "saved_func",
             "saved_grad",
             "saved_h_diag",
@@ -179,6 +178,10 @@ class OTR:
     # accumulated over its lifetime
     n_update_orbs = 0
     n_hess_x = 0
+
+    # the boolean stability setting of the solver shadows the stability() method of
+    # PySCF's mean-field and localizer classes; the equivalent is stability_check()
+    stability = False
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
@@ -333,7 +336,9 @@ class LocalizerOTR(OTR):
     mol: gto.Mole
     verbose: int
     init_guess: Optional[str]
+    pdim: int
     check_sanity: Callable[[], Any]
+    unpack_uniq_var: Callable[[np.ndarray], np.ndarray]
     cost_function: Callable[..., float]
     get_init_guess: Callable[..., np.ndarray]
     gen_g_hop: Callable[..., Tuple[np.ndarray, PySCFHessX, np.ndarray]]
@@ -346,26 +351,15 @@ class LocalizerOTR(OTR):
     # cost function itself needs this factor
     cost_sign = 1.0
 
-    # the boolean stability solver setting shadows the stability() method the PySCF
-    # localizers provide; the OTR equivalent is the stability_check() method
-    stability = False
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._snapshot_shadowed_settings()
-
-    # unpack matrix
-    def unpack(self, kappa: np.ndarray) -> np.ndarray:
-        matrix = np.zeros(2 * (self.norb,), dtype=np.float64)
-        idx = np.tril_indices(self.norb, -1)
-        matrix[idx] = kappa
-        return matrix - matrix.conj().T
 
     # cost function
     def _func(self, kappa: np.ndarray) -> float:
         if self._rotates_too_far(kappa):
             return np.inf
-        u = ciah.expmat(self.unpack(kappa))
+        u = ciah.expmat(self.unpack_uniq_var(kappa))
         return self.cost_sign * self.cost_function(u)
 
     # cost function, gradient, Hessian diagonal and Hessian linear transformation
@@ -376,7 +370,7 @@ class LocalizerOTR(OTR):
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the cost function and its derivatives still apply
         if np.any(kappa) or not self._cache_is_valid():
-            u = ciah.expmat(self.unpack(kappa))
+            u = ciah.expmat(self.unpack_uniq_var(kappa))
             self.saved_func = self.cost_function(u)
             (
                 self.saved_grad,
@@ -419,7 +413,7 @@ class LocalizerOTR(OTR):
         self.norb = self.mo_coeff.shape[1]
 
         # number of parameters
-        self.n_param = (self.norb - 1) * self.norb // 2
+        self.n_param = self.pdim
 
         # a single orbital leaves nothing to optimize
         if self.n_param == 0:
@@ -923,6 +917,7 @@ class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
 
     fix_phase = RHFOTR.fix_phase
     exp_mat = RHFOTR.exp_mat
+    unpack = RHFOTR.unpack
 
     # get indices of all occupied-virtual combinations of the spin orbitals
     def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -939,13 +934,6 @@ class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
             mask[mask] = mask_symm
 
         return mask, mask_symm
-
-    # unpack the rotations into an anti-Hermitian matrix over the spin orbitals, of
-    # which there are twice as many as atomic orbitals
-    def unpack(self, rotation: np.ndarray) -> np.ndarray:
-        matrix = np.zeros(2 * (self.mo_coeff.shape[1],), dtype=rotation.dtype)
-        matrix[self.mask] = rotation
-        return matrix - matrix.conj().T
 
 
 # Kramers-restricted X2C keeps every odd spinor the time reverse of the even one before
@@ -1037,7 +1025,7 @@ class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
 
     fix_phase = RHFOTR.fix_phase
     exp_mat = RHFOTR.exp_mat
-    unpack = GHFOTR.unpack
+    unpack = RHFOTR.unpack
 
     # get indices of all occupied-virtual combinations of the spinors, which
     # point-group symmetry can not restrict, since PySCF has no symmetry labels for
@@ -1073,9 +1061,6 @@ def _mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
         raise _unsupported(mf)
 
     mf_otr = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
-    if hasattr(mf_otr, "stability") and callable(mf_otr.stability):
-        mf_otr.stability = None
-
     mf_otr._snapshot_shadowed_settings()
 
     return mf_otr
