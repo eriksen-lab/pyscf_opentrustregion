@@ -574,6 +574,7 @@ class SCFTests(unittest.TestCase):
         self.assertTrue(otr.converged)
         self.assertAlmostEqual(e_tot, ref, 8)
         self.assertAlmostEqual(otr.e_tot, ref, 8)
+        self.assertEqual(lib.chkfile.load(otr.chkfile, "scf/e_tot"), e_tot)
 
         # the orbitals must remain a valid, orthonormal set in the AO basis
         ovlp = otr.get_ovlp()
@@ -1114,7 +1115,9 @@ class LocalizerTests(unittest.TestCase):
         self.assertGreater(loc.n_hess_x, 0)
 
     def test_derivatives_match_finite_differences(self) -> None:
-        check_derivatives_match_finite_differences(self, BoysOTR(mol, occ_orbs))
+        for cls, _, _ in self.localizers:
+            with self.subTest(cls=cls.__name__):
+                check_derivatives_match_finite_differences(self, cls(mol, occ_orbs))
 
     def test_large_rotation_is_rejected(self) -> None:
         check_large_rotation_is_rejected(self, BoysOTR(mol, occ_orbs))
@@ -1149,6 +1152,7 @@ class CASSCFTests(unittest.TestCase):
                 self.assertAlmostEqual(e_tot, ref.e_tot, 7)
                 self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
                 self.assertAlmostEqual(mc.e_tot, ref.e_tot, 7)
+                self.assertEqual(lib.chkfile.load(mc.chkfile, "mcscf/e_tot"), e_tot)
                 self.assertAlmostEqual(float(np.linalg.norm(np.ravel(ci))), 1.0, 9)
                 n_param_orb[mf_in.mol.symmetry] = mc.n_param_orb
                 n_param_ci[mf_in.mol.symmetry] = mc.n_param_ci

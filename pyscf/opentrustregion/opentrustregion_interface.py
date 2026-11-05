@@ -770,6 +770,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
         self.mo_energy, self.mo_coeff = self._canonicalize(fock)
 
+        # write the result to the chkfile as PySCF's kernel does, from the attributes
+        # that hold the values it passes
+        self.dump_chk(vars(self))
+
         self._finalize()
 
         # the parameters are set up anew for the orbitals the kernel returns, which a
@@ -1380,6 +1384,11 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             )
         else:
             self.mo_energy = None
+
+        # write the result to the chkfile as PySCF's kernel does, from the attributes
+        # that hold the values it passes and the active space density matrix
+        casdm1 = self.fcisolver.make_rdm1(self.ci, self.ncas, self.nelecas)
+        self.dump_chk({**vars(self), "casdm1": casdm1, "fcivec": self.ci})
 
         self._finalize()
 
