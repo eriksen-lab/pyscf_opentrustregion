@@ -214,12 +214,12 @@ def check_derivatives_match_finite_differences(
     # the difference formulas are limited by round off in the objective, so both are
     # compared relative to the value they approximate
     step = 1e-4
-    curvature = (
+    second_derivative = (
         obj._func(step * x)
         - 2 * obj._func(np.zeros(obj.n_param))
         + obj._func(-step * x)
     ) / step**2
-    test.assertLess(abs(x @ hx - curvature), 1e-4 * abs(curvature))
+    test.assertLess(abs(x @ hx - second_derivative), 1e-4 * abs(second_derivative))
 
 
 def check_large_rotation_is_rejected(test: unittest.TestCase, obj: Any) -> None:
@@ -251,6 +251,10 @@ def capture_warnings(obj: Any) -> Generator[io.StringIO, None, None]:
 
 
 def check_stability_shape(test: unittest.TestCase, obj: OTR) -> Tuple[bool, np.ndarray]:
+    """
+    this function runs the stability check of an object, checks that it returns a
+    boolean and a direction over the parameters and returns both for further checks
+    """
     stable, direction = obj.stability_check()
     test.assertIsInstance(stable, bool)
     test.assertIsInstance(direction, np.ndarray)
@@ -865,7 +869,8 @@ class SCFTests(unittest.TestCase):
     def test_complex_derivatives_match_finite_differences(self) -> None:
         # the real and imaginary parts of PySCF's gradient and Hessian are the
         # derivatives with respect to those of the rotations, doubled as for real
-        # orbitals; for ROHF, whose Hessian is approximate, only the gradient is compared
+        # orbitals; for ROHF, whose Hessian is approximate, only the gradient is
+        # compared
         for name, mf_in, kernel_args in (
             ("RHF", scf.RHF(mol), {"dm0": complex_guess(scf.RHF(mol))}),
             (
@@ -1045,7 +1050,7 @@ class LocalizerTests(unittest.TestCase):
     def test_localization_improves_the_objective(self) -> None:
         # a flipped cost_sign would drive each cost function the wrong way, which no
         # comparison against a converged PySCF result on its own would reveal
-        for cls, ref_cls, sign in self.localizers:
+        for cls, _, sign in self.localizers:
             with self.subTest(cls=cls.__name__):
                 loc = cls(mol, occ_orbs)
                 start = self._objective(cls, loc.mo_coeff, sign)

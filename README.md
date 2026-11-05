@@ -83,12 +83,12 @@ stable, direction = mf.stability_check()
 
 RHF, ROHF, UHF and GHF are supported, along with their KS counterparts and spinor X2C
 (`scf.X2C(mol)`), Kramers-restricted and unrestricted; the appropriate class is selected
-from the object that is passed in. Complex orbitals, as from a complex initial guess or with spin–orbit
-coupling (`scf.GHF(mol).x2c()`), are optimized through the real and imaginary parts of
-their rotations. Objects with a solvent model, such as `scf.RHF(mol).ddCOSMO()`, and
-periodic calculations at the Γ point are supported as well. The converted object also
-works in PySCF's scanners, which geometry optimizations and scans run, e.g. with
-geomeTRIC:
+from the object that is passed in. Complex orbitals, as from a complex initial guess or
+with spin–orbit coupling (`scf.GHF(mol).x2c()`), are optimized through the real and
+imaginary parts of their rotations. Objects with a solvent model, such as
+`scf.RHF(mol).ddCOSMO()`, and periodic calculations at the Γ point are supported as
+well. The converted object also works in PySCF's scanners, which geometry optimizations
+and scans run, e.g. with geomeTRIC:
 
 ```python
 from pyscf.geomopt.geometric_solver import optimize
