@@ -1,5 +1,5 @@
 from pyscf import gto, scf, mcscf
-from pyscf.opentrustregion import casscf_to_otr
+from pyscf.opentrustregion import to_otr
 
 # define molecule
 mol = gto.M(
@@ -15,7 +15,7 @@ mol = gto.M(
 mf = scf.RHF(mol).run()
 
 # run CASSCF calculation
-mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
+mc = to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
 
 # call stability check

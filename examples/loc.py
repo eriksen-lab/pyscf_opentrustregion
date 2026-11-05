@@ -1,9 +1,5 @@
-from pyscf import gto, scf
-from pyscf.opentrustregion import (
-    PipekMezeyOTR,
-    BoysOTR,
-    EdmistonRuedenbergOTR,
-)
+from pyscf import gto, scf, lo
+from pyscf.opentrustregion import to_otr
 
 # define molecule
 mol = gto.Mole()
@@ -27,7 +23,7 @@ orbs = [hf.mo_coeff[:, : min(mol.nelec)], hf.mo_coeff[:, max(mol.nelec) :]]
 
 # loop over occupied and virtual subspaces
 for mo_coeff in orbs:
-    loc = PipekMezeyOTR(mol, mo_coeff)
+    loc = to_otr(lo.PipekMezey(mol, mo_coeff))
     loc.line_search = True
 
     loc.kernel()
@@ -37,7 +33,7 @@ for mo_coeff in orbs:
 
 # loop over occupied and virtual subspaces
 for mo_coeff in orbs:
-    loc = BoysOTR(mol, mo_coeff)
+    loc = to_otr(lo.Boys(mol, mo_coeff))
     loc.line_search = True
 
     loc.kernel()
@@ -47,7 +43,7 @@ for mo_coeff in orbs:
 
 # loop over occupied and virtual subspaces
 for mo_coeff in orbs:
-    loc = EdmistonRuedenbergOTR(mol, mo_coeff)
+    loc = to_otr(lo.EdmistonRuedenberg(mol, mo_coeff))
     loc.line_search = True
 
     loc.kernel()
