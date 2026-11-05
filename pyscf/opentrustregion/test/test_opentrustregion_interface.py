@@ -566,7 +566,7 @@ class ConversionTests(unittest.TestCase):
 class SCFTests(unittest.TestCase):
     """
     tests for the Hartree-Fock and Kohn-Sham drivers: the converged energies, the
-    cached orbital updates, the derivatives and the stability check
+    derivatives and the stability check
     """
 
     def _check(
@@ -800,48 +800,6 @@ class SCFTests(unittest.TestCase):
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
 
-    def test_repeated_zero_step_reuses_the_update(self) -> None:
-        otr = to_otr(scf.RHF(mol))
-        otr.kernel()
-        grad, h_diag = grad_and_h_diag(otr)
-        zero = np.zeros(otr.n_param, dtype=np.float64)
-
-        # the kernel canonicalizes at the end, so the first request has to recompute
-        otr._update_orbs(zero, grad, h_diag)
-        n_after_first = otr.n_update_orbs
-
-        # a second request at the same point is served from the cache
-        func, _ = otr._update_orbs(zero, grad, h_diag)
-        self.assertEqual(otr.n_update_orbs, n_after_first)
-        self.assertAlmostEqual(func, otr.e_tot, 9)
-
-    def test_cache_is_invalidated_when_orbitals_move(self) -> None:
-        otr = to_otr(scf.RHF(mol))
-        otr.kernel()
-        grad, h_diag = grad_and_h_diag(otr)
-        zero = np.zeros(otr.n_param, dtype=np.float64)
-
-        otr._update_orbs(zero, grad, h_diag)
-        n_before = otr.n_update_orbs
-
-        # a zero step alone must not be taken as proof that nothing has changed
-        otr.mo_coeff = otr.mo_coeff.copy()
-        otr.mo_coeff[:, 0] *= -1.0
-        otr._update_orbs(zero, grad, h_diag)
-        self.assertEqual(otr.n_update_orbs, n_before + 1)
-
-    def test_nonzero_step_always_recomputes(self) -> None:
-        otr = to_otr(scf.RHF(mol))
-        otr.kernel()
-        grad, h_diag = grad_and_h_diag(otr)
-        step = np.zeros(otr.n_param, dtype=np.float64)
-        step[0] = 1e-3
-
-        otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
-        n_before = otr.n_update_orbs
-        otr._update_orbs(step, grad, h_diag)
-        self.assertEqual(otr.n_update_orbs, n_before + 1)
-
     def test_counters_record_the_work_done(self) -> None:
         otr = to_otr(scf.RHF(mol))
         self.assertEqual(otr.n_update_orbs, 0)
@@ -953,14 +911,11 @@ class SCFTests(unittest.TestCase):
     def test_stability_check_examines_the_current_occupations(self) -> None:
         # the check examines the density of the current occupations and their
         # occupied-virtual rotations, which with symmetry are those between orbitals of
-        # the same irrep, also when the occupations are assigned after the kernel and
-        # the update the kernel left is cached
+        # the same irrep, also when the occupations are assigned after the kernel
         for cls, molecule in product((scf.RHF, scf.ROHF), (mol, mol_sym)):
             with self.subTest(cls=cls.__name__, symmetry=molecule.symmetry):
                 otr = to_otr(cls(molecule))
                 otr.kernel()
-                grad, h_diag = grad_and_h_diag(otr)
-                otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
 
                 # move the highest occupied pair to the lowest virtual orbital
                 mo_occ = otr.mo_occ.copy()
@@ -970,11 +925,9 @@ class SCFTests(unittest.TestCase):
                 otr.mo_occ = mo_occ
                 check_stability_shape(self, otr)
 
-                # the update the check used is reused
-                n_update_orbs = otr.n_update_orbs
+                # the energy and the gradient are those of the current occupations
                 grad, h_diag = grad_and_h_diag(otr)
                 func, _ = otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
-                self.assertEqual(otr.n_update_orbs, n_update_orbs)
 
                 ref = cls(molecule)
                 dm = ref.make_rdm1(otr.mo_coeff, mo_occ)
@@ -1100,17 +1053,6 @@ class LocalizerTests(unittest.TestCase):
         stable, _ = check_stability_shape(self, loc)
         self.assertTrue(stable)
 
-    def test_repeated_zero_step_reuses_the_update(self) -> None:
-        loc = BoysOTR(mol, occ_orbs)
-        loc.kernel()
-        grad, h_diag = grad_and_h_diag(loc)
-        zero = np.zeros(loc.n_param, dtype=np.float64)
-
-        loc._update_orbs(zero, grad, h_diag)
-        n_before = loc.n_update_orbs
-        loc._update_orbs(zero, grad, h_diag)
-        self.assertEqual(loc.n_update_orbs, n_before)
-
     def test_counters_record_the_work_done(self) -> None:
         loc = BoysOTR(mol, occ_orbs)
         self.assertEqual(loc.n_update_orbs, 0)
@@ -1135,8 +1077,8 @@ class LocalizerTests(unittest.TestCase):
 
 class CASSCFTests(unittest.TestCase):
     """
-    tests for the CASSCF driver: the active space, the converged energy, the cached
-    updates, the derivatives and the stability check
+    tests for the CASSCF driver: the active space, the converged energy, the
+    derivatives and the stability check
     """
 
     def test_conversion_preserves_the_active_space(self) -> None:
@@ -1231,27 +1173,6 @@ class CASSCFTests(unittest.TestCase):
             0.0,
             8,
         )
-
-    def test_cache_notices_a_changed_ci_vector(self) -> None:
-        # for CASSCF the cached update describes a point in the orbitals and the CI
-        # vector both, so moving only the CI vector has to invalidate it
-        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
-        mc.kernel()
-        grad, h_diag = grad_and_h_diag(mc)
-        zero = np.zeros(mc.n_param, dtype=np.float64)
-
-        # the kernel canonicalizes, so the first request recomputes and the second is
-        # served from the cache
-        mc._update_orbs(zero, grad, h_diag)
-        n_before = mc.n_update_orbs
-        mc._update_orbs(zero, grad, h_diag)
-        self.assertEqual(mc.n_update_orbs, n_before)
-
-        ci = np.array(mc.ci, copy=True)
-        ci[0] = -ci[0]
-        mc.ci = ci / np.linalg.norm(ci)
-        mc._update_orbs(zero, grad, h_diag)
-        self.assertEqual(mc.n_update_orbs, n_before + 1)
 
     def test_counters_record_the_work_done(self) -> None:
         mc = to_otr(mcscf.CASSCF(mf, 4, 4))
