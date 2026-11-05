@@ -21,6 +21,7 @@ import scipy.linalg
 from pyscf import gto, scf, dft, fci, lo, mcscf, lib
 from pyscf.pbc import gto as pbcgto, scf as pbcscf
 from pyscf.scf import dhf
+from pyscf.tools import mo_mapping
 from pyscf.x2c import x2c
 
 from pyscf.opentrustregion import to_otr
@@ -1077,6 +1078,12 @@ class LocalizerTests(unittest.TestCase):
                     abs(mo_loc @ mo_loc.T - occ_orbs @ occ_orbs.T).max(),
                     0.0,
                     8,
+                )
+                # each localized orbital is closest to the input orbital of the same
+                # index, as PySCF sorts them
+                overlap = occ_orbs.T @ ovlp @ mo_loc
+                self.assertEqual(
+                    mo_mapping.mo_1to1map(overlap), list(range(overlap.shape[1]))
                 )
 
     def test_single_orbital_is_returned_unchanged(self) -> None:

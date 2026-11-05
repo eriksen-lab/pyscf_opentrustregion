@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 from pyscf import gto, scf, lo, lib
+from pyscf.tools import mo_mapping
 from pyscf.scf import hf_symm, uhf_symm, ghf_symm
 from pyscf.soscf import ciah, newton_ah
 from pyscf.x2c import x2c
@@ -268,6 +269,18 @@ class OTR:
             if f"(code {error_solver_max_iter})" not in str(error):
                 raise
 
+    def _warn_on_callback(self, callback: Optional[Callable[..., None]]) -> None:
+        """
+        this function warns that a callback for PySCF's kernels is ignored, since it
+        reads local variables of those kernels, which the solver does not have
+        """
+        if callback is not None:
+            lib.logger.warn(
+                self,
+                "The callback is ignored, since it reads local variables of PySCF's "
+                "kernel, which OpenTrustRegion does not have.",
+            )
+
     # stability check function
     def stability_check(self) -> Tuple[bool, np.ndarray]:
         # without parameters, as when symmetry forbids every rotation, there is no
@@ -384,7 +397,16 @@ class LocalizerOTR(OTR):
         return self.cost_sign * self.saved_func, hess_x
 
     # kernel function
-    def kernel(self, mo_coeff: Optional[np.ndarray] = None) -> np.ndarray:
+    def kernel(
+        self,
+        mo_coeff: Optional[np.ndarray] = None,
+        callback: Optional[Callable[..., None]] = None,
+        verbose: Optional[int] = None,
+    ) -> np.ndarray:
+        # a verbosity passed to the kernel holds for its run
+        if verbose is not None:
+            with lib.temporary_env(self, verbose=verbose):
+                return self.kernel(mo_coeff, callback)
 
         # set MO coefficients if provided
         if mo_coeff is not None:
@@ -408,6 +430,10 @@ class LocalizerOTR(OTR):
         # PySCF's kernel does
         if self.verbose >= lib.logger.WARN:
             self.check_sanity()
+        self._warn_on_callback(callback)
+
+        # the input orbitals, against which the localized orbitals are sorted
+        mo_in = self.mo_coeff
 
         # get initial guess
         if mo_coeff is None:
@@ -422,6 +448,11 @@ class LocalizerOTR(OTR):
 
         # call solver
         self._solve()
+
+        # sort the localized orbitals as PySCF does, so that each is closest to the
+        # input orbital of the same index
+        u = np.linalg.lstsq(mo_in, self.mo_coeff, rcond=None)[0]
+        self.mo_coeff = self.mo_coeff[:, mo_mapping.mo_1to1map(u)]
 
         return self.mo_coeff
 
@@ -675,6 +706,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # the energy and the gradient are evaluated with the options of the wrapped
         # object, whereas the Hessian is evaluated with those of this object
         self._warn_on_differing_energy_options()
+        self._warn_on_callback(self.callback)
 
         mol = self._scf.mol
 
@@ -1273,6 +1305,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         mo_coeff: Optional[np.ndarray] = None,
         ci0: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
         callback: Optional[Callable[..., None]] = None,
+        _kern: Any = None,
     ) -> Tuple[
         Optional[float],
         Optional[float],
@@ -1291,6 +1324,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             self.mo_coeff = mo_coeff
         if callback is None:
             callback = self.callback
+        self._warn_on_callback(callback)
 
         if ci0 is None:
             ci0 = self.ci
