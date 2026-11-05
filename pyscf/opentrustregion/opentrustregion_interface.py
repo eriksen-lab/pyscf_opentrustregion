@@ -147,11 +147,6 @@ class OTR:
         + stability_setting_fields
         + list(stability_setting_aliases.values())
         + [
-            "saved_func",
-            "saved_grad",
-            "saved_h_diag",
-            "saved_hess_x",
-            "saved_state",
             "n_update_orbs",
             "n_hess_x",
             "n_param",
@@ -168,11 +163,11 @@ class OTR:
 
     # cached result of the last orbital update, reused when the solver asks for the
     # same point again, together with the point it was computed at
-    saved_func: float
-    saved_grad: np.ndarray
-    saved_h_diag: np.ndarray
-    saved_hess_x: PySCFHessX
-    saved_state: Optional[Tuple[np.ndarray, ...]] = None
+    _saved_func: float
+    _saved_grad: np.ndarray
+    _saved_h_diag: np.ndarray
+    _saved_hess_x: PySCFHessX
+    _saved_state: Optional[Tuple[np.ndarray, ...]] = None
 
     # orbital updates and Hessian linear transformations performed on this object,
     # accumulated over its lifetime
@@ -196,12 +191,12 @@ class OTR:
         current point. A zero step alone is not enough, since a kernel can move the
         orbitals after the solver has returned, for instance by canonicalizing them
         """
-        if self.saved_state is None:
+        if self._saved_state is None:
             return False
         state = self._orbs_state()
-        return len(state) == len(self.saved_state) and all(
+        return len(state) == len(self._saved_state) and all(
             np.array_equal(saved, current)
-            for saved, current in zip(self.saved_state, state)
+            for saved, current in zip(self._saved_state, state)
         )
 
     def _save_orbs_state(self) -> None:
@@ -209,9 +204,9 @@ class OTR:
         this function records the point a cached orbital update was computed at, as
         copies, since the orbitals are also updated in place
         """
-        self.saved_state = tuple(np.copy(array) for array in self._orbs_state())
+        self._saved_state = tuple(np.copy(array) for array in self._orbs_state())
 
-    def _snapshot_shadowed_settings(self) -> None:
+    def _record_inherited_settings(self) -> None:
         """
         this function records the settings whose names PySCF also uses as inherited
         from PySCF until they are assigned; it must run after any copying of another
@@ -353,7 +348,7 @@ class LocalizerOTR(OTR):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._snapshot_shadowed_settings()
+        self._record_inherited_settings()
 
     # cost function
     def _func(self, kappa: np.ndarray) -> float:
@@ -371,24 +366,24 @@ class LocalizerOTR(OTR):
         # orbitals since, so the cost function and its derivatives still apply
         if np.any(kappa) or not self._cache_is_valid():
             u = ciah.expmat(self.unpack_uniq_var(kappa))
-            self.saved_func = self.cost_function(u)
+            self._saved_func = self.cost_function(u)
             (
-                self.saved_grad,
-                self.saved_hess_x,
-                self.saved_h_diag,
+                self._saved_grad,
+                self._saved_hess_x,
+                self._saved_h_diag,
             ) = self.gen_g_hop(u)
             self.mo_coeff = self.mo_coeff @ u
             self.n_update_orbs += 1
             self._save_orbs_state()
 
-        grad[:] = self.saved_grad
-        h_diag[:] = self.saved_h_diag
+        grad[:] = self._saved_grad
+        h_diag[:] = self._saved_h_diag
 
         def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
-            hx[:] = self.saved_hess_x(x)
+            hx[:] = self._saved_hess_x(x)
             self.n_hess_x += 1
 
-        return self.cost_sign * self.saved_func, hess_x
+        return self.cost_sign * self._saved_func, hess_x
 
     # kernel function
     def kernel(
@@ -482,7 +477,7 @@ def _localizer_to_otr(loc: Any) -> LocalizerOTR:
     """
     loc_otr = localizer_drivers[type(loc)](loc.mol, loc.mo_coeff)
     loc_otr.__dict__.update(loc.__dict__)
-    loc_otr._snapshot_shadowed_settings()
+    loc_otr._record_inherited_settings()
 
     return loc_otr
 
@@ -523,7 +518,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def __init__(self, mf: scf.SCF) -> None:
         self.__dict__.update(mf.__dict__)
         self._scf = mf
-        self._snapshot_shadowed_settings()
+        self._record_inherited_settings()
 
     def _warn_on_differing_energy_options(self) -> None:
         """
@@ -557,7 +552,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         complex, so that their real and imaginary parts are the parameters
         """
         self.complex_orbitals = bool(np.iscomplexobj(self.mo_coeff))
-        self.mask, self.mask_symm = self.get_indices()
+        self.mask, self.mask_symm = self._get_indices()
         self.n_param = (1 + self.complex_orbitals) * int(
             np.count_nonzero(self.mask_symm)
         )
@@ -587,7 +582,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         this function returns the vector over the occupied-virtual pairs of PySCF's
         derivatives that the rotations correspond to
         """
-        full = np.zeros(self.mask_symm.shape, dtype=self.saved_grad.dtype)
+        full = np.zeros(self.mask_symm.shape, dtype=self._saved_grad.dtype)
         full[self.mask_symm] = rotation
         return full
 
@@ -617,7 +612,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         rotation = self._rotation(kappa)
         if self._rotates_too_far(rotation):
             return np.inf
-        u = self.exp_mat(self.unpack(rotation))
+        u = self._exp_mat(self._unpack(rotation))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
         vhf = self._scf.get_veff(self._scf.mol, dm)
@@ -634,18 +629,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # reuse the cached update when the step is zero and nothing has moved the
         # orbitals since, so the effective potential and Fock matrix need not be rebuilt
         if np.any(kappa) or not self._cache_is_valid():
-            u = self.exp_mat(self.unpack(self._rotation(kappa)))
+            u = self._exp_mat(self._unpack(self._rotation(kappa)))
             self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
             dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
             vhf = self._scf.get_veff(self._scf.mol, dm)
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
             (
-                self.saved_grad,
-                self.saved_hess_x,
-                self.saved_h_diag,
+                self._saved_grad,
+                self._saved_hess_x,
+                self._saved_h_diag,
             ) = self.gen_g_hop(self.mo_coeff, self.mo_occ, fock)
-            self.saved_func = self._scf.energy_tot(dm, self.h1e, vhf)
+            self._saved_func = self._scf.energy_tot(dm, self.h1e, vhf)
             self.n_update_orbs += 1
             self._save_orbs_state()
 
@@ -653,16 +648,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # for complex orbitals, the real and imaginary parts of the gradient are the
         # derivatives with respect to the real and imaginary parts of the rotations,
         # which share the diagonal of the Hessian
-        grad[:] = 2 * self._parameters(self._restrict(self.saved_grad))
-        h_diag_rotations = self._restrict_diagonal(self.saved_h_diag)
+        grad[:] = 2 * self._parameters(self._restrict(self._saved_grad))
+        h_diag_rotations = self._restrict_diagonal(self._saved_h_diag)
         h_diag[:] = 2 * np.tile(h_diag_rotations, 1 + self.complex_orbitals)
 
         def hess_x_symm(x: np.ndarray, hx: np.ndarray) -> None:
             x_full = self._embed(self._rotation(x))
-            hx[:] = 2 * self._parameters(self._restrict(self.saved_hess_x(x_full)))
+            hx[:] = 2 * self._parameters(self._restrict(self._saved_hess_x(x_full)))
             self.n_hess_x += 1
 
-        return self.saved_func, hess_x_symm
+        return self._saved_func, hess_x_symm
 
     # kernel function
     def kernel(
@@ -743,7 +738,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self.mo_coeff, self.mo_occ = np.array(mo_coeff), mo_occ
 
         # fix phases of MO coefficients to improve deterministic behavior
-        self.fix_phase()
+        self._fix_phase()
 
         # get the parameters, the occupied-virtual rotations, which are complex for
         # complex orbitals
@@ -811,7 +806,7 @@ def unit_phases(values: np.ndarray) -> np.ndarray:
 class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
     # fix phases of MO coefficients to improve deterministic behavior
-    def fix_phase(self) -> None:
+    def _fix_phase(self) -> None:
         abs_mo_coeff = np.abs(self.mo_coeff)
         max_mo_coeff = np.max(abs_mo_coeff, axis=0)
         mask = np.isclose(abs_mo_coeff, max_mo_coeff, atol=1e-12)
@@ -821,7 +816,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         self.mo_coeff *= unit_phases(vals).conj()[np.newaxis, :]
 
     # get indices of all mixed occupation combinations
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         occidxa = self.mo_occ > 0
         occidxb = self.mo_occ == 2
         viridxa = ~occidxa
@@ -841,11 +836,11 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         return mask, mask_symm
 
     # function to compute exponential of anti-symmetric matrix
-    def exp_mat(self, matrix: np.ndarray) -> np.ndarray:
+    def _exp_mat(self, matrix: np.ndarray) -> np.ndarray:
         return ciah.expmat(matrix)
 
     # unpack the rotations into an anti-Hermitian matrix over the orbitals
-    def unpack(self, rotation: np.ndarray) -> np.ndarray:
+    def _unpack(self, rotation: np.ndarray) -> np.ndarray:
         matrix = np.zeros(2 * (self.mo_coeff.shape[1],), dtype=rotation.dtype)
         matrix[self.mask] = rotation
         return matrix - matrix.conj().T
@@ -858,16 +853,16 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 # like PySCF's own, is approximate with those releases
 class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
 
-    fix_phase = RHFOTR.fix_phase
-    get_indices = RHFOTR.get_indices
-    exp_mat = RHFOTR.exp_mat
-    unpack = RHFOTR.unpack
+    _fix_phase = RHFOTR._fix_phase
+    _get_indices = RHFOTR._get_indices
+    _exp_mat = RHFOTR._exp_mat
+    _unpack = RHFOTR._unpack
 
 
 class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
     # fix phases of MO coefficients to improve deterministic behavior
-    def fix_phase(self) -> None:
+    def _fix_phase(self) -> None:
         abs_mo_coeff = np.abs(self.mo_coeff)
         max_mo_coeff = np.max(abs_mo_coeff, axis=1)
         for i in range(2):
@@ -878,7 +873,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             self.mo_coeff[i] *= unit_phases(vals).conj()[np.newaxis, :]
 
     # get indices of all mixed occupation combinations
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         occidxa = self.mo_occ[0] == 1
         occidxb = self.mo_occ[1] == 1
         viridxa = ~occidxa
@@ -898,11 +893,11 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         return mask, mask_symm
 
     # function to compute exponential of anti-symmetric matrix
-    def exp_mat(self, matrix: List[np.ndarray]) -> List[np.ndarray]:
+    def _exp_mat(self, matrix: List[np.ndarray]) -> List[np.ndarray]:
         return [ciah.expmat(matrix[0]), ciah.expmat(matrix[1])]
 
     # unpack the rotations into an anti-Hermitian matrix over the orbitals of each spin
-    def unpack(self, rotation: np.ndarray) -> List[np.ndarray]:
+    def _unpack(self, rotation: np.ndarray) -> List[np.ndarray]:
         n_param_a = np.count_nonzero(self.mask[0])
         matrices = [
             np.zeros(2 * (mo_coeff.shape[1],), dtype=rotation.dtype)
@@ -915,12 +910,12 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
 class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
 
-    fix_phase = RHFOTR.fix_phase
-    exp_mat = RHFOTR.exp_mat
-    unpack = RHFOTR.unpack
+    _fix_phase = RHFOTR._fix_phase
+    _exp_mat = RHFOTR._exp_mat
+    _unpack = RHFOTR._unpack
 
     # get indices of all occupied-virtual combinations of the spin orbitals
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         occidx = self.mo_occ > 0
         viridx = ~occidx
         mask = viridx[:, None] & occidx
@@ -946,11 +941,11 @@ class GHFOTR(SecondOrderOTR, newton_ah._SecondOrderGHF):
 # pairs only for real rotations
 class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
 
-    exp_mat = RHFOTR.exp_mat
+    _exp_mat = RHFOTR._exp_mat
 
     # fix phases of MO coefficients to improve deterministic behavior, giving the
     # partner of every even spinor the conjugate phase, which keeps it its time reverse
-    def fix_phase(self) -> None:
+    def _fix_phase(self) -> None:
         even = self.mo_coeff[:, ::2]
         abs_even = np.abs(even)
         mask = np.isclose(abs_even, np.max(abs_even, axis=0), atol=1e-12)
@@ -961,7 +956,7 @@ class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
 
     # get indices of all combinations of a virtual and an occupied Kramers pair, each
     # of which has the rotations A and C
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         occ_pairs = self.mo_occ[::2] > 0
         mask = ~occ_pairs[:, None] & occ_pairs
         return mask, np.ones(2 * int(np.count_nonzero(mask)), dtype=bool)
@@ -984,7 +979,7 @@ class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
         return block
 
     # unpack the rotations into an anti-Hermitian matrix over the spinors
-    def unpack(self, rotation: np.ndarray) -> np.ndarray:
+    def _unpack(self, rotation: np.ndarray) -> np.ndarray:
         occidx = self.mo_occ > 0
         matrix = np.zeros(2 * (self.mo_occ.size,), dtype=rotation.dtype)
         matrix[np.ix_(~occidx, occidx)] = self._vo_block(rotation)
@@ -1023,14 +1018,14 @@ class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
 
 class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
 
-    fix_phase = RHFOTR.fix_phase
-    exp_mat = RHFOTR.exp_mat
-    unpack = RHFOTR.unpack
+    _fix_phase = RHFOTR._fix_phase
+    _exp_mat = RHFOTR._exp_mat
+    _unpack = RHFOTR._unpack
 
     # get indices of all occupied-virtual combinations of the spinors, which
     # point-group symmetry can not restrict, since PySCF has no symmetry labels for
     # spinors
-    def get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         occidx = self.mo_occ > 0
         viridx = ~occidx
         mask = viridx[:, None] & occidx
@@ -1061,7 +1056,7 @@ def _mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
         raise _unsupported(mf)
 
     mf_otr = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
-    mf_otr._snapshot_shadowed_settings()
+    mf_otr._record_inherited_settings()
 
     return mf_otr
 
@@ -1094,10 +1089,10 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         self.mo_energy = self._scf.mo_energy
         self.converged = False
         self._max_stepsize = None
-        self._snapshot_shadowed_settings()
+        self._record_inherited_settings()
 
     @staticmethod
-    def ci_vectors(ci: Union[np.ndarray, List[np.ndarray]]) -> List[np.ndarray]:
+    def _ci_vectors(ci: Union[np.ndarray, List[np.ndarray]]) -> List[np.ndarray]:
         """
         this function returns the CI vectors as a list
         """
@@ -1112,7 +1107,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         average over several CI solvers, each solves for its own states, whose CI
         vectors belong to the space of that solver, independently of the others
         """
-        vectors = [np.ravel(c) for c in self.ci_vectors(ci)]
+        vectors = [np.ravel(c) for c in self._ci_vectors(ci)]
         if not isinstance(self.fcisolver, addons.StateAverageMixFCISolver):
             return [(self.fcisolver, self.nelecas, np.array(vectors))]
 
@@ -1178,7 +1173,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             start += states.size
         return np.concatenate(parts)
 
-    def displaced_ci(self, x: np.ndarray) -> Union[np.ndarray, List[np.ndarray]]:
+    def _displaced_ci(self, x: np.ndarray) -> Union[np.ndarray, List[np.ndarray]]:
         """
         this function applies the CI part of a step to the current CI vectors, giving
         the CI vectors the energy and its derivatives are both evaluated at; the
@@ -1199,7 +1194,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             start += states.size
         return displaced[0] if isinstance(self.ci, np.ndarray) else displaced
 
-    def eigenstates(
+    def _eigenstates(
         self, mo_coeff: np.ndarray, ci: Union[np.ndarray, List[np.ndarray]], eris: Any
     ) -> Tuple[float, List[np.ndarray]]:
         """
@@ -1242,10 +1237,10 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         eris = self.ao2mo(rot_mo_coeff)
 
-        return self.eigenstates(rot_mo_coeff, self.displaced_ci(x), eris)[0]
+        return self._eigenstates(rot_mo_coeff, self._displaced_ci(x), eris)[0]
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
-        return (self.mo_coeff, *self.ci_vectors(self.ci))
+        return (self.mo_coeff, *self._ci_vectors(self.ci))
 
     # energy, gradient, Hessian diagonal and Hessian linear transformation function
     def _update_orbs(
@@ -1260,16 +1255,16 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
             # the states move on as the eigenstates within the space the displaced CI
             # vectors span, at which gen_g_hop's derivatives are those of the energy
-            self.saved_func, states = self.eigenstates(
-                self.mo_coeff, self.displaced_ci(x), eris
+            self._saved_func, states = self._eigenstates(
+                self.mo_coeff, self._displaced_ci(x), eris
             )
             self.ci = states[0] if isinstance(self.ci, np.ndarray) else states
 
             (
-                self.saved_grad,
+                self._saved_grad,
                 _,
-                self.saved_hess_x,
-                self.saved_h_diag,
+                self._saved_hess_x,
+                self._saved_h_diag,
             ) = newton_casscf.gen_g_hop(self, self.mo_coeff, self.ci, eris)
             self.n_update_orbs += 1
             self._save_orbs_state()
@@ -1279,15 +1274,15 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         # whereas the steps are orthogonal to all states of its CI solver; its CI
         # gradient is orthogonal to all of them already, since the states are
         # eigenstates within the space they span
-        grad[:] = self._restrict(self.saved_grad)
-        h_diag[:] = self._restrict(self.saved_h_diag)
+        grad[:] = self._restrict(self._saved_grad)
+        h_diag[:] = self._restrict(self._saved_h_diag)
 
         def hess_x(x: np.ndarray, hx: np.ndarray) -> None:
             x_full = self._orthogonal_ci(self._embed(x))
-            hx[:] = self._restrict(self._orthogonal_ci(self.saved_hess_x(x_full)))
+            hx[:] = self._restrict(self._orthogonal_ci(self._saved_hess_x(x_full)))
             self.n_hess_x += 1
 
-        return self.saved_func, hess_x
+        return self._saved_func, hess_x
 
     def kernel(
         self,
@@ -1400,7 +1395,7 @@ def _casscf_to_otr(casscf: mc1step.CASSCF) -> CASSCFOTR:
         CASSCFOTR.__name__,
     )
     casscf_otr.__dict__.update(casscf.__dict__)
-    casscf_otr._snapshot_shadowed_settings()
+    casscf_otr._record_inherited_settings()
 
     # the state average is applied with the symmetry of the wave functions, as PySCF's
     # newton() applies it

@@ -278,7 +278,7 @@ class DummySettingsHolder(OTR):
         before the user gets to see the object
         """
         self.__dict__.update(kwargs)
-        self._snapshot_shadowed_settings()
+        self._record_inherited_settings()
         return self
 
 
