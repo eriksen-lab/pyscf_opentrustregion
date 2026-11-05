@@ -389,21 +389,24 @@ class LocalizerOTR(OTR):
         if mo_coeff is not None:
             self.mo_coeff = np.asarray(mo_coeff, order="C")
 
-        # ensure MO coefficients are provided and orbitals can be optimized
+        # ensure MO coefficients are provided
         assert self.mo_coeff is not None
-        if self.mo_coeff.shape[1] <= 1:
-            return self.mo_coeff
-
-        # warn about attributes no class registers, such as misspelled settings, as
-        # PySCF's kernel does
-        if self.verbose >= lib.logger.WARN:
-            self.check_sanity()
 
         # number of orbitals
         self.norb = self.mo_coeff.shape[1]
 
         # number of parameters
         self.n_param = (self.norb - 1) * self.norb // 2
+
+        # a single orbital leaves nothing to optimize
+        if self.n_param == 0:
+            self.converged = True
+            return self.mo_coeff
+
+        # warn about attributes no class registers, such as misspelled settings, as
+        # PySCF's kernel does
+        if self.verbose >= lib.logger.WARN:
+            self.check_sanity()
 
         # get initial guess
         if mo_coeff is None:
@@ -994,23 +997,22 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
     if isinstance(mf, SecondOrderOTR):
         return mf
 
-    assert isinstance(mf, scf.hf.SCF)
-
     # the spinor classes of X2C carry the names of the nonrelativistic classes, so they
     # are told apart by their type first, and an ROHF class also carries the name of
-    # RHF, from which it derives; the four-component classes and those with k-points
-    # are not supported
+    # RHF, from which it derives; the four-component classes, those with k-points and
+    # objects other than mean-field ones are not supported
     cls: Optional[type[SecondOrderOTR]] = None
-    if isinstance(mf, x2c.RHF):
-        cls = X2CRHFOTR
-    elif isinstance(mf, x2c.UHF):
-        cls = X2CUHFOTR
-    elif mf.istype("RHF"):
-        cls = ROHFOTR if mf.istype("ROHF") else RHFOTR
-    elif mf.istype("UHF"):
-        cls = UHFOTR
-    elif mf.istype("GHF"):
-        cls = GHFOTR
+    if isinstance(mf, scf.hf.SCF):
+        if isinstance(mf, x2c.RHF):
+            cls = X2CRHFOTR
+        elif isinstance(mf, x2c.UHF):
+            cls = X2CUHFOTR
+        elif mf.istype("RHF"):
+            cls = ROHFOTR if mf.istype("ROHF") else RHFOTR
+        elif mf.istype("UHF"):
+            cls = UHFOTR
+        elif mf.istype("GHF"):
+            cls = GHFOTR
     if cls is None:
         raise TypeError(
             "mf_to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham "
@@ -1262,7 +1264,12 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         np.ndarray,
         Optional[np.ndarray],
     ]:
+        # the SCF object is run first if there are no orbitals yet, as PySCF's kernel
+        # does
         if mo_coeff is None:
+            if self.mo_coeff is None and self._scf.mol.nelectron > 0:
+                self._scf.run()
+                self.mo_coeff = self._scf.mo_coeff
             mo_coeff = self.mo_coeff
         else:
             self.mo_coeff = mo_coeff
@@ -1332,6 +1339,12 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
     if isinstance(casscf, CASSCFOTR):
         return casscf
+
+    if not isinstance(casscf, mc1step.CASSCF):
+        raise TypeError(
+            "casscf_to_otr supports CASSCF, also state-averaged and with point-group "
+            f"symmetry, but not {type(casscf).__module__}.{type(casscf).__name__}."
+        )
 
     if not isinstance(casscf, newton_casscf.CASSCF):
         casscf = casscf.newton()

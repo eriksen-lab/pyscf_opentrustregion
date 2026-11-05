@@ -561,7 +561,8 @@ class SCFTests(unittest.TestCase):
         self.assertIs(mf_to_otr(otr), otr)
 
     def test_mf_to_otr_rejects_unsupported_classes(self) -> None:
-        # neither four-component calculations nor those at k-points are supported
+        # neither four-component calculations nor those at k-points are supported, nor
+        # objects other than mean-field ones
         cell = pbcgto.M(
             atom="H 0 0 0; H 0 0 0.74",
             a=np.eye(3) * 4.0,
@@ -569,7 +570,11 @@ class SCFTests(unittest.TestCase):
             pseudo="gth-pade",
             verbose=0,
         )
-        for mf_in in (scf.DHF(mol), pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1]))):
+        for mf_in in (
+            scf.DHF(mol),
+            pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1])),
+            mcscf.CASSCF(mf, 4, 4),
+        ):
             with self.subTest(mf=mf_in.__class__.__name__):
                 self.assertRaises(TypeError, mf_to_otr, mf_in)
 
@@ -1063,10 +1068,12 @@ class LocalizerTests(unittest.TestCase):
                 )
 
     def test_single_orbital_is_returned_unchanged(self) -> None:
+        # without any rotation, the orbital also counts as stable
         one_orb = occ_orbs[:, :1]
-        self.assertAlmostEqual(
-            abs(BoysOTR(mol, one_orb).kernel() - one_orb).max(), 0.0, 12
-        )
+        loc = BoysOTR(mol, one_orb)
+        self.assertAlmostEqual(abs(loc.kernel() - one_orb).max(), 0.0, 12)
+        stable, _ = check_stability_shape(self, loc)
+        self.assertTrue(stable)
 
     def test_repeated_zero_step_reuses_the_update(self) -> None:
         loc = BoysOTR(mol, occ_orbs)
@@ -1114,6 +1121,13 @@ class CASSCFTests(unittest.TestCase):
     def test_casscf_to_otr_is_idempotent(self) -> None:
         mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
         self.assertIs(casscf_to_otr(mc), mc)
+
+    def test_casscf_to_otr_rejects_unsupported_classes(self) -> None:
+        # CASCI optimizes no orbitals and PySCF has no second-order solver for
+        # unrestricted CASSCF
+        for mc_in in (mcscf.CASCI(mf, 4, 4), mcscf.UCASSCF(scf.UHF(mol_open), 4, 4)):
+            with self.subTest(mc=mc_in.__class__.__name__):
+                self.assertRaises(TypeError, casscf_to_otr, mc_in)
 
     def test_casscf_energy(self) -> None:
         # with symmetry, the parameters are the rotations between orbitals of the same
