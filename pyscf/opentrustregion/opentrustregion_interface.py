@@ -317,7 +317,9 @@ class LocalizerOTR(OTR):
 
     # supplied by the pyscf.lo class this driver is combined with
     mol: gto.Mole
+    verbose: int
     init_guess: Optional[str]
+    check_sanity: Callable[[], Any]
     cost_function: Callable[..., float]
     get_init_guess: Callable[..., np.ndarray]
     gen_g_hop: Callable[..., Tuple[np.ndarray, PySCFHessX, np.ndarray]]
@@ -387,10 +389,15 @@ class LocalizerOTR(OTR):
         if mo_coeff is not None:
             self.mo_coeff = np.asarray(mo_coeff, order="C")
 
-        # emnsure MO coefficients are provided and orbitals can be optimized
+        # ensure MO coefficients are provided and orbitals can be optimized
         assert self.mo_coeff is not None
         if self.mo_coeff.shape[1] <= 1:
             return self.mo_coeff
+
+        # warn about attributes no class registers, such as misspelled settings, as
+        # PySCF's kernel does
+        if self.verbose >= lib.logger.WARN:
+            self.check_sanity()
 
         # number of orbitals
         self.norb = self.mo_coeff.shape[1]
@@ -1011,7 +1018,7 @@ def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
             f"X2C, but not {type(mf).__module__}.{type(mf).__name__}."
         )
 
-    mf = lib.set_class(cls(mf), (cls, mf.__class__))
+    mf = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
     if hasattr(mf, "stability") and callable(mf.stability):
         mf.stability = None
 
@@ -1265,6 +1272,10 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         if ci0 is None:
             ci0 = self.ci
 
+        # warn about attributes no class registers, such as misspelled settings, and
+        # check the active space, as PySCF's kernel does
+        self.check_sanity()
+
         # a symmetry-adapted object labels the orbitals by symmetry first, as PySCF's
         # kernel does, since its orbital rotations and the CI solver need the labels
         if isinstance(self, newton_casscf_symm.CASSCF):
@@ -1333,7 +1344,9 @@ def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
         else casscf.__class__
     )
     casscf_otr = lib.set_class(
-        CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas), (CASSCFOTR, pyscf_class)
+        CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas),
+        (CASSCFOTR, pyscf_class),
+        CASSCFOTR.__name__,
     )
     casscf_otr.__dict__.update(casscf.__dict__)
     casscf_otr._snapshot_shadowed_settings()

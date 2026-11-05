@@ -459,11 +459,12 @@ class SettingsTests(unittest.TestCase):
         for setting in solver_setting_fields + list(stability_setting_aliases.values()):
             self.assertIn(setting, keys)
 
-    def test_attributes_set_by_the_kernel_are_recognized_keys(self) -> None:
-        # PySCF also warns about the attributes the kernel sets once the object is
-        # built again, as by a second kernel, unless one of its classes registers them;
-        # it joins the keys of all these classes and skips class attributes and names
-        # starting with an underscore
+    def test_only_unknown_attributes_are_reported(self) -> None:
+        # every kernel reports attributes that none of the classes of the object
+        # registers, such as a misspelled setting, as PySCF's kernels do, so the
+        # attributes the kernel sets itself have to be registered; PySCF joins the keys
+        # of all these classes and skips class attributes and names starting with an
+        # underscore
         for obj in (
             mf_to_otr(scf.RHF(mol)),
             mf_to_otr(scf.UHF(mol_open)),
@@ -478,6 +479,11 @@ class SettingsTests(unittest.TestCase):
                 )
                 public = {name for name in vars(obj) if not name.startswith("_")}
                 self.assertFalse(public - keys - set(dir(type(obj))))
+
+                with capture_warnings(obj) as log:
+                    obj.n_marco = 1
+                    obj.kernel()
+                    self.assertIn("n_marco", log.getvalue())
 
     def test_kernel_returns_without_convergence(self) -> None:
         # like PySCF's own kernels, a kernel that runs out of macro iterations returns
