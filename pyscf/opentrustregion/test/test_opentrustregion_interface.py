@@ -23,7 +23,8 @@ from pyscf.pbc import gto as pbcgto, scf as pbcscf
 from pyscf.scf import dhf
 from pyscf.x2c import x2c
 
-from pyscf.opentrustregion import (
+from pyscf.opentrustregion import to_otr
+from pyscf.opentrustregion.opentrustregion_interface import (
     RHFOTR,
     ROHFOTR,
     UHFOTR,
@@ -33,10 +34,6 @@ from pyscf.opentrustregion import (
     BoysOTR,
     PipekMezeyOTR,
     EdmistonRuedenbergOTR,
-    mf_to_otr,
-    casscf_to_otr,
-)
-from pyscf.opentrustregion.opentrustregion_interface import (
     CASSCFOTR,
     OTR,
     SecondOrderOTR,
@@ -454,7 +451,7 @@ class SettingsTests(unittest.TestCase):
         # setting has to be registered on the class; PySCF collects the keys of every
         # class in the method resolution order, so a driver can register its own on top
         # of those of its base classes
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         keys = set().union(*(getattr(cls, "_keys", ()) for cls in type(otr).__mro__))
         for setting in solver_setting_fields + list(stability_setting_aliases.values()):
             self.assertIn(setting, keys)
@@ -466,11 +463,11 @@ class SettingsTests(unittest.TestCase):
         # of all these classes and skips class attributes and names starting with an
         # underscore
         for obj in (
-            mf_to_otr(scf.RHF(mol)),
-            mf_to_otr(scf.UHF(mol_open)),
-            mf_to_otr(x2c.UHF(mol)),
+            to_otr(scf.RHF(mol)),
+            to_otr(scf.UHF(mol_open)),
+            to_otr(x2c.UHF(mol)),
             BoysOTR(mol, occ_orbs),
-            casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
+            to_otr(mcscf.CASSCF(mf, 4, 4)),
         ):
             with self.subTest(cls=type(obj).__name__):
                 obj.kernel()
@@ -493,9 +490,9 @@ class SettingsTests(unittest.TestCase):
             raise ValueError
 
         for obj in (
-            mf_to_otr(scf.RHF(mol)),
+            to_otr(scf.RHF(mol)),
             BoysOTR(mol, occ_orbs),
-            casscf_to_otr(mcscf.CASSCF(mf, 4, 4)),
+            to_otr(mcscf.CASSCF(mf, 4, 4)),
         ):
             with self.subTest(cls=type(obj).__name__), capture_warnings(obj) as log:
                 obj.n_macro = 1
@@ -506,17 +503,72 @@ class SettingsTests(unittest.TestCase):
                 self.assertRaises(RuntimeError, obj.kernel)
 
 
+class ConversionTests(unittest.TestCase):
+    """
+    tests for the conversion of PySCF objects into their OpenTrustRegion counterparts
+    """
+
+    def test_to_otr_selects_the_matching_class(self) -> None:
+        # the converted object must remain usable as the PySCF object it came from,
+        # since PySCF routines are typed against those classes, takes over its
+        # attributes and is returned as it is when converted again
+        for obj, cls in (
+            (scf.RHF(mol), RHFOTR),
+            (scf.ROHF(mol_open), ROHFOTR),
+            (scf.UHF(mol_open), UHFOTR),
+            (scf.GHF(mol_open), GHFOTR),
+            (dft.RKS(mol, xc="b3lyp"), RHFOTR),
+            (dft.UKS(mol_open, xc="b3lyp"), UHFOTR),
+            (dft.GKS(mol_open, xc="b3lyp"), GHFOTR),
+            (x2c.UHF(mol), X2CUHFOTR),
+            (lo.Boys(mol, occ_orbs), BoysOTR),
+            (lo.PipekMezey(mol, occ_orbs, pop_method="mulliken"), PipekMezeyOTR),
+            (lo.EdmistonRuedenberg(mol, occ_orbs), EdmistonRuedenbergOTR),
+            (mcscf.CASSCF(mf, 4, 4), CASSCFOTR),
+        ):
+            with self.subTest(obj=obj.__class__.__name__):
+                otr = to_otr(obj)
+                self.assertIsInstance(otr, cls)
+                self.assertIsInstance(otr, type(obj))
+                for name, value in vars(obj).items():
+                    self.assertIs(vars(otr)[name], value)
+                self.assertIs(to_otr(otr), otr)
+
+    def test_to_otr_rejects_unsupported_objects(self) -> None:
+        # neither four-component calculations nor those at k-points are supported, nor
+        # the complex Pipek-Mezey localizer, CASCI, which optimizes no orbitals,
+        # unrestricted CASSCF, for which PySCF has no second-order solver, or other
+        # objects
+        cell = pbcgto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            a=np.eye(3) * 4.0,
+            basis="gth-szv",
+            pseudo="gth-pade",
+            verbose=0,
+        )
+        for obj in (
+            scf.DHF(mol),
+            pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1])),
+            lo.PipekMezeyComplex(mol, occ_orbs),
+            mcscf.CASCI(mf, 4, 4),
+            mcscf.UCASSCF(scf.UHF(mol_open), 4, 4),
+            mol,
+        ):
+            with self.subTest(obj=obj.__class__.__name__):
+                self.assertRaises(TypeError, to_otr, obj)
+
+
 class SCFTests(unittest.TestCase):
     """
-    tests for the Hartree-Fock and Kohn-Sham drivers: the conversion, the converged
-    energies, the cached orbital updates, the derivatives and the stability check
+    tests for the Hartree-Fock and Kohn-Sham drivers: the converged energies, the
+    cached orbital updates, the derivatives and the stability check
     """
 
     def _check(
         self, mf_in: scf.hf.SCF, ref_mf: scf.hf.SCF, **kernel_args: Any
     ) -> SecondOrderOTR:
         ref = ref_mf.newton().kernel()
-        otr = mf_to_otr(mf_in)
+        otr = to_otr(mf_in)
         e_tot = otr.kernel(**kernel_args)
         self.assertTrue(otr.converged)
         self.assertAlmostEqual(e_tot, ref, 8)
@@ -538,50 +590,10 @@ class SCFTests(unittest.TestCase):
         self.assertLess(gradient_rms(otr), SolverSettings().conv_tol)
         return otr
 
-    def test_mf_to_otr_selects_the_matching_class(self) -> None:
-        for mf_in, cls in (
-            (scf.RHF(mol), RHFOTR),
-            (scf.ROHF(mol_open), ROHFOTR),
-            (scf.UHF(mol_open), UHFOTR),
-            (scf.GHF(mol_open), GHFOTR),
-            (dft.RKS(mol, xc="b3lyp"), RHFOTR),
-            (dft.UKS(mol_open, xc="b3lyp"), UHFOTR),
-            (dft.GKS(mol_open, xc="b3lyp"), GHFOTR),
-            (x2c.UHF(mol), X2CUHFOTR),
-        ):
-            with self.subTest(mf=mf_in.__class__.__name__):
-                otr = mf_to_otr(mf_in)
-                self.assertIsInstance(otr, cls)
-                # the converted object must remain usable as the PySCF object it came
-                # from, since PySCF routines are typed against those classes
-                self.assertIsInstance(otr, scf.hf.SCF)
-
-    def test_mf_to_otr_is_idempotent(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
-        self.assertIs(mf_to_otr(otr), otr)
-
-    def test_mf_to_otr_rejects_unsupported_classes(self) -> None:
-        # neither four-component calculations nor those at k-points are supported, nor
-        # objects other than mean-field ones
-        cell = pbcgto.M(
-            atom="H 0 0 0; H 0 0 0.74",
-            a=np.eye(3) * 4.0,
-            basis="gth-szv",
-            pseudo="gth-pade",
-            verbose=0,
-        )
-        for mf_in in (
-            scf.DHF(mol),
-            pbcscf.KRHF(cell, cell.make_kpts([2, 1, 1])),
-            mcscf.CASSCF(mf, 4, 4),
-        ):
-            with self.subTest(mf=mf_in.__class__.__name__):
-                self.assertRaises(TypeError, mf_to_otr, mf_in)
-
-    def test_mf_to_otr_stability_is_a_setting(self) -> None:
+    def test_stability_is_a_setting(self) -> None:
         # stability is a boolean solver setting, so the PySCF method of that name has
         # to give way; the OpenTrustRegion equivalent is stability_check
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         self.assertFalse(callable(otr.stability))
         self.assertTrue(callable(otr.stability_check))
 
@@ -639,7 +651,7 @@ class SCFTests(unittest.TestCase):
         # canonical orbitals the kernel returns remain Kramers pairs
         ref = x2c.RHF(mol)
         ref.kernel()
-        otr = mf_to_otr(x2c.RHF(mol))
+        otr = to_otr(x2c.RHF(mol))
         self.assertIsInstance(otr, X2CRHFOTR)
         self.assertAlmostEqual(otr.kernel(), ref.e_tot, 8)
         self.assertLess(gradient_rms(otr), SolverSettings().conv_tol)
@@ -655,7 +667,7 @@ class SCFTests(unittest.TestCase):
         # the step the derivatives are checked at keeps every odd spinor the time
         # reverse of the even one before it, as only the conjugate rotation of the
         # partners does for complex rotations
-        otr = mf_to_otr(x2c.RHF(mol))
+        otr = to_otr(x2c.RHF(mol))
         check_derivatives_match_finite_differences(self, otr)
         self.assertLess(kramers_pairing_error(mol, otr.mo_coeff), 1e-10)
 
@@ -678,7 +690,7 @@ class SCFTests(unittest.TestCase):
             for _ in range(2)
         )
         perturbed = ref.mo_coeff @ kramers_rotation(n_occ, a, c)
-        otr = mf_to_otr(x2c.RHF(mol))
+        otr = to_otr(x2c.RHF(mol))
         e_tot = otr.kernel(mo_coeff=perturbed, mo_occ=ref.mo_occ)
         self.assertAlmostEqual(e_tot, ref.e_tot, 8)
         self.assertLess(kramers_pairing_error(mol, otr.mo_coeff), 1e-10)
@@ -728,13 +740,13 @@ class SCFTests(unittest.TestCase):
             atom="O 0 0 0; H 0 -0.78 0.60; H 0 0.78 0.60", basis="6-31g", verbose=0
         )
         ref = scf.RHF(mol).newton().as_scanner()
-        otr = mf_to_otr(scf.RHF(mol)).as_scanner()
+        otr = to_otr(scf.RHF(mol)).as_scanner()
         ref(mol)
         otr(mol)
         self.assertAlmostEqual(otr(mol_displaced), ref(mol_displaced), 8)
 
         grad_ref = scf.RHF(mol).nuc_grad_method().as_scanner()
-        grad_otr = mf_to_otr(scf.RHF(mol)).nuc_grad_method().as_scanner()
+        grad_otr = to_otr(scf.RHF(mol)).nuc_grad_method().as_scanner()
         grad_ref(mol)
         grad_otr(mol)
         e_ref, g_ref = grad_ref(mol_displaced)
@@ -744,9 +756,9 @@ class SCFTests(unittest.TestCase):
 
     def test_symmetry_restricts_the_parameter_count(self) -> None:
         # symmetry forbidden rotations must be excluded from the parameter vector
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         otr.kernel()
-        otr_sym = mf_to_otr(scf.RHF(mol_sym))
+        otr_sym = to_otr(scf.RHF(mol_sym))
         otr_sym.kernel()
         self.assertLess(otr_sym.n_param, otr.n_param)
 
@@ -763,7 +775,7 @@ class SCFTests(unittest.TestCase):
         ):
             with self.subTest(cls=plain.__name__):
                 otr = self._check(plain(molecule), adapted(molecule))
-                otr_adapted = mf_to_otr(adapted(molecule))
+                otr_adapted = to_otr(adapted(molecule))
                 otr_adapted.kernel()
                 self.assertEqual(otr.n_param, otr_adapted.n_param)
 
@@ -776,14 +788,14 @@ class SCFTests(unittest.TestCase):
         for cls in (scf.ROHF, scf.UHF):
             with self.subTest(cls=cls.__name__):
                 ref = cls(carbon).newton().kernel()
-                otr = mf_to_otr(cls(carbon))
+                otr = to_otr(cls(carbon))
                 self.assertAlmostEqual(otr.kernel(), ref, 8)
                 self.assertEqual(otr.n_param, 0)
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
 
     def test_repeated_zero_step_reuses_the_update(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         otr.kernel()
         grad, h_diag = grad_and_h_diag(otr)
         zero = np.zeros(otr.n_param, dtype=np.float64)
@@ -798,7 +810,7 @@ class SCFTests(unittest.TestCase):
         self.assertAlmostEqual(func, otr.e_tot, 9)
 
     def test_cache_is_invalidated_when_orbitals_move(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         otr.kernel()
         grad, h_diag = grad_and_h_diag(otr)
         zero = np.zeros(otr.n_param, dtype=np.float64)
@@ -813,7 +825,7 @@ class SCFTests(unittest.TestCase):
         self.assertEqual(otr.n_update_orbs, n_before + 1)
 
     def test_nonzero_step_always_recomputes(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         otr.kernel()
         grad, h_diag = grad_and_h_diag(otr)
         step = np.zeros(otr.n_param, dtype=np.float64)
@@ -825,7 +837,7 @@ class SCFTests(unittest.TestCase):
         self.assertEqual(otr.n_update_orbs, n_before + 1)
 
     def test_counters_record_the_work_done(self) -> None:
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         self.assertEqual(otr.n_update_orbs, 0)
         self.assertEqual(otr.n_hess_x, 0)
         otr.kernel()
@@ -845,7 +857,7 @@ class SCFTests(unittest.TestCase):
         ):
             with self.subTest(cls=mf_in.__class__.__name__):
                 check_derivatives_match_finite_differences(
-                    self, mf_to_otr(mf_in), curvature=curvature
+                    self, to_otr(mf_in), curvature=curvature
                 )
 
     def test_complex_derivatives_match_finite_differences(self) -> None:
@@ -866,7 +878,7 @@ class SCFTests(unittest.TestCase):
             ("GHF X2C", scf.GHF(mol).x2c(), {}),
         ):
             with self.subTest(case=name):
-                otr = mf_to_otr(mf_in)
+                otr = to_otr(mf_in)
                 check_derivatives_match_finite_differences(
                     self, otr, curvature=name != "ROHF", **kernel_args
                 )
@@ -874,12 +886,12 @@ class SCFTests(unittest.TestCase):
                 self.assertEqual(otr.n_param, 2 * np.count_nonzero(otr.mask_symm))
 
     def test_large_rotation_is_rejected(self) -> None:
-        check_large_rotation_is_rejected(self, mf_to_otr(scf.RHF(mol)))
+        check_large_rotation_is_rejected(self, to_otr(scf.RHF(mol)))
 
     def test_large_complex_rotation_is_rejected(self) -> None:
         # the limit applies to the modulus of a complex rotation, which exceeds pi / 4
         # with real and imaginary parts below it
-        otr = mf_to_otr(x2c.UHF(mol))
+        otr = to_otr(x2c.UHF(mol))
         otr.kernel()
         n_pairs = otr.n_param // 2
         step = np.zeros(otr.n_param, dtype=np.float64)
@@ -893,7 +905,7 @@ class SCFTests(unittest.TestCase):
         # restricted solution is a saddle point in the unrestricted parameters
         mol_stretched = gto.M(atom="H 0 0 0; H 0 0 3.0", basis="6-31g", verbose=0)
         rhf = scf.RHF(mol_stretched).run()
-        otr = mf_to_otr(scf.UHF(mol_stretched))
+        otr = to_otr(scf.UHF(mol_stretched))
         e_tot = otr.kernel()
 
         # the solver escapes the restricted solution on its own, so its own result is
@@ -905,7 +917,7 @@ class SCFTests(unittest.TestCase):
         # placing the same object back at the restricted solution, or a new object
         # whose kernel never ran there, must make the check report the instability,
         # along with a normalized direction out of the saddle
-        new_otr = mf_to_otr(scf.UHF(mol_stretched))
+        new_otr = to_otr(scf.UHF(mol_stretched))
         new_otr.mo_occ = otr.mo_occ
         for obj in (otr, new_otr):
             with self.subTest(kernel_ran=obj is otr):
@@ -918,7 +930,7 @@ class SCFTests(unittest.TestCase):
         # the curvature tells a minimum from a saddle point only at a stationary point,
         # so the check warns at the orbitals of the core Hamiltonian guess but not at
         # the orbitals the kernel converged to
-        otr = mf_to_otr(scf.RHF(mol))
+        otr = to_otr(scf.RHF(mol))
         mo_energy, otr.mo_coeff = otr.eig(otr.get_hcore(), otr.get_ovlp())
         otr.mo_occ = otr.get_occ(mo_energy, otr.mo_coeff)
         with capture_warnings(otr) as log:
@@ -938,7 +950,7 @@ class SCFTests(unittest.TestCase):
         # the update the kernel left is cached
         for cls, molecule in product((scf.RHF, scf.ROHF), (mol, mol_sym)):
             with self.subTest(cls=cls.__name__, symmetry=molecule.symmetry):
-                otr = mf_to_otr(cls(molecule))
+                otr = to_otr(cls(molecule))
                 otr.kernel()
                 grad, h_diag = grad_and_h_diag(otr)
                 otr._update_orbs(np.zeros(otr.n_param), grad, h_diag)
@@ -968,10 +980,10 @@ class SCFTests(unittest.TestCase):
                 np.testing.assert_allclose(grad, 2 * ref_grad, atol=1e-8)
 
     def test_energy_option_assigned_after_conversion_is_reported(self) -> None:
-        # the PySCF object passed to mf_to_otr evaluates the energy and the gradient, so
+        # the PySCF object passed to to_otr evaluates the energy and the gradient, so
         # an option defining the energy that is assigned afterwards reaches at most the
         # Hessian, which the solver and the stability check warn about
-        otr = mf_to_otr(dft.UKS(mol_open, xc="b3lyp"))
+        otr = to_otr(dft.UKS(mol_open, xc="b3lyp"))
         with capture_warnings(otr) as log:
             # a replaced grid for the nonlocal correlation, which b3lyp does not use,
             # leaves the optimization unaffected
@@ -991,7 +1003,7 @@ class SCFTests(unittest.TestCase):
         # only uses for the Hessian all reach the energy or are meant for the Hessian
         uks = dft.UKS(mol_open)
         uks.xc = "b3lyp"
-        otr = mf_to_otr(uks)
+        otr = to_otr(uks)
         with capture_warnings(otr) as log:
             otr.xc = "B3LYP"
             otr.grids.level = 2
@@ -1000,7 +1012,7 @@ class SCFTests(unittest.TestCase):
                 otr.set_second_grids(2)
             otr.kernel()
             otr.stability_check()
-            self.assertNotIn("mf_to_otr", log.getvalue())
+            self.assertNotIn("to_otr", log.getvalue())
 
 
 class LocalizerTests(unittest.TestCase):
@@ -1108,26 +1120,14 @@ class LocalizerTests(unittest.TestCase):
 
 class CASSCFTests(unittest.TestCase):
     """
-    tests for the CASSCF driver: the conversion, the converged energy, the cached
+    tests for the CASSCF driver: the active space, the converged energy, the cached
     updates, the derivatives and the stability check
     """
 
-    def test_casscf_to_otr_preserves_the_active_space(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
-        self.assertIsInstance(mc, CASSCFOTR)
+    def test_conversion_preserves_the_active_space(self) -> None:
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         self.assertEqual(mc.ncas, 4)
         self.assertEqual(mc.nelecas, (2, 2))
-
-    def test_casscf_to_otr_is_idempotent(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
-        self.assertIs(casscf_to_otr(mc), mc)
-
-    def test_casscf_to_otr_rejects_unsupported_classes(self) -> None:
-        # CASCI optimizes no orbitals and PySCF has no second-order solver for
-        # unrestricted CASSCF
-        for mc_in in (mcscf.CASCI(mf, 4, 4), mcscf.UCASSCF(scf.UHF(mol_open), 4, 4)):
-            with self.subTest(mc=mc_in.__class__.__name__):
-                self.assertRaises(TypeError, casscf_to_otr, mc_in)
 
     def test_casscf_energy(self) -> None:
         # with symmetry, the parameters are the rotations between orbitals of the same
@@ -1137,7 +1137,7 @@ class CASSCFTests(unittest.TestCase):
         for mf_in in (mf, mf_sym):
             with self.subTest(symmetry=mf_in.mol.symmetry):
                 ref = mcscf.CASSCF(mf_in, 4, 4).run()
-                mc = casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))
+                mc = to_otr(mcscf.CASSCF(mf_in, 4, 4))
                 e_tot, e_cas, ci, mo_coeff, mo_energy = mc.kernel()
                 self.assertAlmostEqual(e_tot, ref.e_tot, 7)
                 self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
@@ -1155,7 +1155,7 @@ class CASSCFTests(unittest.TestCase):
             atom="O 0 0 0; H 0 -0.78 0.60; H 0 0.78 0.60", basis="6-31g", verbose=0
         )
         ref = mcscf.CASSCF(scf.RHF(mol), 4, 4).as_scanner()
-        mc = casscf_to_otr(mcscf.CASSCF(scf.RHF(mol), 4, 4)).as_scanner()
+        mc = to_otr(mcscf.CASSCF(scf.RHF(mol), 4, 4)).as_scanner()
         ref(mol)
         mc(mol)
         self.assertAlmostEqual(mc(mol_displaced), ref(mol_displaced), 7)
@@ -1189,11 +1189,11 @@ class CASSCFTests(unittest.TestCase):
             for order, mc in (
                 (
                     "conversion of the average",
-                    casscf_to_otr(average(mcscf.CASSCF(mf_in, 4, 4))),
+                    to_otr(average(mcscf.CASSCF(mf_in, 4, 4))),
                 ),
                 (
                     "average of the conversion",
-                    average(casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))),
+                    average(to_otr(mcscf.CASSCF(mf_in, 4, 4))),
                 ),
             ):
                 with self.subTest(average=name, order=order):
@@ -1205,7 +1205,7 @@ class CASSCFTests(unittest.TestCase):
                     self.assertTrue(stable)
 
     def test_casscf_orbitals_stay_orthonormal(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         mc.kernel()
         ovlp = mol.intor_symmetric("int1e_ovlp")
         self.assertAlmostEqual(
@@ -1219,7 +1219,7 @@ class CASSCFTests(unittest.TestCase):
     def test_cache_notices_a_changed_ci_vector(self) -> None:
         # for CASSCF the cached update describes a point in the orbitals and the CI
         # vector both, so moving only the CI vector has to invalidate it
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         mc.kernel()
         grad, h_diag = grad_and_h_diag(mc)
         zero = np.zeros(mc.n_param, dtype=np.float64)
@@ -1238,7 +1238,7 @@ class CASSCFTests(unittest.TestCase):
         self.assertEqual(mc.n_update_orbs, n_before + 1)
 
     def test_counters_record_the_work_done(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         self.assertEqual(mc.n_update_orbs, 0)
         self.assertEqual(mc.n_hess_x, 0)
         mc.kernel()
@@ -1284,12 +1284,12 @@ class CASSCFTests(unittest.TestCase):
             with self.subTest(average=name):
                 check_derivatives_match_finite_differences(
                     self,
-                    average(casscf_to_otr(mcscf.CASSCF(mf_in, 4, 4))),
+                    average(to_otr(mcscf.CASSCF(mf_in, 4, 4))),
                     curvature=curvature,
                 )
 
     def test_only_large_orbital_rotations_are_rejected(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         check_large_rotation_is_rejected(self, mc)
 
         # the CI part of a step displaces the CI vector rather than rotating orbitals
@@ -1298,6 +1298,6 @@ class CASSCFTests(unittest.TestCase):
         self.assertTrue(np.isfinite(mc._func(step)))
 
     def test_casscf_stability_check(self) -> None:
-        mc = casscf_to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         mc.kernel()
         check_stability_shape(self, mc)

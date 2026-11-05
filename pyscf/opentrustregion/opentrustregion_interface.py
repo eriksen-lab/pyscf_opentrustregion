@@ -70,11 +70,6 @@ stability_setting_aliases = {
     "jacobi_davidson_start": "stability_jacobi_davidson_start",
 }
 
-# the error code, named as in OpenTrustRegion, with which the solver reports that it
-# reached the maximum number of macro iterations, which pyopentrustregion states only
-# in the message of the RuntimeError it raises
-error_solver_max_iter = 102
-
 
 def setting_was_set_by_user(obj: object, name: str) -> bool:
     """
@@ -137,6 +132,12 @@ def assign_solver_settings(obj: object, settings: SolverSettings) -> None:
             setattr(settings, setting, getattr(obj, setting))
     assign_pyscf_logger(obj, settings)
     assign_stability_settings(obj, settings.stability_settings)
+
+
+# the error code, named as in OpenTrustRegion, with which the solver reports that it
+# reached the maximum number of macro iterations, which pyopentrustregion states only
+# in the message of the RuntimeError it raises
+error_solver_max_iter = 102
 
 
 class OTR:
@@ -441,6 +442,26 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
     cost_sign = -1.0
 
 
+# the drivers of the PySCF localizers, matched by their exact class, since a subclass
+# such as PipekMezeyComplex can change the cost function
+localizer_drivers = {
+    lo.Boys: BoysOTR,
+    lo.PipekMezey: PipekMezeyOTR,
+    lo.EdmistonRuedenberg: EdmistonRuedenbergOTR,
+}
+
+
+def _localizer_to_otr(loc: Any) -> LocalizerOTR:
+    """
+    this function converts a PySCF localizer into an object of its driver class
+    """
+    loc_otr = localizer_drivers[type(loc)](loc.mol, loc.mo_coeff)
+    loc_otr.__dict__.update(loc.__dict__)
+    loc_otr._snapshot_shadowed_settings()
+
+    return loc_otr
+
+
 # input options of the PySCF Kohn-Sham objects that define the energy. A converted
 # object evaluates the energy and the gradient through the PySCF object it was
 # converted from but the Hessian itself, so such an option assigned after the
@@ -497,9 +518,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             lib.logger.warn(
                 self,
                 f"{names} of this object {verb} from the PySCF object passed to "
-                "mf_to_otr, which evaluates the energy and the gradient, so the value "
+                "to_otr, which evaluates the energy and the gradient, so the value "
                 "assigned here reaches only the Hessian. Unless the Hessian is "
-                f"approximated on purpose, set {names} before mf_to_otr: otherwise the "
+                f"approximated on purpose, set {names} before to_otr: otherwise the "
                 "solver optimizes the energy for the original value and the stability "
                 "check can report instabilities that this energy does not have.",
             )
@@ -992,41 +1013,36 @@ class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
         return mask, mask[mask]
 
 
-def mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
-
-    if isinstance(mf, SecondOrderOTR):
-        return mf
-
+def _mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
+    """
+    this function converts a mean-field object into an object of its driver class,
+    unless the class is not supported, as the four-component ones and those with
+    k-points
+    """
     # the spinor classes of X2C carry the names of the nonrelativistic classes, so they
     # are told apart by their type first, and an ROHF class also carries the name of
-    # RHF, from which it derives; the four-component classes, those with k-points and
-    # objects other than mean-field ones are not supported
-    cls: Optional[type[SecondOrderOTR]] = None
-    if isinstance(mf, scf.hf.SCF):
-        if isinstance(mf, x2c.RHF):
-            cls = X2CRHFOTR
-        elif isinstance(mf, x2c.UHF):
-            cls = X2CUHFOTR
-        elif mf.istype("RHF"):
-            cls = ROHFOTR if mf.istype("ROHF") else RHFOTR
-        elif mf.istype("UHF"):
-            cls = UHFOTR
-        elif mf.istype("GHF"):
-            cls = GHFOTR
-    if cls is None:
-        raise TypeError(
-            "mf_to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham "
-            "counterparts, also at the Gamma point of periodic systems, and spinor "
-            f"X2C, but not {type(mf).__module__}.{type(mf).__name__}."
-        )
+    # RHF, from which it derives
+    cls: type[SecondOrderOTR]
+    if isinstance(mf, x2c.RHF):
+        cls = X2CRHFOTR
+    elif isinstance(mf, x2c.UHF):
+        cls = X2CUHFOTR
+    elif mf.istype("RHF"):
+        cls = ROHFOTR if mf.istype("ROHF") else RHFOTR
+    elif mf.istype("UHF"):
+        cls = UHFOTR
+    elif mf.istype("GHF"):
+        cls = GHFOTR
+    else:
+        raise _unsupported(mf)
 
-    mf = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
-    if hasattr(mf, "stability") and callable(mf.stability):
-        mf.stability = None
+    mf_otr = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
+    if hasattr(mf_otr, "stability") and callable(mf_otr.stability):
+        mf_otr.stability = None
 
-    mf._snapshot_shadowed_settings()
+    mf_otr._snapshot_shadowed_settings()
 
-    return mf
+    return mf_otr
 
 
 class CASSCFOTR(OTR, newton_casscf.CASSCF):
@@ -1336,26 +1352,20 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
 
 
-def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
-    if isinstance(casscf, CASSCFOTR):
-        return casscf
-
-    if not isinstance(casscf, mc1step.CASSCF):
-        raise TypeError(
-            "casscf_to_otr supports CASSCF, also state-averaged and with point-group "
-            f"symmetry, but not {type(casscf).__module__}.{type(casscf).__name__}."
-        )
-
+def _casscf_to_otr(casscf: mc1step.CASSCF) -> CASSCFOTR:
+    """
+    this function converts a CASSCF object into an object of its driver class
+    """
+    # the driver builds on PySCF's second-order class, without a state average, which
+    # has to precede the class it averages and is therefore applied again below
     if not isinstance(casscf, newton_casscf.CASSCF):
         casscf = casscf.newton()
-
-    # the class of the PySCF object is mixed in as in mf_to_otr, e.g. for symmetry,
-    # without a state average, which is applied again below so that it comes first
     pyscf_class = (
         casscf._base_class
         if isinstance(casscf, addons.StateAverageMCSCFSolver)
         else casscf.__class__
     )
+
     casscf_otr = lib.set_class(
         CASSCFOTR(casscf._scf, casscf.ncas, casscf.nelecas),
         (CASSCFOTR, pyscf_class),
@@ -1364,8 +1374,40 @@ def casscf_to_otr(casscf: newton_casscf.CASSCF) -> CASSCFOTR:
     casscf_otr.__dict__.update(casscf.__dict__)
     casscf_otr._snapshot_shadowed_settings()
 
+    # the state average is applied with the symmetry of the wave functions, as PySCF's
+    # newton() applies it
     if isinstance(casscf, addons.StateAverageMCSCFSolver):
         wfnsym = getattr(casscf, "wfnsym", None)
         casscf_otr = casscf_otr.state_average_(casscf.weights, wfnsym)
 
     return casscf_otr
+
+
+def to_otr(obj: Any) -> Any:
+    """
+    this function converts a PySCF mean-field, localizer or CASSCF object into its
+    OpenTrustRegion counterpart, which takes over its attributes and remains usable as
+    the PySCF object
+    """
+    if isinstance(obj, OTR):
+        return obj
+
+    if isinstance(obj, scf.hf.SCF):
+        return _mf_to_otr(obj)
+    if type(obj) in localizer_drivers:
+        return _localizer_to_otr(obj)
+    if isinstance(obj, mc1step.CASSCF):
+        return _casscf_to_otr(obj)
+    raise _unsupported(obj)
+
+
+def _unsupported(obj: Any) -> TypeError:
+    """
+    this function returns the error to_otr raises for an object it does not support
+    """
+    return TypeError(
+        "to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham counterparts, also "
+        "at the Gamma point of periodic systems, spinor X2C, the Boys, Pipek-Mezey and "
+        "Edmiston-Ruedenberg localizers and CASSCF, but not "
+        f"{type(obj).__module__}.{type(obj).__name__}."
+    )

@@ -6,16 +6,4 @@
 
 __version__ = "1.0.0"
 
-from pyscf.opentrustregion.opentrustregion_interface import (
-    RHFOTR,
-    ROHFOTR,
-    UHFOTR,
-    GHFOTR,
-    X2CRHFOTR,
-    X2CUHFOTR,
-    BoysOTR,
-    PipekMezeyOTR,
-    EdmistonRuedenbergOTR,
-    mf_to_otr,
-    casscf_to_otr,
-)
+from pyscf.opentrustregion.opentrustregion_interface import to_otr

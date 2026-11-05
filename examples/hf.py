@@ -1,5 +1,5 @@
 from pyscf import gto, scf, dft
-from pyscf.opentrustregion import mf_to_otr
+from pyscf.opentrustregion import to_otr
 
 # define molecule
 mol = gto.Mole()
@@ -15,8 +15,8 @@ mol.build(
 
 ### run RHF
 
-# use hf_to_otr function to convert to RHFOTR object
-hf = mf_to_otr(scf.RHF(mol))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(scf.RHF(mol))
 
 # call kernel
 hf.kernel()
@@ -26,8 +26,8 @@ stable, direction = hf.stability_check()
 
 ### run RKS
 
-# use hf_to_otr function to convert to RHFOTR object
-hf = mf_to_otr(dft.RKS(mol, xc="b3lyp"))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(dft.RKS(mol, xc="b3lyp"))
 
 # call kernel
 hf.kernel()
@@ -40,8 +40,8 @@ mol.spin = 2
 
 ### run ROHF
 
-# use hf_to_otr function to convert to ROHFOTR object
-hf = mf_to_otr(scf.ROHF(mol))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(scf.ROHF(mol))
 
 # call kernel
 hf.kernel()
@@ -51,8 +51,8 @@ stable, direction = hf.stability_check()
 
 ### run ROKS
 
-# use hf_to_otr function to convert to ROHFOTR object
-hf = mf_to_otr(dft.ROKS(mol, xc="b3lyp"))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(dft.ROKS(mol, xc="b3lyp"))
 
 # call kernel
 hf.kernel()
@@ -62,8 +62,8 @@ stable, direction = hf.stability_check()
 
 ### run UHF
 
-# use hf_to_otr function to convert to ROHFOTR object
-hf = mf_to_otr(scf.UHF(mol))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(scf.UHF(mol))
 
 # call kernel
 hf.kernel()
@@ -73,8 +73,8 @@ stable, direction = hf.stability_check()
 
 ### run UKS
 
-# use hf_to_otr function to convert to ROHFOTR object
-hf = mf_to_otr(dft.UKS(mol, xc="b3lyp"))
+# convert to the OpenTrustRegion counterpart
+hf = to_otr(dft.UKS(mol, xc="b3lyp"))
 
 # call kernel
 hf.kernel()

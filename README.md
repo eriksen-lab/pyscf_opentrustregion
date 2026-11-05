@@ -64,17 +64,18 @@ for details.
 
 ## Usage
 
-### Hartree–Fock and DFT
+`to_otr` converts a PySCF object into its OpenTrustRegion counterpart, which takes over
+its attributes and is used as the PySCF object would be.
 
-`mf_to_otr` converts a PySCF mean-field object into its OpenTrustRegion counterpart:
+### Hartree–Fock and DFT
 
 ```python
 from pyscf import gto, scf
-from pyscf.opentrustregion import mf_to_otr
+from pyscf.opentrustregion import to_otr
 
 mol = gto.M(atom="O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587", basis="cc-pVDZ")
 
-mf = mf_to_otr(scf.RHF(mol))
+mf = to_otr(scf.RHF(mol))
 mf.kernel()
 
 stable, direction = mf.stability_check()
@@ -92,7 +93,7 @@ geomeTRIC:
 ```python
 from pyscf.geomopt.geometric_solver import optimize
 
-mol_eq = optimize(mf_to_otr(scf.RHF(mol)))
+mol_eq = optimize(to_otr(scf.RHF(mol)))
 ```
 
 **Set the functional before the conversion.** The converted object evaluates the energy
@@ -107,7 +108,7 @@ stability check starts.
 ```python
 mf = scf.UKS(mol)
 mf.xc = "B3LYP"
-mf = mf_to_otr(mf)
+mf = to_otr(mf)
 ```
 
 A grid changed in place, as by `mf.grids.level = 4`, reaches both objects, since they
@@ -116,24 +117,21 @@ after 2.14 provide `mf.set_second_grids()`, whose grid only the Hessian uses.
 
 ### Orbital localization
 
-The localizers are used exactly like the PySCF classes they derive from:
+The Boys, Pipek–Mezey and Edmiston–Ruedenberg localizers are converted the same way:
 
 ```python
-from pyscf.opentrustregion import BoysOTR, PipekMezeyOTR, EdmistonRuedenbergOTR
+from pyscf import lo
 
-loc = BoysOTR(mol, mf.mo_coeff[:, : mol.nelec[0]])
+loc = to_otr(lo.Boys(mol, mf.mo_coeff[:, : mol.nelec[0]]))
 mo_loc = loc.kernel()
 ```
 
 ### CASSCF
 
-`casscf_to_otr` converts a PySCF CASSCF object:
-
 ```python
 from pyscf import mcscf
-from pyscf.opentrustregion import casscf_to_otr
 
-mc = casscf_to_otr(mcscf.CASSCF(mf, 6, 6))
+mc = to_otr(mcscf.CASSCF(mf, 6, 6))
 mc.kernel()
 ```
 
@@ -152,7 +150,7 @@ PySCF log of the object, which `verbose` and the output file control as for PySC
 output.
 
 ```python
-mf = mf_to_otr(scf.RHF(mol))
+mf = to_otr(scf.RHF(mol))
 mf.conv_tol = 1e-7
 mf.n_macro = 100
 mf.line_search = True
@@ -173,7 +171,7 @@ value assigned after the conversion reaches the solver:
 ```python
 mf = scf.RHF(mol)
 mf.conv_tol = 1e-7           # ignored by the solver
-mf = mf_to_otr(mf)
+mf = to_otr(mf)
 mf.conv_tol = 1e-7           # used by the solver, as an RMS gradient threshold
 mf.kernel()
 ```
@@ -235,7 +233,7 @@ mf.n_hess_x          # Hessian linear transformations
 Check that PySCF picks the interface up and that OpenTrustRegion loads:
 
 ```sh
-python3 -c "from pyscf.opentrustregion import mf_to_otr"
+python3 -c "from pyscf.opentrustregion import to_otr"
 ```
 
 A `ModuleNotFoundError` means that the interface is neither installed nor on
