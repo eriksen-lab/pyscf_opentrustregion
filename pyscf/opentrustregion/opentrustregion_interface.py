@@ -97,9 +97,18 @@ class LastResult:
 
     @classmethod
     def of(cls, key: Tuple[np.ndarray, ...], value: Any) -> LastResult:
+        """
+        this function returns the result computed at a point, keyed by copies of the
+        arrays that define the point, so that changing these arrays in place does not
+        change the key
+        """
         return cls(tuple(np.array(array, copy=True) for array in key), value)
 
     def matches(self, key: Tuple[np.ndarray, ...]) -> bool:
+        """
+        this function returns whether a result is held that was computed at the point
+        the arrays define
+        """
         return (
             len(self.key) > 0
             and len(self.key) == len(key)
@@ -285,13 +294,19 @@ class OTR:
     # Hessian linear transformation of the last orbital update
     _raw_hess_x: OTRHessX
 
-    # Hessian linear transformation performed for the solver
     def _count_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the Hessian linear transformation of the last orbital
+        update for the solver and counts it
+        """
         self._raw_hess_x(x, hx)
         self.n_hess_x += 1
 
-    # Hessian linear transformation performed for a stability check
     def _count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the Hessian linear transformation of the last orbital
+        update for a stability check and counts it
+        """
         self._raw_hess_x(x, hx)
         self.n_hess_x_stability += 1
 
@@ -696,6 +711,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     @property
     def n_jk(self) -> int:
+        """
+        this property returns the number of two-electron builds of every kind,
+        including the response builds of the stability check
+        """
         return self.n_jk_update + self.n_jk_energy + self.n_jk_response
 
     # the last built and the last adopted effective potential, keyed by their densities
@@ -757,7 +776,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # those the last kernel did, which refer to the extension objects of that kernel
     # and keep them alive and which the next kernel drops, so that its factories wrap
     # the routines of this object
-    factory_routines = (
+    _factory_routines = (
         "_func",
         "_update_orbs",
         "_approx_update_orbs",
@@ -797,6 +816,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._adopted_routines = ()
 
     def _reset(self) -> None:
+        """
+        this function discards everything a previous kernel computed, including the
+        effective potentials and the routines it adopted from the extension factories
+        """
         super()._reset()
         self._last_potential = LastResult()
         self._adopted_potential = None
@@ -822,6 +845,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _raw_approx_hess_x: OTRHessX
 
     def _count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the approximate Hessian linear transformation of the
+        last orbital update for the solver and counts it
+        """
         self._raw_approx_hess_x(x, hx)
         self.n_hess_x += 1
 
@@ -829,6 +856,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         [np.ndarray, np.ndarray, np.ndarray],
         Tuple[float, Callable[[np.ndarray, np.ndarray], None]],
     ]:
+        """
+        this function wraps an approximate orbital update, so that the approximate
+        Hessian linear transformations the solver performs with it are counted
+        """
+
         def update_orbs(
             kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
         ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
@@ -838,11 +870,21 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         return update_orbs
 
     def _count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the Hessian linear transformation of the last orbital
+        update for a stability check and counts it together with the two-electron
+        response builds it requires
+        """
         n_jk_response = self.n_jk_response
         super()._count_stability_hess_x(x, hx)
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
     def _approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the approximate Hessian linear transformation of the
+        quasi-Newton or S-GEK extension for a stability check and counts it together
+        with the two-electron response builds it requires
+        """
         n_jk_response = self.n_jk_response
         self._raw_approx_update_orbs.hess_x(x, hx)
         self.n_hess_x_stability += 1
@@ -1230,7 +1272,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # called
         if self.n_param > 0:
             # routines before the extensions replace or take over any of them
-            routines = {name: self.__dict__.get(name) for name in self.factory_routines}
+            routines = {
+                name: self.__dict__.get(name) for name in self._factory_routines
+            }
 
             # the extensions replace or take over routines of this object, which are
             # recorded also if a factory or a check after one raises, so that the next
@@ -1249,7 +1293,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                             n_particle,
                             self._scf.mol.nao,
                             self.mo_coeff.shape[-1],
-                            self.evaluate_dm,
+                            self._evaluate_dm,
                             settings,
                             state,
                             mo_settings,
@@ -1271,7 +1315,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                             self.s1e,
                             n_particle,
                             self._scf.mol.nao,
-                            self.evaluate_dm,
+                            self._evaluate_dm,
                             settings,
                             state,
                             oao_settings,
@@ -1316,7 +1360,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     # on, which holds the orbitals it updates in place and provides the
                     # exact Hessian the stability check uses
                     approx_update_orbs, obj_func = density_qn_factory(
-                        self.evaluate_dm_density_qn,
+                        self._evaluate_dm_density_qn,
                         settings,
                         state,
                         density_qn_settings,
@@ -1350,8 +1394,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         self.n_param,
                         self._update_orbs,
                         self._func,
-                        self.transport,
-                        self.init_hess,
+                        self._transport,
+                        self._init_hess,
                         settings,
                         state,
                         rotation_qn_settings,
@@ -1365,9 +1409,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         )
                     if isinstance(self, ROHFOTR):
                         raise RuntimeError(
-                            "ROHFOTR is not supported for S-GEK because history cannot be "
-                            "transformed consistently to make redundant blocks vanish for flag "
-                            "manifold."
+                            "ROHFOTR is not supported for S-GEK because the history "
+                            "cannot be transformed consistently to make the redundant "
+                            "blocks vanish on the flag manifold."
                         )
                     s_gek_settings = SGEKSettings()
                     assign_extension_settings(
@@ -1377,7 +1421,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         self.n_param,
                         self._update_orbs,
                         self._func,
-                        self.change_reference,
+                        self._change_reference,
                         settings,
                         state,
                         s_gek_settings,
@@ -1387,7 +1431,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             finally:
                 self._adopted_routines = tuple(
                     name
-                    for name in self.factory_routines
+                    for name in self._factory_routines
                     if self.__dict__.get(name) is not routines[name]
                 )
 
@@ -1425,8 +1469,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # get canonical orbitals
         if self.oao:
             self.dm = 2 * dm_per_spin_ao if isinstance(self, RHFOTR) else dm_per_spin_ao
-        if self.oao:
-            self.mo_occ, self.mo_coeff = self.get_orth_mo_coeff()
+            self.mo_occ, self.mo_coeff = self._get_orth_mo_coeff()
         self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
         vhf = self._potential(self.dm)
         self._count_update()
@@ -1656,27 +1699,36 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         matrix[self.rot_matrix_mask] = rotation
         return matrix - matrix.conj().T
 
-    # unpack matrix into virtual-occupied block
-    def unpack_vo(self, kappa: np.ndarray) -> np.ndarray:
+    def _unpack_vo(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function unpacks parameters into the virtual-occupied block of a rotation
+        matrix
+        """
         matrix = np.zeros((self.n_virt, self.n_occ), dtype=np.float64)
         matrix[self.rot_matrix_mask_vo] = kappa
         return matrix
 
-    # pack matrix from virtual occupied block
-    def pack_vo(self, matrix: np.ndarray) -> np.ndarray:
+    def _pack_vo(self, matrix: np.ndarray) -> np.ndarray:
+        """
+        this function packs the virtual-occupied block of a rotation matrix into
+        parameters
+        """
         return matrix.ravel()[self.kappa_mask]
 
-    # evaluate quantities at a density matrix
-    def evaluate_dm(
+    def _evaluate_dm(
         self, dm: np.ndarray, fock: Optional[np.ndarray], get_response: bool
     ) -> Tuple[float, Optional[Callable[[np.ndarray, np.ndarray], None]]]:
+        """
+        this function evaluates the energy at a density matrix of one spin for the MO
+        and OAO extensions and, if asked for, the Fock matrix and the response function
+        """
         # anything the caller did not ask for is not built
         veff = self._potential(2.0 * dm)
         if fock is not None:
             self.fock = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
             fock[:, :] = self.fock
         response = (
-            self.get_response_factory(
+            self._get_response_factory(
                 self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
             )
             if get_response
@@ -1685,9 +1737,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff), response
 
-    # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
-    # non-linear (XC) contributions to the effective potential
-    def evaluate_dm_density_qn(
+    def _evaluate_dm_density_qn(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
@@ -1695,6 +1745,12 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         v_exchange: Optional[np.ndarray],
         v_nonlinear: Optional[np.ndarray],
     ) -> float:
+        """
+        this function evaluates the energy at a density matrix of one spin for the
+        density QN extension and, if asked for, the Fock matrix and the Coulomb,
+        exact-exchange and non-linear (exchange-correlation) parts of the effective
+        potential
+        """
         # anything the caller did not ask for is not built
         veff = self._potential(2.0 * dm)
 
@@ -1721,33 +1777,48 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff)
 
-    def get_response_factory(
+    def _get_response_factory(
         self, gen_response: Callable[[np.ndarray], np.ndarray]
     ) -> Callable[[np.ndarray, np.ndarray], None]:
+        """
+        this function turns a PySCF response function into the response function of
+        the extensions, which takes a density matrix of one spin, and counts its
+        two-electron builds
+        """
+
         def get_response(dm: np.ndarray, response: np.ndarray) -> None:
             self.n_jk_response += 1
             response[:, :] = gen_response(2.0 * dm)
 
         return get_response
 
-    # transport tangent vector along geodesic
-    def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+        """
+        this function transports a tangent vector along a geodesic for the rotation QN
+        extension, which leaves its parameters unchanged: the commutator of two
+        occupied-virtual rotations has only occupied-occupied and virtual-virtual
+        blocks, which are redundant, so that every term of the series in
+        ROHFOTR._transport vanishes
+        """
         return
 
-    # Hessian initialization
-    def init_hess(self, vector: np.ndarray) -> None:
+    def _init_hess(self, vector: np.ndarray) -> None:
+        """
+        this function applies the initial Hessian of the rotation QN extension to
+        parameters in place, the approximation 2 (F_vv x - x F_oo) that neglects the
+        response of the effective potential to the rotation
+        """
         mo_coeff_occ = self.mo_coeff[:, self.occ_idx]
         mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
 
         fock_oo = mo_coeff_occ.T @ self.fock @ mo_coeff_occ
         fock_vv = mo_coeff_virt.T @ self.fock @ mo_coeff_virt
 
-        x_vo = self.unpack_vo(vector)
+        x_vo = self._unpack_vo(vector)
         x_vo = 2 * (fock_vv @ x_vo - x_vo @ fock_oo)
-        vector[:] = self.pack_vo(x_vo)
+        vector[:] = self._pack_vo(x_vo)
 
-    # change of reference
-    def change_reference(
+    def _change_reference(
         self,
         new_ref: np.ndarray,
         kappa: np.ndarray,
@@ -1756,7 +1827,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
     ) -> None:
         """
         this function performs a gauge transformation for the S-GEK extension which
-        requires the history of orbital rotation parameters to be have vanishing
+        requires the history of orbital rotation parameters to have vanishing
         occupied-occupied and virtual-virtual blocks such that the GEK metric is
         consistent
         """
@@ -1774,55 +1845,21 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             combined_rot_vo = combined_rot[np.ix_(self.virt_idx, self.occ_idx)]
             combined_rot_vv = combined_rot[np.ix_(self.virt_idx, self.virt_idx)]
 
-            # # perform sine cosine decomposition of combined rotation matrix
-            # n_occ = np.count_nonzero(self.occ_idx)
-            # n_virt = np.count_nonzero(self.virt_idx)
-            # rank = min(n_occ, self.mol.nao - n_occ)
-            # ((u1, u2), theta, (v1h, v2h)) = sc.linalg.cossin(
-            #     [combined_rot_oo, combined_rot_ov, combined_rot_vo, combined_rot_vv],
-            #     separate=True,
-            # )
-            # lower_kappa = np.zeros((n_virt, n_occ), dtype=np.float64)
-            # lower_kappa[n_virt - rank :, n_occ - rank :] = np.diag(theta)
-            # kappa[i, :] = (u2 @ lower_kappa @ u1.T).ravel()
-
-            # # get rotation matrices to new basis
-            # rot_occ = (u1 @ v1h).T
-            # rot_virt = (u2 @ v2h).T
-
-            # test gauge transformation
-            # U_new = self._exp_mat(self._unpack(kappa[i, :]))
-            # U_new[np.ix_(self.occ_idx, self.occ_idx)] = U_new[np.ix_(self.occ_idx, self.occ_idx)] @ rot_occ.T
-            # U_new[np.ix_(self.occ_idx, self.virt_idx)] = U_new[np.ix_(self.occ_idx, self.virt_idx)] @ rot_virt.T
-            # U_new[np.ix_(self.virt_idx, self.occ_idx)] = U_new[np.ix_(self.virt_idx, self.occ_idx)] @ rot_occ.T
-            # U_new[np.ix_(self.virt_idx, self.virt_idx)] = U_new[np.ix_(self.virt_idx, self.virt_idx)] @ rot_virt.T
-            # print("kappa_diff", np.linalg.norm(combined_rot - U_new))
-
             # perform SVD of occupied block
             u, s, vh = sc.linalg.svd(combined_rot_oo)
-            # u2, s2, v2h = sc.linalg.svd(combined_rot_vv)
 
             # get rotation matrix to make occupied-occupied block vanish
-            rot_occ = u @ vh  # vh.T @ u.T
+            rot_occ = u @ vh
             rot_virt = (
                 combined_rot_vv
                 - combined_rot_vo @ (vh.T / (s + 1)) @ u.T @ combined_rot_ov
             )
-            # rot_virt = v2h.T @ u2.T
 
             # get combined rotation matrix with vanishing oo and vv blocks
             scos = np.ones_like(s)
             mask = np.abs(1 - s) > np.sqrt(np.finfo(float).eps)
             scos[mask] = np.arccos(s[mask]) / np.sqrt(1 - s[mask] ** 2)
-            kappa[i, :] = self.pack_vo(combined_rot_vo @ (vh.T * scos) @ u.T)
-
-            # # test gauge transformation
-            # U_new = self._exp_mat(self._unpack(kappa[i, :]))
-            # U_new[np.ix_(self.occ_idx, self.occ_idx)] = U_new[np.ix_(self.occ_idx, self.occ_idx)] @ rot_occ.T
-            # U_new[np.ix_(self.occ_idx, self.virt_idx)] = U_new[np.ix_(self.occ_idx, self.virt_idx)] @ rot_virt.T
-            # U_new[np.ix_(self.virt_idx, self.occ_idx)] = U_new[np.ix_(self.virt_idx, self.occ_idx)] @ rot_occ.T
-            # U_new[np.ix_(self.virt_idx, self.virt_idx)] = U_new[np.ix_(self.virt_idx, self.virt_idx)] @ rot_virt.T
-            # print("kappa_diff", np.linalg.norm(combined_rot - U_new))
+            kappa[i, :] = self._pack_vo(combined_rot_vo @ (vh.T * scos) @ u.T)
 
             # transform local gradients to new orbitals
             n_occ = rot_occ.shape[0]
@@ -1830,32 +1867,22 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             occ_unit = np.allclose(rot_occ, np.eye(n_occ), atol=1.0e-10, rtol=0)
             virt_unit = np.allclose(rot_virt, np.eye(n_virt), atol=1.0e-10, rtol=0)
             if not occ_unit or not virt_unit:
-                local_grad_2d = self.unpack_vo(local_grad[i, :])
+                local_grad_2d = self._unpack_vo(local_grad[i, :])
                 if not occ_unit:
                     local_grad_2d = local_grad_2d @ rot_occ
                 if not virt_unit:
                     local_grad_2d = rot_virt.T @ local_grad_2d
-                local_grad[i, :] = self.pack_vo(local_grad_2d)
-
-            # # test gradient transformation
-            # rot = self._exp_mat(self._unpack(kappa[i, :]))
-            # mo_coeff = self.rotate_mo(self.mo_coeff, rot)
-            # dm = self.make_rdm1(mo_coeff, self.mo_occ)
-            # vhf = self._scf.get_veff(self._scf.mol, dm)
-            # fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
-            # grad_full, _, _ = self.gen_g_hop(mo_coeff, self.mo_occ, fock)
-            # grad_test = 2 * grad_full[self.kappa_mask]
-            # print("local_grad_diff", np.linalg.norm(grad_test - local_grad[i, :]))
+                local_grad[i, :] = self._pack_vo(local_grad_2d)
 
             # transform gradients to new reference
-            u, s, vh = sc.linalg.svd(self.unpack_vo(kappa[i, :]), full_matrices=False)
-            t0 = self.unpack_vo(local_grad[i, :])
+            u, s, vh = sc.linalg.svd(self._unpack_vo(kappa[i, :]), full_matrices=False)
+            t0 = self._unpack_vo(local_grad[i, :])
             z = u.T @ t0 @ vh.T
             dm = 0.5 * np.sinc((s.reshape(-1, 1) - s) / np.pi)
             dp = 0.5 * np.sinc((s.reshape(-1, 1) + s) / np.pi)
             grad_2d = u @ ((z + z.T) * dm + (z - z.T) * dp) @ vh
-            # decide whether the occupied orbitals or virtual orbitals define the rank
-            # of the parameter matrix
+            # decide whether the occupied or virtual orbitals define the rank of the
+            # parameter matrix
             if n_occ <= n_virt:
                 grad_2d += (
                     (np.eye(n_virt) - u @ u.T) @ t0 @ ((vh.T * np.sinc(s / np.pi)) @ vh)
@@ -1864,12 +1891,16 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
                 grad_2d += (
                     ((u * np.sinc(s / np.pi)) @ u.T) @ t0 @ (np.eye(n_occ) - vh.T @ vh)
                 )
-            grad[i, :] = self.pack_vo(grad_2d)
+            grad[i, :] = self._pack_vo(grad_2d)
 
         return
 
-    # function to get orthogonal MO coefficients and occupations
-    def get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the occupations and the natural orbitals of the density
+        matrix, which define the orbitals after the OAO extension optimized the density
+        matrix
+        """
         eigvals_s, eigvecs_s = np.linalg.eigh(self.s1e)
         s_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.T
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
@@ -1937,15 +1968,14 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
     _exp_mat = RHFOTR._exp_mat
     _unpack = RHFOTR._unpack
 
-    # transport tangent vector along geodesic
-    def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
         """
         this function transports tangent_vector from the tangent space at a starting
         base to the tangent space at a new base along the geodesic. tangent_vector and
         geodesic have the same base. In other words, the displacement described by
         tangent_vector is defined in terms of the MO coefficients defined by
         the starting base, and this function transforms it to the MO coefficients
-        define by the new base. The geodesic describes the rotation from the starting
+        defined by the new base. The geodesic describes the rotation from the starting
         base to the new base.
         """
         # unpack into full matrix
@@ -1958,34 +1988,34 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         tangent_vector_full = self._unpack(tangent_vector)
         # k = 1
         k = 1
-        current_term = -(1 / 2) * self.remove_diag_blocks(
+        current_term = -(1 / 2) * self._remove_diag_blocks(
             geodesic_full @ tangent_vector_full - tangent_vector_full @ geodesic_full
         )
         tangent_vector_full = tangent_vector_full + current_term
         # k > 1
         while (np.linalg.norm(current_term) > tol) and (k < 200):
             k += 1
-            current_term = (-1 / (2 * k)) * self.remove_diag_blocks(
+            current_term = (-1 / (2 * k)) * self._remove_diag_blocks(
                 geodesic_full @ current_term - current_term @ geodesic_full
             )
             tangent_vector_full = tangent_vector_full + current_term
         current_term_norm = np.linalg.norm(current_term)
         if current_term_norm > tol:
             raise RuntimeError(
-                "Parallel transport trunctated before tolerance is reached. Norm of "
+                "Parallel transport truncated before tolerance is reached. Norm of "
                 f"the last term: {current_term_norm}."
             )
 
         # ensure the transported kappa and grad are in the tangent space of the new
         # reference
-        tangent_vector_full = self.ensure_tangent(tangent_vector_full)
+        tangent_vector_full = self._ensure_tangent(tangent_vector_full)
 
         # pack back into non-redundant parameters
         tangent_vector[:] = tangent_vector_full[self.rot_matrix_mask]
 
         return
 
-    def remove_diag_blocks(self, matrix: np.ndarray) -> np.ndarray:
+    def _remove_diag_blocks(self, matrix: np.ndarray) -> np.ndarray:
         """
         this function removes the redundant diagonal blocks of the matrix corresponding
         to closed, open, and virtual orbitals, which ensures the output is in the
@@ -1996,16 +2026,20 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
         matrix[np.ix_(self.virt_idx, self.virt_idx)] = 0.0
         return matrix
 
-    def ensure_tangent(self, tangent_vector: np.ndarray) -> np.ndarray:
+    def _ensure_tangent(self, tangent_vector: np.ndarray) -> np.ndarray:
         """
         this function ensures the input tangent vector is in the tangent space of the
         reference by removing the redundant diagonal blocks and anti-symmetrizing the
         matrix
         """
-        return self.remove_diag_blocks(0.5 * (tangent_vector - tangent_vector.T))
+        return self._remove_diag_blocks(0.5 * (tangent_vector - tangent_vector.T))
 
-    # function to get orthogonal MO coefficients and occupations
-    def get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the occupations and the natural orbitals of the total
+        density matrix, which define the orbitals after the OAO extension optimized the
+        density matrix
+        """
         eigvals_s, eigvecs_s = np.linalg.eigh(self.s1e)
         s_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.T
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
@@ -2136,8 +2170,11 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         matrices[1][self.rot_matrix_mask[1]] = rotation[n_param_a:]
         return [matrix - matrix.conj().T for matrix in matrices]
 
-    # unpack matrix into virtual-occupied block
-    def unpack_vo(self, kappa: np.ndarray) -> List[np.ndarray]:
+    def _unpack_vo(self, kappa: np.ndarray) -> List[np.ndarray]:
+        """
+        this function unpacks parameters into the virtual-occupied blocks of the
+        rotation matrices of both spins
+        """
         n_param_a = np.count_nonzero(self.rot_matrix_mask[0])
         matrix = [
             np.zeros((self.n_virt[0], self.n_occ[0]), dtype=np.float64),
@@ -2147,29 +2184,34 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         matrix[1][self.rot_matrix_mask_vo[1]] = kappa[n_param_a:]
         return matrix
 
-    # pack matrix from virtual occupied block
-    def pack_vo(self, matrix: List[np.ndarray]) -> np.ndarray:
+    def _pack_vo(self, matrix: List[np.ndarray]) -> np.ndarray:
+        """
+        this function packs the virtual-occupied blocks of the rotation matrices of
+        both spins into parameters
+        """
         return np.concatenate((matrix[0].ravel(), matrix[1].ravel()))[self.kappa_mask]
 
-    # evaluate quantities at a density matrix
-    def evaluate_dm(
+    def _evaluate_dm(
         self, dm: np.ndarray, fock: Optional[np.ndarray], get_response: bool
     ) -> Tuple[float, Optional[Callable[[np.ndarray, np.ndarray], None]]]:
+        """
+        this function evaluates the energy at the density matrices of both spins for
+        the MO and OAO extensions and, if asked for, the Fock matrices and the response
+        function
+        """
         # anything the caller did not ask for is not built
         vhf = self._potential(dm)
         if fock is not None:
             fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
         response = (
-            self.get_response_factory(self.gen_response(dm0=dm, hermi=1))
+            self._get_response_factory(self.gen_response(dm0=dm, hermi=1))
             if get_response
             else None
         )
 
         return self._scf.energy_tot(dm, self.h1e, vhf), response
 
-    # evaluate quantities at a density matrix with separate Coulomb, exact-exchange and
-    # non-linear (XC) contributions to the effective potential
-    def evaluate_dm_density_qn(
+    def _evaluate_dm_density_qn(
         self,
         dm: np.ndarray,
         fock: Optional[np.ndarray],
@@ -2177,6 +2219,12 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         v_exchange: Optional[np.ndarray],
         v_nonlinear: Optional[np.ndarray],
     ) -> float:
+        """
+        this function evaluates the energy at the density matrices of both spins for
+        the density QN extension and, if asked for, the Fock matrices and the Coulomb,
+        exact-exchange and non-linear (exchange-correlation) parts of the effective
+        potentials
+        """
         # anything the caller did not ask for is not built
         veff = self._potential(dm)
         ks = isinstance(self, scf.hf.KohnShamDFT)
@@ -2212,17 +2260,22 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
         return self._scf.energy_tot(dm, self.h1e, veff)
 
-    def get_response_factory(
+    def _get_response_factory(
         self, gen_response: Callable[[np.ndarray], np.ndarray]
     ) -> Callable[[np.ndarray, np.ndarray], None]:
+        """
+        this function turns a PySCF response function into the response function of
+        the extensions, which takes the density matrices of both spins, and counts its
+        two-electron builds
+        """
+
         def get_response(dm: np.ndarray, response: np.ndarray) -> None:
             self.n_jk_response += 1
             response[:, :, :] = gen_response(dm)
 
         return get_response
 
-    # change of reference
-    def change_reference(
+    def _change_reference(
         self,
         new_ref: np.ndarray,
         kappa: np.ndarray,
@@ -2231,7 +2284,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
     ) -> None:
         """
         this function performs a gauge transformation for the S-GEK extension which
-        requires the history of orbital rotation parameters to be have vanishing
+        requires the history of orbital rotation parameters to have vanishing
         occupied-occupied and virtual-virtual blocks such that the GEK metric is
         consistent
         """
@@ -2243,7 +2296,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             rot_mat = self._exp_mat(self._unpack(kappa[i, :]))
 
             kappa_2d = []
-            local_grad_2d = self.unpack_vo(local_grad[i, :])
+            local_grad_2d = self._unpack_vo(local_grad[i, :])
             grad_2d = []
             for spin in [0, 1]:
                 # get combined rotation matrix
@@ -2295,8 +2348,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
                 dm = 0.5 * np.sinc((s.reshape(-1, 1) - s) / np.pi)
                 dp = 0.5 * np.sinc((s.reshape(-1, 1) + s) / np.pi)
                 grad_2d.append(u @ ((z + z.T) * dm + (z - z.T) * dp) @ vh)
-                # decide whether the occupied orbitals or virtual orbitals define the rank
-                # of the parameter matrix
+                # decide whether the occupied or virtual orbitals define the rank of the
+                # parameter matrix
                 if n_occ <= n_virt:
                     grad_2d[spin] += (
                         (np.eye(n_virt) - u @ u.T)
@@ -2311,18 +2364,26 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
                     )
 
             # pack back into vectors
-            kappa[i, :] = self.pack_vo(kappa_2d)
-            local_grad[i, :] = self.pack_vo(local_grad_2d)
-            grad[i, :] = self.pack_vo(grad_2d)
+            kappa[i, :] = self._pack_vo(kappa_2d)
+            local_grad[i, :] = self._pack_vo(local_grad_2d)
+            grad[i, :] = self._pack_vo(grad_2d)
 
         return
 
-    # change of reference
-    def transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+        """
+        this function transports a tangent vector along a geodesic for the rotation QN
+        extension, which leaves its parameters unchanged, as RHFOTR._transport
+        explains for the rotations of each spin
+        """
         return
 
-    # function to get orthogonal MO coefficients and occupations
-    def get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the occupations and the natural orbitals of the density
+        matrix of each spin, which define the orbitals after the OAO extension
+        optimized the density matrices
+        """
         eigvals_s, eigvecs_s = np.linalg.eigh(self.s1e)
         s_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.T
         s_inv_sqrt = eigvecs_s @ np.diag(1.0 / np.sqrt(eigvals_s)) @ eigvecs_s.T
