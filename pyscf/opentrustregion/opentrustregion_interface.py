@@ -234,7 +234,7 @@ class OTR:
     """
     this class is the part common to all OTR drivers: it runs the solver and the
     stability check on the orbital update and the objective of a driver, with the
-    settings taken from its attributes, and caches the last orbital update
+    settings taken from its attributes
     """
 
     _keys = set(
@@ -256,11 +256,6 @@ class OTR:
     # set while the kernel runs
     n_param: int
     converged: bool
-
-    # the cost function, gradient, Hessian diagonal and Hessian linear transformation
-    # of the last orbital update, keyed by the point they were computed at and reused
-    # when the solver asks for the same point again
-    _last_update = LastResult()
 
     # whether the current kernel has performed an orbital update yet
     _updated = False
@@ -289,7 +284,6 @@ class OTR:
         this function discards everything a previous kernel computed
         """
         self._updated = False
-        self._last_update = LastResult()
 
     # Hessian linear transformation of the last orbital update
     _raw_hess_x: OTRHessX
@@ -313,13 +307,6 @@ class OTR:
     # the boolean stability setting of the solver shadows the stability() method of
     # PySCF's mean-field and localizer classes; the equivalent is stability_check()
     stability = False
-
-    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
-        """
-        this function returns the arrays that define the point an orbital update
-        describes
-        """
-        return (self.mo_coeff,)
 
     def _record_inherited_settings(self) -> None:
         """
@@ -503,18 +490,11 @@ class LocalizerOTR(OTR):
         this function rotates the orbitals by a step and returns the cost function, its
         gradient, Hessian diagonal and Hessian linear transformation there
         """
-        # reuse the cached update when the step is zero and nothing has moved the
-        # orbitals since, so the cost function and its derivatives still apply
         self._moves(kappa)
-        if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
-            u = ciah.expmat(self.unpack_uniq_var(kappa))
-            func = self.cost_function(u)
-            new_grad, hess_x, new_h_diag = self.gen_g_hop(u)
-            self.mo_coeff = self.mo_coeff @ u
-            self._last_update = LastResult.of(
-                self._orbs_state(), (func, new_grad, new_h_diag, hess_x)
-            )
-        func, new_grad, new_h_diag, hess_x = self._last_update.value
+        u = ciah.expmat(self.unpack_uniq_var(kappa))
+        func = self.cost_function(u)
+        new_grad, hess_x, new_h_diag = self.gen_g_hop(u)
+        self.mo_coeff = self.mo_coeff @ u
 
         grad[:] = new_grad
         h_diag[:] = new_h_diag
@@ -999,23 +979,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
         this function returns the orbitals and the occupations, which define the
-        density at the point a cached orbital update describes
+        point the extension objects of the routines the last kernel adopted describe
         """
         return (self.mo_coeff, self.mo_occ)
-
-    def _save_update_orbs(self) -> None:
-        """
-        this function saves the energy, gradient, Hessian diagonal and Hessian linear
-        transformation at the current orbitals, computed from their density matrix,
-        effective potential and Fock matrix
-        """
-        energy = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
-        new_grad, hess_x, new_h_diag = self.gen_g_hop(
-            self.mo_coeff, self.mo_occ, self.fock
-        )
-        self._last_update = LastResult.of(
-            self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
-        )
 
     def _update_orbs(
         self, kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
@@ -1024,19 +990,19 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         this function rotates the orbitals by a step and returns the energy, its
         gradient, Hessian diagonal and Hessian linear transformation there
         """
-        # reuse the cached update when the step is zero and nothing has moved the
-        # orbitals since, so the effective potential and Fock matrix need not be rebuilt
         self._moves(kappa)
-        if np.any(kappa) or not self._last_update.matches(self._orbs_state()):
-            # perform orbital rotation and get new fock matrix
-            u = self._exp_mat(self._unpack(self._rotation(kappa)))
-            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-            self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-            self.vhf = self._potential(self.dm)
-            self._count_update()
-            self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
-            self._save_update_orbs()
-        energy, new_grad, new_h_diag, hess_x = self._last_update.value
+
+        # perform orbital rotation and get new fock matrix
+        u = self._exp_mat(self._unpack(self._rotation(kappa)))
+        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+        self.dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
+        self.vhf = self._potential(self.dm)
+        self._count_update()
+        self.fock = self.get_fock(self.h1e, self.s1e, self.vhf, self.dm)
+        energy = self._scf.energy_tot(self.dm, self.h1e, self.vhf)
+        new_grad, hess_x, new_h_diag = self.gen_g_hop(
+            self.mo_coeff, self.mo_occ, self.fock
+        )
 
         # PySCF's quantities are half the derivatives with respect to the rotations;
         # for complex orbitals, the real and imaginary parts of the gradient are the
@@ -2774,13 +2740,6 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         return self._eigenstates(rot_mo_coeff, self._displaced_ci(x), eris)[0]
 
-    def _orbs_state(self) -> Tuple[np.ndarray, ...]:
-        """
-        this function returns the orbitals and the CI vectors, which define the point a
-        cached orbital update describes
-        """
-        return (self.mo_coeff, *self._ci_vectors(self.ci))
-
     def _update_orbs(
         self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
     ) -> Tuple[float, OTRHessX]:
@@ -2788,28 +2747,19 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         this function moves the orbitals and CI vectors by a step and returns the
         energy, its gradient, Hessian diagonal and Hessian linear transformation there
         """
-        # reuse the cached update when the step is zero and nothing has moved the
-        # orbitals or CI vectors since, so the integrals need not be transformed again
         self._moves(x)
-        if np.any(x) or not self._last_update.matches(self._orbs_state()):
-            u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
-            self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
-            eris = self.ao2mo(self.mo_coeff)
+        u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
+        self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
+        eris = self.ao2mo(self.mo_coeff)
 
-            # the states move on as the eigenstates within the space the displaced CI
-            # vectors span, at which gen_g_hop's derivatives are those of the energy
-            energy, states = self._eigenstates(
-                self.mo_coeff, self._displaced_ci(x), eris
-            )
-            self.ci = states[0] if isinstance(self.ci, np.ndarray) else states
+        # the states move on as the eigenstates within the space the displaced CI
+        # vectors span, at which gen_g_hop's derivatives are those of the energy
+        energy, states = self._eigenstates(self.mo_coeff, self._displaced_ci(x), eris)
+        self.ci = states[0] if isinstance(self.ci, np.ndarray) else states
 
-            new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
-                self, self.mo_coeff, self.ci, eris
-            )
-            self._last_update = LastResult.of(
-                self._orbs_state(), (energy, new_grad, new_h_diag, hess_x)
-            )
-        energy, new_grad, new_h_diag, hess_x = self._last_update.value
+        new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
+            self, self.mo_coeff, self.ci, eris
+        )
 
         # gen_g_hop extends over all CI coefficients and takes the CI part of the
         # Hessian linear transformation of every state orthogonal only to that state,

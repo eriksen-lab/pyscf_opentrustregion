@@ -248,5 +248,5 @@ python3 -m unittest pyscf.opentrustregion.test.test_opentrustregion_interface
 ```
 
 It compares converged energies against the PySCF solvers this interface replaces and
-checks the settings translation, the cached orbital updates, the derivatives and the
-stability check. The solver itself is covered by the OpenTrustRegion testsuite.
+checks the settings translation, the derivatives and the stability check. The solver
+itself is covered by the OpenTrustRegion testsuite.
