@@ -683,7 +683,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             vhf = self._scf.get_veff(mol, dm, dm_last=self.dm, vhf_last=self.vhf)
             self.dm, self.vhf = dm, vhf
 
-        self.mo_coeff, self.mo_occ = np.asarray(mo_coeff), mo_occ
+        self.mo_coeff, self.mo_occ = np.array(mo_coeff), mo_occ
 
         # fix phases of MO coefficients to improve deterministic behavior
         self.fix_phase()
