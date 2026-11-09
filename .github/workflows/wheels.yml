@@ -33,10 +33,13 @@ jobs:
       - name: Checkout interface
         uses: actions/checkout@v7
 
+      # the newest Python the CI workflow tests, since a new Python release comes
+      # before the binary dependencies of PySCF ship wheels for it and the wheel check
+      # would then build them from source
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.13"
 
       - name: Build sdist and wheel
         run: pipx run build

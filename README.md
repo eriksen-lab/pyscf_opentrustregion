@@ -31,12 +31,6 @@ OpenTrustRegion library:
 pip install pyscf-opentrustregion
 ```
 
-Confirm the OpenTrustRegion installation with
-
-```sh
-python3 -m pyopentrustregion.verify_install
-```
-
 The OpenTrustRegion wheels are built with 32-bit integers. To build it from source
 instead, for example with 64-bit integers or from its development branch, follow the
 [OpenTrustRegion installation instructions](https://github.com/eriksen-lab/opentrustregion#installation)
@@ -52,10 +46,11 @@ git clone https://github.com/eriksen-lab/pyscf_opentrustregion
 pip install -e pyscf_opentrustregion
 ```
 
-or, instead of installing it, point PySCF at the clone through the `PYSCF_EXT_PATH`
-environment variable:
+or, instead of installing it, install its dependencies and point PySCF at the clone
+through the `PYSCF_EXT_PATH` environment variable:
 
 ```sh
+pip install pyscf pyopentrustregion
 export PYSCF_EXT_PATH=$PWD/pyscf_opentrustregion:$PYSCF_EXT_PATH
 ```
 
@@ -112,8 +107,8 @@ mf = to_otr(mf)
 ```
 
 A grid changed in place, as by `mf.grids.level = 4`, reaches both objects, since they
-share it. To approximate the Hessian on purpose with a coarser grid, PySCF releases
-after 2.14 provide `mf.set_second_grids()`, whose grid only the Hessian uses.
+share it. To approximate the Hessian on purpose with a coarser grid, PySCF 2.15 and
+later provide `mf.set_second_grids()`, whose grid only the Hessian uses.
 
 ### Orbital localization
 
@@ -221,10 +216,11 @@ result is normally already a minimum.
 
 ## Diagnostics
 
-Each object counts the work the solver asked it for, over its whole lifetime:
+Each object counts the work the solver asked it for, over its whole lifetime; an
+orbital update is a Fock build for SCF and an integral transformation for CASSCF:
 
 ```python
-mf.n_update_orbs     # orbital updates, i.e. Fock builds or integral transformations
+mf.n_update_orbs     # orbital updates
 mf.n_hess_x          # Hessian linear transformations
 ```
 
