@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import functools
+import inspect
+import weakref
 import numpy as np
 from dataclasses import dataclass
 import scipy as sc
@@ -169,14 +171,34 @@ def setting_is_assignable(obj: object, setting: str) -> bool:
     return setting != "conv_check" or not isinstance(getattr(obj, setting, None), bool)
 
 
+def weak_method(routine: Callable) -> Callable:
+    """
+    this function returns a function that calls a bound method through a weak reference
+    to its object, and any other routine as it is; a driver hands its methods to the
+    settings and the extension objects, which it keeps alive itself, only through such
+    references, since the methods would otherwise keep the driver alive in a reference
+    cycle, which only the garbage collector frees
+    """
+    if not inspect.ismethod(routine):
+        return routine
+    method: Any = weakref.WeakMethod(routine)
+
+    def call(*args: Any) -> Any:
+        return method()(*args)
+
+    return call
+
+
 def assign_pyscf_logger(obj: object, settings: Settings) -> None:
     """
     this function hands the messages of the solver, the stability check or an
     extension to the PySCF log of an object, so that its output and verbosity control
     them as they control those of PySCF; the library hands on only the messages at its
-    verbosity, which is that of the object
+    verbosity, which is that of the object, which the settings refer to weakly, like
+    the methods of a driver
     """
-    settings.logger = lambda message: lib.logger.log(obj, "%s", message)
+    reference = weakref.ref(obj)
+    settings.logger = lambda message: lib.logger.log(reference(), "%s", message)
 
 
 def assign_stability_settings(
@@ -304,6 +326,15 @@ class OTR:
         self._raw_hess_x(x, hx)
         self.n_hess_x_stability += 1
 
+    def _drop_hess_x(self) -> None:
+        """
+        this function drops the Hessian linear transformations of the last orbital
+        updates once the solver or the stability check has returned, since they can
+        refer to this object, which would keep them alive in a reference cycle
+        """
+        self.__dict__.pop("_raw_hess_x", None)
+        self.__dict__.pop("_raw_approx_hess_x", None)
+
     # the boolean stability setting of the solver shadows the stability() method of
     # PySCF's mean-field and localizer classes; the equivalent is stability_check()
     stability = False
@@ -381,6 +412,8 @@ class OTR:
         except RuntimeError as error:
             if f"(code {error_solver_max_iter})" not in str(error):
                 raise
+        finally:
+            self._drop_hess_x()
 
     def _warn_on_callback(self, callback: Optional[Callable[..., None]]) -> None:
         """
@@ -432,13 +465,16 @@ class OTR:
 
         # run stability check
         direction = np.empty(self.n_param, dtype=np.float64)
-        stable = stability_check(
-            h_diag,
-            self._count_stability_hess_x,
-            self.n_param,
-            settings,
-            kappa=direction,
-        )
+        try:
+            stable = stability_check(
+                h_diag,
+                self._count_stability_hess_x,
+                self.n_param,
+                settings,
+                kappa=direction,
+            )
+        finally:
+            self._drop_hess_x()
 
         return stable, direction
 
@@ -773,7 +809,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _canonical_rotation: Optional[list] = None
 
     # the orbitals the last kernel left, which the extension objects of the routines it
-    # adopted describe, if it adopted any
+    # adopted describe, if it adopted any, with a weak reference to the object whose
+    # kernel adopted them, which a copy of the object shares the routines with
     _kernel_orbitals = LastResult()
 
     def _adopt(self, name: str, routine: Callable) -> None:
@@ -783,6 +820,31 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         the method until the routines the kernel adopted are dropped
         """
         self.__dict__[name] = routine
+
+    def _response_function(
+        self, dm0: np.ndarray, scale: float
+    ) -> Callable[[np.ndarray, np.ndarray], None]:
+        """
+        this function returns the response function of the extensions at the density
+        matrices of every spin dm0, which scaled are those of the PySCF object, and
+        counts its two-electron builds; the extension objects keep it alive, so it
+        refers to this object weakly and PySCF's response function, which refers to the
+        object it is built on, is built on a view of this object without the routines
+        it adopted from the extension factories and the Hessian linear transformations
+        of its last orbital updates
+        """
+        view = lib.view(self, type(self))
+        view._drop_hess_x()
+        for name in self._factory_routines:
+            view.__dict__.pop(name, None)
+        gen_response = view.gen_response(dm0=scale * dm0, hermi=1)
+        driver: Any = weakref.proxy(self)
+
+        def get_response(dm: np.ndarray, response: np.ndarray) -> None:
+            driver.n_jk_response += 1
+            response[...] = gen_response(scale * dm)
+
+        return get_response
 
     def _drop_adopted_routines(self) -> None:
         """
@@ -809,10 +871,16 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         """
         this function keeps the routines the last kernel adopted while the orbitals and
         occupations are those the kernel left, which the extension objects of these
-        routines keep, and otherwise drops them and determines the parameters of the
-        current orbitals and occupations, on which the routines of this object work
+        routines keep, and otherwise, or on a copy of the object whose kernel adopted
+        them, whose extension objects refer to that object, drops them and determines
+        the parameters of the current orbitals and occupations, on which the routines of
+        this object work
         """
-        if self._adopted_routines and self._kernel_orbitals.matches(self._orbs_state()):
+        if (
+            self._adopted_routines
+            and self._kernel_orbitals.matches(self._orbs_state())
+            and self._kernel_orbitals.value() is self
+        ):
             return
 
         self._drop_adopted_routines()
@@ -1019,7 +1087,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         self._raw_hess_x = raw_hess_x
 
-        return energy, self._count_hess_x
+        # the rotation QN and S-GEK objects keep the Hessian linear transformation the
+        # orbital update of their host returned last, so it refers to this object weakly
+        return energy, weak_method(self._count_hess_x)
 
     def kernel(
         self,
@@ -1242,6 +1312,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 name: self.__dict__.get(name) for name in self._factory_routines
             }
 
+            # the routines this object adopts refer to it weakly, like the methods it
+            # hands to the factories and the settings
+            driver: Any = weakref.proxy(self)
+
             # the extensions replace or take over routines of this object, which are
             # recorded also if a factory or a check after one raises, so that the next
             # kernel drops them
@@ -1259,7 +1333,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                             n_particle,
                             self._scf.mol.nao,
                             self.mo_coeff.shape[-1],
-                            self._evaluate_dm,
+                            weak_method(self._evaluate_dm),
                             settings,
                             state,
                             mo_settings,
@@ -1281,7 +1355,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                             self.s1e,
                             n_particle,
                             self._scf.mol.nao,
-                            self._evaluate_dm,
+                            weak_method(self._evaluate_dm),
                             settings,
                             state,
                             oao_settings,
@@ -1301,13 +1375,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     def wrapped_update_orbs(
                         kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
                     ) -> Tuple[float, OTRHessX]:
-                        n_jk = self.n_jk
+                        n_jk = driver.n_jk
                         func, hess_x = exact_update_orbs(kappa, grad, h_diag)
-                        if self._moves(kappa) or self.n_jk > n_jk:
-                            self._count_update()
-                        self._raw_hess_x = hess_x
+                        if driver._moves(kappa) or driver.n_jk > n_jk:
+                            driver._count_update()
+                        driver._raw_hess_x = hess_x
 
-                        return func, self._count_hess_x
+                        return func, weak_method(driver._count_hess_x)
 
                     self._adopt("_update_orbs", wrapped_update_orbs)
 
@@ -1326,7 +1400,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     # on, which holds the orbitals it updates in place and provides the
                     # exact Hessian the stability check uses
                     approx_update_orbs, obj_func = density_qn_factory(
-                        self._evaluate_dm_density_qn,
+                        weak_method(self._evaluate_dm_density_qn),
                         settings,
                         state,
                         density_qn_settings,
@@ -1343,10 +1417,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     def wrapped_approx_update_orbs(
                         kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
                     ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-                        n_jk = self.n_jk
+                        n_jk = driver.n_jk
                         func, hess_x = approx_update_orbs(kappa, grad, h_diag)
-                        if self._moves(kappa) or self.n_jk > n_jk:
-                            self._count_update()
+                        if driver._moves(kappa) or driver.n_jk > n_jk:
+                            driver._count_update()
                         return func, hess_x
 
                     self._approx_update_orbs = wrapped_approx_update_orbs
@@ -1358,10 +1432,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     )
                     self._approx_update_orbs, obj_func = rotation_qn_factory(
                         self.n_param,
-                        self._update_orbs,
-                        self._func,
-                        self._transport,
-                        self._init_hess,
+                        weak_method(self._update_orbs),
+                        weak_method(self._func),
+                        weak_method(self._transport),
+                        weak_method(self._init_hess),
                         settings,
                         state,
                         rotation_qn_settings,
@@ -1385,9 +1459,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     )
                     self._approx_update_orbs, obj_func = s_gek_factory(
                         self.n_param,
-                        self._update_orbs,
-                        self._func,
-                        self._change_reference,
+                        weak_method(self._update_orbs),
+                        weak_method(self._func),
+                        weak_method(self._change_reference),
                         settings,
                         state,
                         s_gek_settings,
@@ -1410,9 +1484,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 h_diag = np.empty(self.n_param, dtype=np.float64)
                 self._update_orbs(kappa, grad, h_diag)
 
-                settings.stability_hess_x = self._count_stability_hess_x
+                settings.stability_hess_x = weak_method(self._count_stability_hess_x)
                 if hasattr(self, "_approx_update_orbs"):
-                    settings.stability_settings.approx_hess_x = (
+                    settings.stability_settings.approx_hess_x = weak_method(
                         self._approx_stability_hess_x
                     )
 
@@ -1479,12 +1553,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     rotation, occ_idx, virt_idx, masks_evaluated, self._vo_masks()
                 )
             ]
-            self.stability_get_extra_trial_vectors = self._canonical_trial_vectors
+            self.stability_get_extra_trial_vectors = weak_method(
+                self._canonical_trial_vectors
+            )
 
         # the adopted routines describe the orbitals the kernel leaves, which are
-        # recorded so that the routines are dropped once these orbitals are replaced
+        # recorded with this object so that the routines are dropped once these
+        # orbitals are replaced and kept by none of its copies
         if self._adopted_routines:
-            self._kernel_orbitals = LastResult.of(self._orbs_state(), None)
+            self._kernel_orbitals = LastResult.of(self._orbs_state(), weakref.ref(self))
 
         return self.e_tot
 
@@ -1693,13 +1770,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         if fock is not None:
             self.fock = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
             fock[:, :] = self.fock
-        response = (
-            self._get_response_factory(
-                self.gen_response(dm0=2.0 * dm, hermi=1, singlet=None)
-            )
-            if get_response
-            else None
-        )
+        response = self._response_function(dm, 2.0) if get_response else None
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff), response
 
@@ -1742,21 +1813,6 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff)
-
-    def _get_response_factory(
-        self, gen_response: Callable[[np.ndarray], np.ndarray]
-    ) -> Callable[[np.ndarray, np.ndarray], None]:
-        """
-        this function turns a PySCF response function into the response function of
-        the extensions, which takes a density matrix of one spin, and counts its
-        two-electron builds
-        """
-
-        def get_response(dm: np.ndarray, response: np.ndarray) -> None:
-            self.n_jk_response += 1
-            response[:, :] = gen_response(2.0 * dm)
-
-        return get_response
 
     def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
         """
@@ -2169,11 +2225,7 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         vhf = self._potential(dm)
         if fock is not None:
             fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
-        response = (
-            self._get_response_factory(self.gen_response(dm0=dm, hermi=1))
-            if get_response
-            else None
-        )
+        response = self._response_function(dm, 1.0) if get_response else None
 
         return self._scf.energy_tot(dm, self.h1e, vhf), response
 
@@ -2225,21 +2277,6 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, veff, dm)
 
         return self._scf.energy_tot(dm, self.h1e, veff)
-
-    def _get_response_factory(
-        self, gen_response: Callable[[np.ndarray], np.ndarray]
-    ) -> Callable[[np.ndarray, np.ndarray], None]:
-        """
-        this function turns a PySCF response function into the response function of
-        the extensions, which takes the density matrices of both spins, and counts its
-        two-electron builds
-        """
-
-        def get_response(dm: np.ndarray, response: np.ndarray) -> None:
-            self.n_jk_response += 1
-            response[:, :, :] = gen_response(dm)
-
-        return get_response
 
     def _change_reference(
         self,

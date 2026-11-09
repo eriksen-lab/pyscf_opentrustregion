@@ -8,8 +8,11 @@
 Tests for the PySCF interface to OpenTrustRegion
 """
 
+import gc
 import io
+import types
 import unittest
+import weakref
 from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 from itertools import product
@@ -589,6 +592,16 @@ class SCFTests(unittest.TestCase):
         for name, value in settings.items():
             setattr(otr, name, value)
         e_tot = otr.kernel(dm0=dm0)
+
+        # after the kernel, nothing but the frames holding the object refers to it,
+        # since the routines it adopted from the extension factories, the functions
+        # these call and its settings refer to it weakly, so that it is in no reference
+        # cycle and freed without the garbage collector once these frames are gone
+        referrers = gc.get_referrers(otr)
+        self.assertEqual(
+            [obj for obj in referrers if not isinstance(obj, types.FrameType)], []
+        )
+
         self.assertTrue(otr.converged)
         self.assertAlmostEqual(e_tot, ref, 8)
         self.assertAlmostEqual(otr.e_tot, ref, 8)
@@ -936,11 +949,27 @@ class SCFTests(unittest.TestCase):
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
 
+                # a copy checks its orbitals with its own routines, since the
+                # extension objects of the routines the kernel adopted refer to the
+                # object whose kernel ran
+                n_hess_x_stability = otr.n_hess_x_stability
+                stable, _ = check_stability_shape(self, otr.copy())
+                self.assertTrue(stable)
+                self.assertEqual(otr.n_hess_x_stability, n_hess_x_stability)
+
                 # placing the same object back at the restricted solution must make the
                 # check report the instability, along with a normalized direction out
-                # of the saddle
-                otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
-                stable, direction = check_stability_shape(self, otr)
+                # of the saddle; the check drops the routines the kernel adopted, whose
+                # extension objects are freed with them without the garbage collector
+                adopted = weakref.ref(otr._func)
+                gc.disable()
+                try:
+                    otr.mo_coeff = np.array([rhf.mo_coeff, rhf.mo_coeff])
+                    stable, direction = check_stability_shape(self, otr)
+                    freed = adopted() is None
+                finally:
+                    gc.enable()
+                self.assertTrue(freed)
                 self.assertFalse(stable)
                 self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.0, 8)
 
