@@ -70,7 +70,8 @@ if TYPE_CHECKING:
 # fields of the settings structures that are not settings of an object: the
 # initialization flag and the host context of the C structures, the logging function,
 # which always writes to the PySCF log of the object, and the initial Hessian, its
-# preconditioner and the objective function of rotation QN, which the driver supplies
+# preconditioner, the objective function and the transport function of rotation QN,
+# which the driver supplies where it needs them
 non_setting_fields = (
     "initialized",
     "context",
@@ -78,6 +79,7 @@ non_setting_fields = (
     "init_hess",
     "init_precond",
     "obj_func_grad",
+    "transport",
 )
 
 
@@ -1511,7 +1513,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     # preconditioner, and their objective function also returns the
                     # gradient at a trial point, from the potential its energy
                     # evaluation left cached, so that rotation QN also learns from a
-                    # rejected step
+                    # rejected step, while the identity, the default transport, is the
+                    # parallel transport of the occupied-virtual rotations
                     mo_obj_func = self._func
 
                     def obj_func_grad(kappa: np.ndarray, grad: np.ndarray) -> float:
@@ -1533,7 +1536,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         self.n_param,
                         self._update_orbs,
                         mo_obj_func,
-                        weak_method(self._transport),
                         settings,
                         state,
                         rotation_qn_settings,
@@ -1911,16 +1913,6 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             fock[:, :] = self.get_fock(self.h1e, self.s1e, veff, 2.0 * dm)
 
         return self._scf.energy_tot(2.0 * dm, self.h1e, veff)
-
-    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
-        """
-        this function transports a tangent vector along a geodesic for the rotation QN
-        extension, which leaves its parameters unchanged: the commutator of two
-        occupied-virtual rotations has only occupied-occupied and virtual-virtual
-        blocks, which are redundant, so that every term of the series in
-        ROHFOTR._transport vanishes
-        """
-        return
 
     def _static_channels(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
         """
@@ -2483,14 +2475,6 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             local_grad[i, :] = self._pack_vo(local_grad_2d)
             grad[i, :] = self._pack_vo(grad_2d)
 
-        return
-
-    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
-        """
-        this function transports a tangent vector along a geodesic for the rotation QN
-        extension, which leaves its parameters unchanged, as RHFOTR._transport
-        explains for the rotations of each spin
-        """
         return
 
     def _static_channels(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
