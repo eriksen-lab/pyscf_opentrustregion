@@ -68,9 +68,17 @@ if TYPE_CHECKING:
 
 
 # fields of the settings structures that are not settings of an object: the
-# initialization flag and the host context of the C structures, and the logging
-# function, which always writes to the PySCF log of the object
-non_setting_fields = ("initialized", "context", "logger")
+# initialization flag and the host context of the C structures, the logging function,
+# which always writes to the PySCF log of the object, and the initial Hessian, its
+# preconditioner and the objective function of rotation QN, which the driver supplies
+non_setting_fields = (
+    "initialized",
+    "context",
+    "logger",
+    "init_hess",
+    "init_precond",
+    "obj_func_grad",
+)
 
 
 def setting_fields(settings_c: Type[Structure]) -> List[str]:
@@ -245,6 +253,9 @@ def assign_extension_settings(
             setattr(settings, setting, getattr(obj, setting))
     assign_pyscf_logger(obj, settings)
 
+
+# the floor of the divisors of the preconditioners of OpenTrustRegion
+precond_floor = 1e-10
 
 # the error code, named as in OpenTrustRegion, with which the solver reports that it
 # reached the maximum number of macro iterations, which pyopentrustregion states only
@@ -1044,6 +1055,69 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         vhf = self._potential(dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
 
+    # eigendecompositions of the static part of the Hessian, keyed by the Fock matrix
+    # and the orbitals they belong to
+    _static_eigen = LastResult()
+
+    def _static_eigenpairs(self) -> List[Tuple[np.ndarray, ...]]:
+        """
+        this function returns, for every channel, the eigenvalues and eigenvectors of
+        the occupied-occupied and virtual-virtual blocks of the Fock matrix at the
+        current orbitals and the factor of the static part of the Hessian, which they
+        diagonalize, computed once for every Fock matrix and orbitals
+        """
+        key = (self.fock, self.mo_coeff)
+        if not self._static_eigen.matches(key):
+            eigenpairs = [
+                (*np.linalg.eigh(fock_oo), *np.linalg.eigh(fock_vv), factor)
+                for fock_oo, fock_vv, factor in self._static_channels()
+            ]
+            self._static_eigen = LastResult.of(key, eigenpairs)
+        return self._static_eigen.value
+
+    def _apply_static(
+        self, vector: np.ndarray, scale: Callable[[np.ndarray], np.ndarray]
+    ) -> np.ndarray:
+        """
+        this function applies a function of the static part of the Hessian at the
+        current orbitals, factor (F_vv x - x F_oo) for every channel, to parameters by
+        scaling them with the function of its eigenvalues in its eigenbasis
+        """
+        blocks = self._unpack_vo(vector)
+        blocks = blocks if isinstance(blocks, list) else [blocks]
+        scaled = []
+        for block, (eigval_occ, eigvec_occ, eigval_virt, eigvec_virt, factor) in zip(
+            blocks, self._static_eigenpairs()
+        ):
+            eigvals = factor * (eigval_virt[:, None] - eigval_occ[None, :])
+            rotated = eigvec_virt.T @ block @ eigvec_occ
+            scaled.append(eigvec_virt @ (scale(eigvals) * rotated) @ eigvec_occ.T)
+        return self._pack_vo(scaled if len(scaled) > 1 else scaled[0])
+
+    def _static_hess_x(self, x: np.ndarray, hess_x: np.ndarray) -> None:
+        """
+        this function applies the static part of the Hessian at the current orbitals,
+        which neglects the response of the effective potential to the rotation and
+        which the rotation QN extension takes as its initial Hessian
+        """
+        hess_x[:] = self._apply_static(x, lambda eigvals: eigvals)
+
+    def _static_precond(
+        self, residual: np.ndarray, mu: float, precond_residual: np.ndarray
+    ) -> None:
+        """
+        this function applies the inverse of the static part of the Hessian at the
+        current orbitals shifted by a level shift, whose divisors are floored as those
+        of the preconditioners of OpenTrustRegion, for the rotation QN extension
+        """
+
+        def inverse(eigvals: np.ndarray) -> np.ndarray:
+            divisors = eigvals - mu
+            divisors[np.abs(divisors) < precond_floor] = precond_floor
+            return 1.0 / divisors
+
+        precond_residual[:] = self._apply_static(residual, inverse)
+
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
         this function returns the orbitals and the occupations, which define the
@@ -1163,6 +1237,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if isinstance(self, ROHFOTR) and (self.oao or density_qn):
             raise NotImplementedError(
                 "OAO and density QN are not currently implemented for ROHF."
+            )
+        # rotation QN takes its initial Hessian, the static part of the Hessian, and the
+        # inverse of it from the MO extension, which only RHF and UHF use
+        if rotation_qn and (self.oao or isinstance(self, ROHFOTR)):
+            raise NotImplementedError(
+                "Rotation QN is not currently implemented for ROHF or in the OAO basis."
             )
         if self.oao and self._scf.mol.symmetry:
             raise NotImplementedError(
@@ -1426,16 +1506,34 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self._approx_update_orbs = wrapped_approx_update_orbs
                     self._raw_approx_update_orbs = approx_update_orbs
                 elif rotation_qn:
+                    # the initial Hessian of the rotation QN settings is the static
+                    # part of the Hessian, whose level-shifted inverse is their
+                    # preconditioner, and their objective function also returns the
+                    # gradient at a trial point, from the potential its energy
+                    # evaluation left cached, so that rotation QN also learns from a
+                    # rejected step
+                    mo_obj_func = self._func
+
+                    def obj_func_grad(kappa: np.ndarray, grad: np.ndarray) -> float:
+                        func = mo_obj_func(kappa)
+                        if np.isfinite(func):
+                            grad[:] = driver._trial_gradient(kappa)
+                        return func
+
                     rotation_qn_settings = RotationQNSettings()
                     assign_extension_settings(
                         self, rotation_qn_settings, rotation_qn_setting_fields
                     )
+                    rotation_qn_settings.init_hess = weak_method(self._static_hess_x)
+                    rotation_qn_settings.init_precond = weak_method(
+                        self._static_precond
+                    )
+                    rotation_qn_settings.obj_func_grad = obj_func_grad
                     self._approx_update_orbs, obj_func = rotation_qn_factory(
                         self.n_param,
-                        weak_method(self._update_orbs),
-                        weak_method(self._func),
+                        self._update_orbs,
+                        mo_obj_func,
                         weak_method(self._transport),
-                        weak_method(self._init_hess),
                         settings,
                         state,
                         rotation_qn_settings,
@@ -1824,21 +1922,34 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         """
         return
 
-    def _init_hess(self, vector: np.ndarray) -> None:
+    def _static_channels(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
         """
-        this function applies the initial Hessian of the rotation QN extension to
-        parameters in place, the approximation 2 (F_vv x - x F_oo) that neglects the
-        response of the effective potential to the rotation
+        this function returns the occupied-occupied and virtual-virtual blocks of the
+        Fock matrix at the current orbitals and the factor of the static part of the
+        Hessian, 4 for the doubly occupied orbitals
         """
         mo_coeff_occ = self.mo_coeff[:, self.occ_idx]
         mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
+        return [
+            (
+                mo_coeff_occ.T @ self.fock @ mo_coeff_occ,
+                mo_coeff_virt.T @ self.fock @ mo_coeff_virt,
+                4.0,
+            )
+        ]
 
-        fock_oo = mo_coeff_occ.T @ self.fock @ mo_coeff_occ
-        fock_vv = mo_coeff_virt.T @ self.fock @ mo_coeff_virt
-
-        x_vo = self._unpack_vo(vector)
-        x_vo = 2 * (fock_vv @ x_vo - x_vo @ fock_oo)
-        vector[:] = self._pack_vo(x_vo)
+    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function returns the gradient 4 F_vo at the orbitals a step rotates the
+        current ones to, from the effective potential the evaluation of the energy
+        there left cached, for the rotation QN extension
+        """
+        dm, veff = self._last_potential.key[0], self._last_potential.value
+        u = self._exp_mat(self._unpack(self._rotation(kappa)))
+        mo_coeff = self.rotate_mo(self.mo_coeff, u)
+        fock = self.get_fock(self.h1e, self.s1e, veff, dm)
+        grad_vo = mo_coeff[:, self.virt_idx].T @ fock @ mo_coeff[:, self.occ_idx]
+        return self._pack_vo(4 * grad_vo)
 
     def _change_reference(
         self,
@@ -2224,7 +2335,8 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         # anything the caller did not ask for is not built
         vhf = self._potential(dm)
         if fock is not None:
-            fock[:, :, :] = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
+            self.fock = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
+            fock[:, :, :] = self.fock
         response = self._response_function(dm, 1.0) if get_response else None
 
         return self._scf.energy_tot(dm, self.h1e, vhf), response
@@ -2380,6 +2492,45 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         explains for the rotations of each spin
         """
         return
+
+    def _static_channels(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """
+        this function returns the occupied-occupied and virtual-virtual blocks of the
+        Fock matrix of each spin at the current orbitals and the factor of the static
+        part of the Hessian, 2 for the singly occupied orbitals
+        """
+        channels = []
+        for spin in range(2):
+            mo_coeff_occ = self.mo_coeff[spin][:, self.occ_idx[spin]]
+            mo_coeff_virt = self.mo_coeff[spin][:, self.virt_idx[spin]]
+            channels.append(
+                (
+                    mo_coeff_occ.T @ self.fock[spin] @ mo_coeff_occ,
+                    mo_coeff_virt.T @ self.fock[spin] @ mo_coeff_virt,
+                    2.0,
+                )
+            )
+        return channels
+
+    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function returns the gradient 2 F_vo of each spin at the orbitals a step
+        rotates the current ones to, from the effective potential the evaluation of
+        the energy there left cached, for the rotation QN extension
+        """
+        dm, vhf = self._last_potential.key[0], self._last_potential.value
+        u = self._exp_mat(self._unpack(self._rotation(kappa)))
+        mo_coeff = self.rotate_mo(self.mo_coeff, u)
+        fock = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
+        return self._pack_vo(
+            [
+                2
+                * mo_coeff[spin][:, self.virt_idx[spin]].T
+                @ fock[spin]
+                @ mo_coeff[spin][:, self.occ_idx[spin]]
+                for spin in range(2)
+            ]
+        )
 
     def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
         """

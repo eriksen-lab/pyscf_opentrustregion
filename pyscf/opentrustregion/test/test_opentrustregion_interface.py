@@ -752,9 +752,11 @@ class SCFTests(unittest.TestCase):
 
     def test_extensions_reject_orbitals_they_do_not_support(self) -> None:
         # the extensions work on the real orbitals of RHF, ROHF and UHF, so they are
-        # rejected for GHF, X2C and complex orbitals
+        # rejected for GHF, X2C and complex orbitals, and rotation QN, which builds on
+        # the MO extension, also for ROHF
         for name, mf_in, setting, value, kernel_args in (
             ("GHF", scf.GHF(mol_open), "oao", True, {}),
+            ("ROHF", scf.ROHF(mol_open), "qn_method", "sr1", {}),
             ("X2C", x2c.UHF(mol), "s_gek", True, {}),
             (
                 "complex",
