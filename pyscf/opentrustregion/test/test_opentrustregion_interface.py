@@ -8,6 +8,7 @@
 Tests for the PySCF interface to OpenTrustRegion
 """
 
+import functools
 import gc
 import io
 import types
@@ -56,6 +57,7 @@ from pyscf.opentrustregion.opentrustregion_interface import (
 )
 from pyopentrustregion import SolverSettings, StabilitySettings
 from pyopentrustregion.extensions.mo import MOSettings
+from pyopentrustregion.extensions.rotation_qn import rotation_qn_factory
 
 # fixtures shared by every test, built once in setUpModule
 mol: gto.Mole
@@ -323,17 +325,51 @@ def reference_transport(
 
 def check_trial_gradient(test: unittest.TestCase, obj: Any) -> None:
     """
-    this function checks that the gradient rotation QN receives at a trial point,
-    right after the objective function evaluated it, is the gradient the orbital
-    update to that point returns
+    this function checks that the objective function the driver hands rotation QN
+    returns the energy at a trial point and the gradient the orbital update to that
+    point returns
     """
+    obj_func_grad = obj._rotation_qn_callbacks(obj._func)["obj_func_grad"]
     rng = np.random.default_rng(4)
     kappa = 0.05 * (rng.random(obj.n_param) - 0.5)
-    obj._func(kappa)
-    trial_gradient = obj._trial_gradient(kappa)
+    trial_gradient = np.empty(obj.n_param)
+    energy = obj_func_grad(kappa, trial_gradient)
     grad, h_diag = grad_and_h_diag(obj)
-    obj._update_orbs(kappa, grad, h_diag)
+    func, _ = obj._update_orbs(kappa, grad, h_diag)
+    test.assertAlmostEqual(energy, func, 10)
     np.testing.assert_allclose(trial_gradient, grad, rtol=0, atol=1e-10)
+
+
+def check_transport_is_parallel(test: unittest.TestCase, obj: Any) -> None:
+    """
+    this function checks the transport of an object, away from a stationary point,
+    independently of how it is computed: transporting the gradient at a step back
+    along the step gives a map whose Jacobian is the Riemannian Hessian, which is
+    symmetric, exactly when the transport is the parallel transport to first order,
+    whereas the identity leaves an antisymmetric part
+    """
+    obj_func_grad = obj._rotation_qn_callbacks(obj._func)["obj_func_grad"]
+    step = 1e-5
+
+    def asymmetry(transport: bool) -> float:
+        columns = []
+        for unit_vector in np.eye(obj.n_param):
+            gradients = []
+            for kappa in (step * unit_vector, -step * unit_vector):
+                grad = np.empty(obj.n_param)
+                obj_func_grad(kappa, grad)
+                if transport:
+                    obj._transport(-kappa, grad)
+                gradients.append(grad)
+            columns.append((gradients[0] - gradients[1]) / (2 * step))
+        jacobian = np.array(columns).T
+        return float(
+            np.linalg.norm(jacobian - jacobian.T)
+            / np.linalg.norm(jacobian + jacobian.T)
+        )
+
+    test.assertLess(asymmetry(True), 1e-6)
+    test.assertGreater(asymmetry(False), 1e-3)
 
 
 def check_no_referrers(test: unittest.TestCase, obj: Any) -> None:
@@ -906,7 +942,13 @@ class SCFTests(unittest.TestCase):
         ):
             for qn_method in rotation_qn_methods:
                 with self.subTest(case=name, qn_method=qn_method):
-                    self._check(make(), make(), qn_method=qn_method, **kernel_args)
+                    otr = self._check(
+                        make(), make(), qn_method=qn_method, **kernel_args
+                    )
+                    # the approximate Hessian turns on the stability check of the
+                    # solver, for this solve only
+                    self.assertGreater(otr.n_hess_x_stability, 0)
+                    self.assertNotIn("stability", vars(otr))
         with self.subTest(case="options"):
             self._check(
                 scf.ROHF(mol_open),
@@ -988,6 +1030,67 @@ class SCFTests(unittest.TestCase):
                     atol=1e-10,
                 )
 
+    def test_kramers_restricted_static_hessian(self) -> None:
+        # every parameter of Kramers-restricted X2C turns both spinors of a pair, so
+        # its static Hessian, here at spinors that are their own Kramers pairs and a
+        # time-reversal symmetric Fock matrix, which needs no X2C object and so no
+        # zquatev, is twice the static Hessian of the spinors restricted to the
+        # rotations of the parameters, has the Hessian diagonal of the orbital update,
+        # and its preconditioner inverts it shifted by a level shift
+        rng = np.random.default_rng(10)
+        n_pairs, n_occ_pairs = 5, 2
+        n_spinors = 2 * n_pairs
+        a, b = (
+            rng.standard_normal((n_pairs, n_pairs))
+            + 1j * rng.standard_normal((n_pairs, n_pairs))
+            for _ in range(2)
+        )
+        a, b = a + a.conj().T, b - b.T
+        fock = np.empty((n_spinors, n_spinors), dtype=np.complex128)
+        fock[::2, ::2], fock[1::2, 1::2] = a, a.conj()
+        fock[::2, 1::2], fock[1::2, ::2] = b, -b.conj()
+        otr = X2CRHFOTR.__new__(X2CRHFOTR)
+        otr.mo_occ = np.repeat(
+            [1.0, 0.0], [2 * n_occ_pairs, n_spinors - 2 * n_occ_pairs]
+        )
+        otr.mo_coeff = np.eye(n_spinors, dtype=np.complex128)
+        otr.fock = fock
+        otr.complex_orbitals = True
+        otr._get_indices()
+        otr.n_param = 2 * int(np.count_nonzero(otr.kappa_mask))
+        hessian = dense_operator(otr._static_hess_x, otr.n_param)
+
+        occ = otr.mo_occ > 0
+        fock_occ, fock_virt = fock[np.ix_(occ, occ)], fock[np.ix_(~occ, ~occ)]
+        n_virt, n_occ = int(np.count_nonzero(~occ)), int(np.count_nonzero(occ))
+
+        def static_part(x: np.ndarray, output: np.ndarray) -> None:
+            block = otr._embed(otr._rotation(x)).reshape(n_virt, n_occ)
+            output[:] = 2 * otr._parameters(
+                otr._restrict((fock_virt @ block - block @ fock_occ).ravel())
+            )
+
+        np.testing.assert_allclose(
+            hessian, dense_operator(static_part, otr.n_param), rtol=0, atol=1e-12
+        )
+        h_diag = np.real(np.diag(fock_virt))[:, None] - np.real(np.diag(fock_occ))
+        np.testing.assert_allclose(
+            np.diag(hessian),
+            2 * np.tile(otr._restrict_diagonal(h_diag.ravel()), 2),
+            rtol=0,
+            atol=1e-12,
+        )
+        mu = np.linalg.eigvalsh(hessian)[0] - 1.0
+        precond = dense_operator(
+            lambda r, output: otr._static_precond(r, mu, output), otr.n_param
+        )
+        np.testing.assert_allclose(
+            precond @ (hessian - mu * np.eye(otr.n_param)),
+            np.eye(otr.n_param),
+            rtol=0,
+            atol=1e-10,
+        )
+
     def test_trial_gradient(self) -> None:
         # the gradient at a trial point, which rotation QN takes from the effective
         # potential the objective function left cached, is that of the orbital update
@@ -999,12 +1102,73 @@ class SCFTests(unittest.TestCase):
             ("complex RHF", scf.RHF(mol), {"dm0": complex_guess(scf.RHF(mol))}),
             ("X2C", x2c.UHF(mol), {}),
             ("RKS", dft.RKS(mol), {}),
+            ("ROHF symmetry", scf.ROHF(mol_open_sym), {}),
+            ("GHF X2C", scf.GHF(mol).x2c(), {}),
             ("periodic UHF", pbcscf.UHF(hydrogen_cell("gth-dzv")), {}),
         ):
             with self.subTest(case=name):
                 otr = to_otr(mf_in)
                 run_without_adopted_routines(otr, **kernel_args)
                 check_trial_gradient(self, otr)
+
+        # within a kernel, where the objective function and the orbital update of RHF
+        # and UHF are those of the MO extension, the gradient rotation QN receives at
+        # every trial point the solver accepts is the one the orbital update returns
+        # there
+        for name, mf_in in (
+            ("RHF kernel", scf.RHF(mol)),
+            ("UHF kernel", scf.UHF(mol_open)),
+        ):
+            with self.subTest(case=name):
+                deviations = []
+
+                def factory(
+                    n_param: int,
+                    update_orbs: Callable,
+                    obj_func: Callable,
+                    settings: SolverSettings,
+                    state: Any,
+                    rotation_qn_settings: Any,
+                ) -> Tuple[Callable, Callable]:
+                    obj_func_grad = rotation_qn_settings.obj_func_grad
+                    trial: dict = {}
+
+                    def recording_obj_func_grad(
+                        kappa: np.ndarray, grad: np.ndarray
+                    ) -> float:
+                        func = obj_func_grad(kappa, grad)
+                        trial.update(kappa=kappa.copy(), grad=grad.copy())
+                        return func
+
+                    @functools.wraps(update_orbs)
+                    def checking_update_orbs(
+                        kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+                    ) -> Any:
+                        result = update_orbs(kappa, grad, h_diag)
+                        if "kappa" in trial and np.array_equal(trial["kappa"], kappa):
+                            deviations.append(float(np.abs(grad - trial["grad"]).max()))
+                        return result
+
+                    rotation_qn_settings.obj_func_grad = recording_obj_func_grad
+                    return rotation_qn_factory(
+                        n_param,
+                        checking_update_orbs,
+                        obj_func,
+                        settings,
+                        state,
+                        rotation_qn_settings,
+                    )
+
+                otr = to_otr(mf_in)
+                otr.qn_method = "sr1"
+                with mock.patch(
+                    "pyscf.opentrustregion.opentrustregion_interface."
+                    "rotation_qn_factory",
+                    factory,
+                ):
+                    otr.kernel()
+                self.assertGreater(len(deviations), 0)
+                self.assertLess(max(deviations), 1e-10)
 
     def test_rohf_transport(self) -> None:
         # the transport of ROHF is the parallel transport of the flag manifold of the
@@ -1035,6 +1199,12 @@ class SCFTests(unittest.TestCase):
                     atol=1e-12,
                 )
                 self.assertGreater(np.abs(transported - tangent_vector).max(), 1e-3)
+
+        # away from the minimum, the transport makes the Hessian symmetric, which
+        # checks its sign independently of the reference
+        otr = to_otr(scf.ROHF(mol_open))
+        move_away_from_the_minimum(otr)
+        check_transport_is_parallel(self, otr)
 
         rhf = to_otr(scf.RHF(mol))
         rhf.kernel()
@@ -1485,10 +1655,14 @@ class LocalizerTests(unittest.TestCase):
                     self.assertAlmostEqual(
                         self._objective(cls, loc.mo_coeff, sign), objective, 8
                     )
+                    self.assertGreater(loc.n_hess_x_stability, 0)
+                    self.assertNotIn("stability", vars(loc))
+                    self.assertIsNone(getattr(loc, "_last_jk", None))
             with self.subTest(cls=cls.__name__, qn_method="arh"):
                 loc = cls(mol, occ_orbs)
                 loc.qn_method = "arh"
                 self.assertRaises(ValueError, loc.kernel)
+                np.testing.assert_array_equal(loc.mo_coeff, occ_orbs)
 
     def test_rotation_qn_callbacks(self) -> None:
         # the localizers supply the objective function with the gradient at a trial
@@ -1535,6 +1709,12 @@ class LocalizerTests(unittest.TestCase):
             atol=1e-12,
         )
         self.assertGreater(np.abs(transported - tangent_vector).max(), 1e-3)
+
+        # away from the optimum, the transport makes the Hessian symmetric, which
+        # checks its sign independently of the reference
+        grad, h_diag = grad_and_h_diag(loc)
+        loc._update_orbs(0.2 * (rng.random(loc.n_param) - 0.5), grad, h_diag)
+        check_transport_is_parallel(self, loc)
 
 
 class CASSCFTests(unittest.TestCase):
@@ -1705,27 +1885,45 @@ class CASSCFTests(unittest.TestCase):
         # rotation QN wraps the orbital update of CASSCF, with the gradient at every
         # trial point, the parallel transport of the orbitals and the transport of the
         # states, which for a state average follows the states as they turn within the
-        # space they span, and reaches the minimum with either updating scheme, also
-        # with the identity transport of the orbitals
-        for name, mf_in, average, parallel_transport in (
-            ("single state", mf, lambda mc: mc, True),
-            ("identity transport", mf, lambda mc: mc, False),
-            ("symmetry", mf_sym, lambda mc: mc, True),
+        # space they span, and reaches the minimum, with either updating scheme for a
+        # single state, also with the identity transport of the orbitals, and with SR1,
+        # which needs the turn of the states, for state averages, also over several CI
+        # solvers, and with frozen orbitals
+        def frozen(mc: Any) -> Any:
+            mc.frozen = 1
+            return mc
+
+        for name, mf_in, average, qn_methods, parallel_transport in (
+            ("single state", mf, lambda mc: mc, rotation_qn_methods, True),
+            ("identity transport", mf, lambda mc: mc, rotation_qn_methods, False),
+            ("symmetry", mf_sym, lambda mc: mc, rotation_qn_methods, True),
+            ("frozen orbital", mf, frozen, ("sr1",), True),
             (
                 "equal weights",
                 mf,
                 lambda mc: mcscf.state_average_(mc, [0.5, 0.5]),
+                ("sr1",),
                 True,
             ),
             (
                 "unequal weights",
                 mf,
                 lambda mc: mcscf.state_average_(mc, [0.6, 0.4]),
+                ("sr1",),
+                True,
+            ),
+            (
+                "singlet and triplet",
+                mf,
+                lambda mc: mcscf.state_average_mix_(
+                    mc, singlet_and_triplet_solvers(), [0.6, 0.4]
+                ),
+                ("sr1",),
                 True,
             ),
         ):
             ref = average(mcscf.CASSCF(mf_in, 4, 4)).run(conv_tol=1e-10)
-            for qn_method in rotation_qn_methods:
+            for qn_method in qn_methods:
                 with self.subTest(case=name, qn_method=qn_method):
                     mc = to_otr(average(mcscf.CASSCF(mf_in, 4, 4)))
                     mc.qn_method = qn_method
@@ -1735,6 +1933,16 @@ class CASSCFTests(unittest.TestCase):
                     self.assertTrue(mc.converged)
                     self.assertAlmostEqual(mc.e_tot, ref.e_tot, 6)
                     self.assertLess(gradient_rms(mc), SolverSettings().conv_tol)
+                    self.assertGreater(mc.n_hess_x_stability, 0)
+                    self.assertNotIn("stability", vars(mc))
+                    self.assertFalse(mc._last_trial.key)
+
+        # a method rotation QN does not provide is refused before the kernel runs
+        # anything
+        mc = to_otr(mcscf.CASSCF(mf, 4, 4))
+        mc.qn_method = "arh"
+        self.assertRaises(ValueError, mc.kernel)
+        self.assertIsNone(mc.e_tot)
 
     def test_trial_gradient(self) -> None:
         # the gradient at a trial point, which reuses the integrals the objective

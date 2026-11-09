@@ -508,17 +508,17 @@ class OTR:
     def _solve_rotation_qn(self) -> None:
         """
         this function runs the solver from the current point with the rotation QN
-        orbital update and objective function, which also turns on the stability check
-        of the solver unless stability was set on this object, which then checks a
-        minimum with the exact Hessian
+        orbital update and objective function, which for this solve also turns on the
+        stability check of the solver unless stability was set on this object, which
+        then checks a minimum with the exact Hessian
         """
         settings = SolverSettings()
         assign_solver_settings(self, settings)
         state = SolverState()
         if "stability" not in vars(self):
-            self.stability = settings.stability = True
+            settings.stability = True
         update_orbs, obj_func = self._rotation_qn(settings, state)
-        if self.stability:
+        if settings.stability:
             settings.stability_hess_x = weak_method(self._count_stability_hess_x)
             settings.stability_settings.approx_hess_x = weak_method(
                 self._approx_stability_hess_x
@@ -797,8 +797,10 @@ class LocalizerOTR(OTR):
             with lib.temporary_env(self, verbose=verbose):
                 return self.kernel(mo_coeff, callback)
 
-        # discard anything computed by a previous kernel
+        # discard anything computed by a previous kernel and check the quasi-Newton
+        # method before anything changes
         self._reset()
+        qn_method = self._qn_method()
 
         # set MO coefficients if provided
         if mo_coeff is not None:
@@ -839,7 +841,7 @@ class LocalizerOTR(OTR):
         self.mo_coeff = self.mo_coeff @ u0
 
         # call solver, with rotation QN if the object has a quasi-Newton method
-        if self._qn_method() is None:
+        if qn_method is None:
             self._solve()
         else:
             self._solve_rotation_qn()
@@ -867,19 +869,40 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
     # the Edmiston-Ruedenberg cost function is maximized
     cost_sign = -1.0
 
-    # the Coulomb and exchange matrices of the last orbitals, keyed by these orbitals
-    _last_jk = LastResult()
+    # the Coulomb and exchange matrices of the last orbitals, keyed by these orbitals,
+    # while a kernel runs
+    _last_jk: Optional[LastResult] = None
 
     def get_jk(self, u: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         this function returns the Coulomb and exchange matrices of the orbitals rotated
-        by u, reusing those of the last orbitals, from which the cost function, its
-        gradient and its Hessian at the same orbitals are all built
+        by u, while a kernel runs reusing those of the last orbitals, from which the
+        cost function, its gradient and its Hessian at the same orbitals are all built
         """
+        if self._last_jk is None:
+            return super().get_jk(u)
         mo_coeff = self.rotate_orb(u)
         if not self._last_jk.matches((mo_coeff,)):
+            self._last_jk = LastResult()
             self._last_jk = LastResult.of((mo_coeff,), super().get_jk(u))
         return self._last_jk.value
+
+    def kernel(
+        self,
+        mo_coeff: Optional[np.ndarray] = None,
+        callback: Optional[Callable[..., None]] = None,
+        verbose: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        this function localizes the orbitals as the kernel of every localizer does,
+        caching the Coulomb and exchange matrices of the last orbitals only while it
+        runs, since they grow with the cube of the number of orbitals
+        """
+        self._last_jk = LastResult()
+        try:
+            return super().kernel(mo_coeff, callback, verbose)
+        finally:
+            self._last_jk = None
 
 
 # the drivers of the PySCF localizers, matched by their exact class, since a subclass
@@ -1387,8 +1410,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         u = self._exp_mat(self._unpack(self._rotation(kappa)))
         mo_coeff = self.rotate_mo(self.mo_coeff, u)
         fock = self.get_fock(self.h1e, self.s1e, veff, dm)
-        grad = self.get_grad(mo_coeff, self.mo_occ, fock)
-        return 2 * self._parameters(self._restrict(grad))
+        return 2 * self._parameters(self._restrict(self._get_grad(mo_coeff, fock)))
+
+    def _get_grad(self, mo_coeff: np.ndarray, fock: np.ndarray) -> np.ndarray:
+        """
+        this function returns PySCF's gradient over the occupied-virtual pairs at given
+        orbitals and Fock matrix, as gen_g_hop returns it, that of the get_grad of the
+        PySCF class
+        """
+        return self.get_grad(mo_coeff, self.mo_occ, fock)
 
     def _rotation_qn_callbacks(
         self, obj_func: Callable[[np.ndarray], float]
@@ -1662,9 +1692,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self.n_param = n_particle * self._scf.mol.nao * (self._scf.mol.nao - 1) // 2
 
         # turn on the stability check of the solver for approximate Hessians, unless
-        # stability was set on this object
+        # stability was set on this object, for this solve only
         if "stability" not in vars(self) and (qn_method is not None or self.s_gek):
-            self.stability = settings.stability = True
+            settings.stability = True
 
         # without parameters, as when symmetry forbids every rotation, the orbitals are
         # stationary already, so neither an extension object is built nor the solver
@@ -1828,7 +1858,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 )
 
             # set (approximate) Hessian linear transformation for stability check
-            if self.stability:
+            if settings.stability:
                 # get linear transformation function which is continuously updated as
                 # the orbitals move
                 kappa = np.zeros(self.n_param, dtype=np.float64)
@@ -2836,9 +2866,13 @@ class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
     # every rotation turns both spinors of a Kramers pair
     _static_metric = 2.0
 
-    # the gradient of the spinors is that of DHF, as gen_g_hop returns it, rather than
-    # twice that, which the get_grad of RHF the X2C classes inherit returns
-    get_grad = dhf.DHF.get_grad
+    def _get_grad(self, mo_coeff: np.ndarray, fock: np.ndarray) -> np.ndarray:
+        """
+        this function returns PySCF's gradient over the occupied-virtual pairs of
+        spinors at given orbitals and Fock matrix, as gen_g_hop returns it, that of
+        DHF, whereas the get_grad of RHF the X2C classes inherit returns twice that
+        """
+        return dhf.get_grad(mo_coeff, self.mo_occ, fock)
 
     def _fix_phase(self) -> None:
         """
@@ -2947,7 +2981,7 @@ class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
     _fix_phase = RHFOTR._fix_phase
     _exp_mat = RHFOTR._exp_mat
     _unpack = RHFOTR._unpack
-    get_grad = X2CRHFOTR.get_grad
+    _get_grad = X2CRHFOTR._get_grad
 
     def _get_indices(self) -> None:
         """
@@ -3198,6 +3232,9 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         """
         key = self._trial_key(x)
         if not self._last_trial.matches(key):
+            # the integrals of the last trial point are dropped before those of the new
+            # one are transformed
+            self._last_trial = LastResult()
             u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
             rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
             eris = self.ao2mo(rot_mo_coeff)
@@ -3272,14 +3309,14 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             rotations = self._last_trial.value[4]
 
         full = self._embed(tangent_vector)
-        parts, start = [self.pack_uniq_var(orbital_rotation)], n_param_orb
-        for i, (*_, states) in enumerate(self._state_groups(self.ci)):
-            block = full[start : start + states.size].reshape(states.shape)
-            if rotations is not None:
-                block = rotations[i] @ block
-            parts.append((block - (block @ states.T) @ states).ravel())
-            start += states.size
-        tangent_vector[:] = self._restrict(np.concatenate(parts))
+        full[:n_param_orb] = self.pack_uniq_var(orbital_rotation)
+        if rotations is not None:
+            start = n_param_orb
+            for rotation, (*_, states) in zip(rotations, self._state_groups(self.ci)):
+                block = full[start : start + states.size].reshape(states.shape)
+                full[start : start + states.size] = (rotation @ block).ravel()
+                start += states.size
+        tangent_vector[:] = self._restrict(self._orthogonal_ci(full))
 
     def _rotation_qn_callbacks(
         self, obj_func: Callable[[np.ndarray], float]
@@ -3298,9 +3335,12 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
     ) -> Tuple[float, OTRHessX]:
         """
         this function moves the orbitals and CI vectors by a step and returns the
-        energy, its gradient, Hessian diagonal and Hessian linear transformation there
+        energy, its gradient, Hessian diagonal and Hessian linear transformation there,
+        dropping the last trial point, which the new point replaces, before it
+        transforms the integrals
         """
         self._moves(x)
+        self._last_trial = LastResult()
         u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
         self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
         eris = self.ao2mo(self.mo_coeff)
@@ -3352,8 +3392,10 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         this function optimizes the orbitals and CI vectors passed in or those of this
         object and returns the values PySCF's CASSCF kernel returns
         """
-        # discard anything computed by a previous kernel
+        # discard anything computed by a previous kernel and check the quasi-Newton
+        # method before anything changes
         self._reset()
+        qn_method = self._qn_method()
 
         # the SCF object is run first if there are no orbitals yet, as PySCF's kernel
         # does
@@ -3405,12 +3447,14 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         # call solver, with rotation QN if the object has a quasi-Newton method, after
         # which the last trial point, whose integrals the kernel does not need anymore,
-        # is dropped
-        if self._qn_method() is None:
-            self._solve()
-        else:
-            self._solve_rotation_qn()
-        self._last_trial = LastResult()
+        # is dropped, also after an error
+        try:
+            if qn_method is None:
+                self._solve()
+            else:
+                self._solve_rotation_qn()
+        finally:
+            self._last_trial = LastResult()
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
         if isinstance(fcivec, np.ndarray):
