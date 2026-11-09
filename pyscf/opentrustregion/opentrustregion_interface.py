@@ -15,7 +15,7 @@ import scipy as sc
 from pyscf import gto, scf, lo, lib
 from pyscf.pbc import gto as pbcgto
 from pyscf.tools import mo_mapping
-from pyscf.scf import hf_symm, uhf_symm, ghf_symm
+from pyscf.scf import hf_symm, uhf_symm, ghf_symm, dhf
 from pyscf.soscf import ciah, newton_ah
 from pyscf.x2c import x2c
 from pyscf.x2c import newton_ah as x2c_newton_ah
@@ -61,7 +61,7 @@ from ctypes import Structure
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Tuple, Callable, List, Optional, Type, Union
+    from typing import Any, Tuple, Callable, Dict, List, Optional, Type, Union
 
     PySCFHessX = Callable[[np.ndarray], np.ndarray]
     OTRHessX = Callable[[np.ndarray, np.ndarray], None]
@@ -259,6 +259,40 @@ def assign_extension_settings(
 # the floor of the divisors of the preconditioners of OpenTrustRegion
 precond_floor = 1e-10
 
+# the number of terms after which the series of a parallel transport is given up
+max_transport_terms = 200
+
+
+def transport_rotation(
+    generator: np.ndarray, tangent: np.ndarray, non_redundant: np.ndarray
+) -> np.ndarray:
+    """
+    this function transports the anti-Hermitian matrix A of a tangent vector of the
+    orbitals along the geodesic of the rotation by the anti-Hermitian generator K to
+    the orbitals the rotation reaches, in whose frame both are expressed, by the
+    parallel transport of the normal metric of a manifold of orbitals whose rotations
+    within sets of orbitals are redundant, exp(-1/2 P ad_K) A with the projection P
+    onto the entries non_redundant marks, summed as a series until its terms vanish;
+    without redundant rotations, this is exp(-K/2) A exp(K/2), and where the
+    commutators of non-redundant rotations are redundant, as for occupied and virtual
+    orbitals, the identity
+    """
+    transported = term = np.where(non_redundant, tangent, 0)
+    for k in range(1, max_transport_terms + 1):
+        term = np.where(non_redundant, generator @ term - term @ generator, 0) / (
+            -2 * k
+        )
+        transported = transported + term
+        if np.linalg.norm(term) <= np.finfo(np.float64).eps * np.linalg.norm(
+            transported
+        ):
+            return transported
+    raise RuntimeError(
+        f"Parallel transport not converged after {max_transport_terms} terms, the last "
+        f"of which has the norm {np.linalg.norm(term)}."
+    )
+
+
 # the error code, named as in OpenTrustRegion, with which the solver reports that it
 # reached the maximum number of macro iterations, which pyopentrustregion states only
 # in the message of the RuntimeError it raises
@@ -276,7 +310,9 @@ class OTR:
         solver_setting_fields
         + stability_setting_fields
         + list(stability_setting_aliases.values())
+        + rotation_qn_setting_fields
         + [
+            "parallel_transport",
             "n_update_orbs",
             "n_hess_x",
             "n_hess_x_stability",
@@ -348,6 +384,156 @@ class OTR:
         self.__dict__.pop("_raw_hess_x", None)
         self.__dict__.pop("_raw_approx_hess_x", None)
 
+    # raw and counted approximate orbital updates and Hessian linear transformations;
+    # the raw orbital update is the object a factory returns, whose Hessian linear
+    # transformation the stability check uses
+    _raw_approx_update_orbs: Any = None
+    _raw_approx_hess_x: OTRHessX
+
+    def _count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the approximate Hessian linear transformation of the
+        last orbital update for the solver and counts it
+        """
+        self._raw_approx_hess_x(x, hx)
+        self.n_hess_x += 1
+
+    def _count_approx_update_orbs(self, approx_update_orbs: Callable) -> Callable[
+        [np.ndarray, np.ndarray, np.ndarray],
+        Tuple[float, Callable[[np.ndarray, np.ndarray], None]],
+    ]:
+        """
+        this function wraps an approximate orbital update, so that the approximate
+        Hessian linear transformations the solver performs with it are counted
+        """
+
+        def update_orbs(
+            kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
+        ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
+            func, self._raw_approx_hess_x = approx_update_orbs(kappa, grad, h_diag)
+            return func, self._count_approx_hess_x
+
+        return update_orbs
+
+    def _approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
+        """
+        this function performs the approximate Hessian linear transformation of the
+        quasi-Newton or S-GEK extension for a stability check and counts it
+        """
+        self._raw_approx_update_orbs.hess_x(x, hx)
+        self.n_hess_x_stability += 1
+
+    # whether the driver also supports the density QN methods, which work on the
+    # density matrices of the mean-field drivers
+    _density_qn = False
+
+    # whether rotation QN transports its history between the orbitals of the points by
+    # the parallel transport of the orbital rotations where the identity is not that,
+    # as for ROHF, the localizers and CASSCF, at the cost of products of matrices over
+    # the orbitals for every vector of the history it transports
+    parallel_transport = True
+
+    def _qn_method(self) -> Optional[str]:
+        """
+        this function returns the quasi-Newton method of this object in lower case, if
+        it has one, and raises for a method this driver does not support
+        """
+        qn_method = getattr(self, "qn_method", None)
+        if qn_method is None:
+            return None
+        methods = (density_qn_methods if self._density_qn else ()) + rotation_qn_methods
+        if qn_method.lower() not in methods:
+            families = [f"the rotation QN methods {', '.join(rotation_qn_methods)}"]
+            if self._density_qn:
+                families.insert(
+                    0, f"the density QN methods {', '.join(density_qn_methods)}"
+                )
+            raise ValueError(
+                f"Unknown quasi-Newton method {qn_method!r}: {type(self).__name__} "
+                f"supports {' and '.join(families)}."
+            )
+        return qn_method.lower()
+
+    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function is supplied by every concrete driver below; it returns the
+        gradient at a step from the current point, right after the objective function
+        evaluated it there, whose intermediates it reuses
+        """
+        raise NotImplementedError
+
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
+        """
+        this function returns the callback functions of the rotation QN settings that
+        this driver supplies for the objective function the rotation QN object wraps:
+        the objective function, which also returns the gradient at a trial point, so
+        that rotation QN also learns from a rejected step, while rotation QN starts
+        from the Hessian diagonal and keeps the components of its history in the
+        rotated orbitals unless a driver supplies these too
+        """
+        driver: Any = weakref.proxy(self)
+
+        def obj_func_grad(kappa: np.ndarray, grad: np.ndarray) -> float:
+            func = obj_func(kappa)
+            if np.isfinite(func):
+                grad[:] = driver._trial_gradient(kappa)
+            return func
+
+        return {"obj_func_grad": obj_func_grad}
+
+    def _rotation_qn(
+        self, settings: SolverSettings, state: SolverState
+    ) -> Tuple[Callable, Callable]:
+        """
+        this function wires the solver settings with a rotation QN object, which wraps
+        the orbital update and the objective function of this object, handed to it as
+        weak references to this object, with the callback functions this driver
+        supplies, and returns the rotation QN orbital update and objective function
+        """
+        update_orbs = weak_method(self._update_orbs)
+        obj_func = weak_method(self._func)
+        rotation_qn_settings = RotationQNSettings()
+        assign_extension_settings(
+            self, rotation_qn_settings, rotation_qn_setting_fields
+        )
+        for name, callback in self._rotation_qn_callbacks(obj_func).items():
+            setattr(rotation_qn_settings, name, callback)
+
+        return rotation_qn_factory(
+            self.n_param, update_orbs, obj_func, settings, state, rotation_qn_settings
+        )
+
+    def _solve_rotation_qn(self) -> None:
+        """
+        this function runs the solver from the current point with the rotation QN
+        orbital update and objective function, which also turns on the stability check
+        of the solver unless stability was set on this object, which then checks a
+        minimum with the exact Hessian
+        """
+        settings = SolverSettings()
+        assign_solver_settings(self, settings)
+        state = SolverState()
+        if "stability" not in vars(self):
+            self.stability = settings.stability = True
+        update_orbs, obj_func = self._rotation_qn(settings, state)
+        if self.stability:
+            settings.stability_hess_x = weak_method(self._count_stability_hess_x)
+            settings.stability_settings.approx_hess_x = weak_method(
+                self._approx_stability_hess_x
+            )
+
+        # the rotation QN objects are released with the functions they returned once
+        # the solver has returned
+        self._raw_approx_update_orbs = update_orbs
+        try:
+            self._solve(
+                settings, state, self._count_approx_update_orbs(update_orbs), obj_func
+            )
+        finally:
+            self.__dict__.pop("_raw_approx_update_orbs", None)
+
     # the boolean stability setting of the solver shadows the stability() method of
     # PySCF's mean-field and localizer classes; the equivalent is stability_check()
     stability = False
@@ -404,23 +590,26 @@ class OTR:
         settings: Optional[SolverSettings] = None,
         state: Optional[SolverState] = None,
         update_orbs: Optional[Callable[..., Tuple[float, OTRHessX]]] = None,
+        obj_func: Optional[Callable[[np.ndarray], float]] = None,
     ) -> None:
         """
         this function runs the solver from the current point and records whether it
-        converged, with the settings of this object and its orbital update unless the
-        kernel built the settings and a state for the extensions and takes the orbital
-        update of one; like PySCF's own solvers, it stops at the last point without
-        raising once the maximum number of macro iterations is reached, which the
-        solver reports itself
+        converged, with the settings of this object, its orbital update and its
+        objective function unless the kernel built the settings and a state for the
+        extensions and takes the functions of one; like PySCF's own solvers, it stops
+        at the last point without raising once the maximum number of macro iterations
+        is reached, which the solver reports itself
         """
         if settings is None:
             settings = SolverSettings()
             assign_solver_settings(self, settings)
         if update_orbs is None:
             update_orbs = self._update_orbs
+        if obj_func is None:
+            obj_func = self._func
         self.converged = False
         try:
-            solver(update_orbs, self._func, self.n_param, settings, state)
+            solver(update_orbs, obj_func, self.n_param, settings, state)
             self.converged = True
         except RuntimeError as error:
             if f"(code {error_solver_max_iter})" not in str(error):
@@ -505,8 +694,10 @@ class LocalizerOTR(OTR):
     init_guess: Optional[str]
     pdim: int
     check_sanity: Callable[[], Any]
+    pack_uniq_var: Callable[[np.ndarray], np.ndarray]
     unpack_uniq_var: Callable[[np.ndarray], np.ndarray]
     cost_function: Callable[..., float]
+    get_grad: Callable[..., np.ndarray]
     get_init_guess: Callable[..., np.ndarray]
     gen_g_hop: Callable[..., Tuple[np.ndarray, PySCFHessX, np.ndarray]]
 
@@ -553,7 +744,43 @@ class LocalizerOTR(OTR):
 
         self._raw_hess_x = raw_hess_x
 
-        return self.cost_sign * func, self._count_hess_x
+        # the rotation QN objects keep the Hessian linear transformation the orbital
+        # update of their host returned last, so it refers to this object weakly
+        return self.cost_sign * func, weak_method(self._count_hess_x)
+
+    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function returns the gradient of the cost function as a minimization
+        objective at a step from the current orbitals, as gen_g_hop returns it
+        """
+        return self.get_grad(ciah.expmat(self.unpack_uniq_var(kappa)))
+
+    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+        """
+        this function transports a tangent vector along the geodesic of a rotation to
+        the orbitals the rotation reaches by the parallel transport of the orthogonal
+        group, none of whose rotations are redundant, which turns the antisymmetric
+        matrix A of the tangent vector into exp(-K/2) A exp(K/2) for the antisymmetric
+        matrix K of the geodesic, for the rotation QN extension
+        """
+        half_rotation = ciah.expmat(-0.5 * self.unpack_uniq_var(geodesic))
+        tangent_vector[:] = self.pack_uniq_var(
+            half_rotation @ self.unpack_uniq_var(tangent_vector) @ half_rotation.T
+        )
+
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
+        """
+        this function returns the callback functions of the rotation QN settings: the
+        objective function with the gradient at a trial point and the parallel
+        transport, which on the orthogonal group differs from the identity, unless
+        parallel_transport is unset
+        """
+        callbacks = super()._rotation_qn_callbacks(obj_func)
+        if self.parallel_transport:
+            callbacks["transport"] = weak_method(self._transport)
+        return callbacks
 
     def kernel(
         self,
@@ -611,8 +838,11 @@ class LocalizerOTR(OTR):
             u0 = self.get_init_guess(None)
         self.mo_coeff = self.mo_coeff @ u0
 
-        # call solver
-        self._solve()
+        # call solver, with rotation QN if the object has a quasi-Newton method
+        if self._qn_method() is None:
+            self._solve()
+        else:
+            self._solve_rotation_qn()
 
         # sort the localized orbitals as PySCF does, so that each is closest to the
         # input orbital of the same index
@@ -636,6 +866,20 @@ class EdmistonRuedenbergOTR(LocalizerOTR, lo.EdmistonRuedenberg):
 
     # the Edmiston-Ruedenberg cost function is maximized
     cost_sign = -1.0
+
+    # the Coulomb and exchange matrices of the last orbitals, keyed by these orbitals
+    _last_jk = LastResult()
+
+    def get_jk(self, u: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the Coulomb and exchange matrices of the orbitals rotated
+        by u, reusing those of the last orbitals, from which the cost function, its
+        gradient and its Hessian at the same orbitals are all built
+        """
+        mo_coeff = self.rotate_orb(u)
+        if not self._last_jk.matches((mo_coeff,)):
+            self._last_jk = LastResult.of((mo_coeff,), super().get_jk(u))
+        return self._last_jk.value
 
 
 # the drivers of the PySCF localizers, matched by their exact class, since a subclass
@@ -687,8 +931,14 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # supplied by the PySCF mean-field object this driver wraps
     mo_occ: np.ndarray
 
-    # quasi-Newton method, which selects density QN or rotation QN, if any
-    qn_method: Optional[str]
+    # the mean-field drivers also support density QN
+    _density_qn = True
+
+    # whether rotation QN takes the static part of the Hessian, which neglects the
+    # response of the effective potential, as its initial Hessian and its inverse as
+    # its preconditioner, at the cost of products of matrices over the orbitals for
+    # every application, rather than the Hessian diagonal
+    static_hess = True
 
     # set while the kernel runs
     dm: np.ndarray
@@ -699,9 +949,9 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         mo_setting_fields
         + oao_setting_fields
         + density_qn_setting_fields
-        + rotation_qn_setting_fields
         + s_gek_setting_fields
         + [
+            "static_hess",
             "n_jk_update",
             "n_jk_energy",
             "n_jk_response",
@@ -899,37 +1149,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         self._drop_adopted_routines()
         self._set_parameters()
 
-    # raw and counted orbital updates and (approximate) Hessian linear transformations;
-    # the raw orbital update is the object a factory returns, whose Hessian linear
-    # transformation the stability check uses
-    _raw_approx_update_orbs: Any = None
-    _raw_approx_hess_x: OTRHessX
-
-    def _count_approx_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
-        """
-        this function performs the approximate Hessian linear transformation of the
-        last orbital update for the solver and counts it
-        """
-        self._raw_approx_hess_x(x, hx)
-        self.n_hess_x += 1
-
-    def _count_approx_update_orbs(self, approx_update_orbs: Callable) -> Callable[
-        [np.ndarray, np.ndarray, np.ndarray],
-        Tuple[float, Callable[[np.ndarray, np.ndarray], None]],
-    ]:
-        """
-        this function wraps an approximate orbital update, so that the approximate
-        Hessian linear transformations the solver performs with it are counted
-        """
-
-        def update_orbs(
-            kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
-        ) -> Tuple[float, Callable[[np.ndarray, np.ndarray], None]]:
-            func, self._raw_approx_hess_x = approx_update_orbs(kappa, grad, h_diag)
-            return func, self._count_approx_hess_x
-
-        return update_orbs
-
     def _count_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         """
         this function performs the Hessian linear transformation of the last orbital
@@ -947,8 +1166,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         with the two-electron response builds it requires
         """
         n_jk_response = self.n_jk_response
-        self._raw_approx_update_orbs.hess_x(x, hx)
-        self.n_hess_x_stability += 1
+        super()._approx_stability_hess_x(x, hx)
         self.n_jk_response_stability += self.n_jk_response - n_jk_response
 
     def __init__(self, mf: scf.SCF) -> None:
@@ -1061,6 +1279,31 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     # and the orbitals they belong to
     _static_eigen = LastResult()
 
+    # the factor c of the inner products of the rotations, J^T J = c I for the map J
+    # from the parameters to the rotations over PySCF's occupied-virtual pairs, which
+    # is 2 where every parameter turns both spinors of a Kramers pair
+    _static_metric = 1.0
+
+    def _static_channels(self) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """
+        this function returns, for every channel, whose virtual-occupied blocks PySCF's
+        vector over the occupied-virtual pairs holds one after the other, the
+        occupied-occupied and virtual-virtual blocks of the Fock matrix at the current
+        orbitals and the factor of the static part of the Hessian, for the occupied and
+        virtual spin orbitals or spinors a single channel with the factor 2 of the
+        singly occupied orbitals
+        """
+        occ_idx = self.mo_occ > 0
+        mo_coeff_occ = self.mo_coeff[:, occ_idx]
+        mo_coeff_virt = self.mo_coeff[:, ~occ_idx]
+        return [
+            (
+                mo_coeff_occ.conj().T @ self.fock @ mo_coeff_occ,
+                mo_coeff_virt.conj().T @ self.fock @ mo_coeff_virt,
+                2.0,
+            )
+        ]
+
     def _static_eigenpairs(self) -> List[Tuple[np.ndarray, ...]]:
         """
         this function returns, for every channel, the eigenvalues and eigenvectors of
@@ -1082,19 +1325,32 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     ) -> np.ndarray:
         """
         this function applies a function of the static part of the Hessian at the
-        current orbitals, factor (F_vv x - x F_oo) for every channel, to parameters by
-        scaling them with the function of its eigenvalues in its eigenbasis
+        current orbitals, factor (F_vv x - x F_oo) for the virtual-occupied block x of
+        every channel, to parameters by scaling the rotations they map to with the
+        function of its eigenvalues in its eigenbasis; with the map J from the
+        parameters to the rotations and J^T J = c I, the static part is
+        J^+ (c factor (F_vv x - x F_oo)) J and a function of it J^+ f(...) J, since the
+        Fock matrix keeps the rotations within those of the parameters
         """
-        blocks = self._unpack_vo(vector)
-        blocks = blocks if isinstance(blocks, list) else [blocks]
-        scaled = []
-        for block, (eigval_occ, eigvec_occ, eigval_virt, eigvec_virt, factor) in zip(
-            blocks, self._static_eigenpairs()
-        ):
-            eigvals = factor * (eigval_virt[:, None] - eigval_occ[None, :])
-            rotated = eigvec_virt.T @ block @ eigvec_occ
-            scaled.append(eigvec_virt @ (scale(eigvals) * rotated) @ eigvec_occ.T)
-        return self._pack_vo(scaled if len(scaled) > 1 else scaled[0])
+        metric = self._static_metric
+        rotations = self._embed(self._rotation(vector))
+        scaled, start = [], 0
+        for (
+            eigval_occ,
+            eigvec_occ,
+            eigval_virt,
+            eigvec_virt,
+            factor,
+        ) in self._static_eigenpairs():
+            shape = (eigval_virt.size, eigval_occ.size)
+            block = rotations[start : start + shape[0] * shape[1]].reshape(shape)
+            start += shape[0] * shape[1]
+            eigvals = metric * factor * (eigval_virt[:, None] - eigval_occ[None, :])
+            rotated = eigvec_virt.conj().T @ block @ eigvec_occ
+            scaled.append(
+                (eigvec_virt @ (scale(eigvals) * rotated) @ eigvec_occ.conj().T).ravel()
+            )
+        return self._parameters(self._restrict(np.concatenate(scaled))) / metric
 
     def _static_hess_x(self, x: np.ndarray, hess_x: np.ndarray) -> None:
         """
@@ -1119,6 +1375,40 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             return 1.0 / divisors
 
         precond_residual[:] = self._apply_static(residual, inverse)
+
+    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
+        """
+        this function returns the gradient at the orbitals a step rotates the current
+        ones to, from PySCF's gradient there, as gen_g_hop returns it, with the Fock
+        matrix of the effective potential the evaluation of the energy there left
+        cached, for the rotation QN extension
+        """
+        dm, veff = self._last_potential.key[0], self._last_potential.value
+        u = self._exp_mat(self._unpack(self._rotation(kappa)))
+        mo_coeff = self.rotate_mo(self.mo_coeff, u)
+        fock = self.get_fock(self.h1e, self.s1e, veff, dm)
+        grad = self.get_grad(mo_coeff, self.mo_occ, fock)
+        return 2 * self._parameters(self._restrict(grad))
+
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
+        """
+        this function returns the callback functions of the rotation QN settings: the
+        static part of the Hessian as the initial Hessian and its inverse shifted by
+        the level shift as the preconditioner, unless static_hess is unset,
+        and the objective function with the gradient at a trial point from the
+        potential the evaluation of its energy left cached, while the identity is the
+        parallel transport of the rotations between occupied and virtual orbitals,
+        whose commutators are redundant
+        """
+        static: Dict[str, Callable] = {}
+        if self.static_hess:
+            static = {
+                "init_hess": weak_method(self._static_hess_x),
+                "init_precond": weak_method(self._static_precond),
+            }
+        return {**static, **super()._rotation_qn_callbacks(obj_func)}
 
     def _orbs_state(self) -> Tuple[np.ndarray, ...]:
         """
@@ -1223,28 +1513,18 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # quasi-Newton method, in any letter case, selects density QN or rotation QN
         if not hasattr(self, "oao"):
             self.oao = False
-        if not hasattr(self, "qn_method"):
-            self.qn_method = None
-        qn_method = None if self.qn_method is None else self.qn_method.lower()
-        if qn_method is not None and qn_method not in (
-            density_qn_methods + rotation_qn_methods
-        ):
-            raise ValueError(
-                f"Unknown quasi-Newton method {self.qn_method!r}: the density QN "
-                f"methods are {', '.join(density_qn_methods)} and the rotation QN "
-                f"methods {', '.join(rotation_qn_methods)}."
-            )
+        qn_method = self._qn_method()
         density_qn = qn_method in density_qn_methods
         rotation_qn = qn_method in rotation_qn_methods
         if isinstance(self, ROHFOTR) and (self.oao or density_qn):
             raise NotImplementedError(
                 "OAO and density QN are not currently implemented for ROHF."
             )
-        # rotation QN takes its initial Hessian, the static part of the Hessian, and the
-        # inverse of it from the MO extension, which only RHF and UHF use
-        if rotation_qn and (self.oao or isinstance(self, ROHFOTR)):
+        # rotation QN takes the static part of the Hessian of the MO basis as its
+        # initial Hessian
+        if rotation_qn and self.oao:
             raise NotImplementedError(
-                "Rotation QN is not currently implemented for ROHF or in the OAO basis."
+                "Rotation QN is not currently implemented in the OAO basis."
             )
         if self.oao and self._scf.mol.symmetry:
             raise NotImplementedError(
@@ -1254,14 +1534,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         if not hasattr(self, "s_gek"):
             self.s_gek = False
 
-        # the extensions work on the real orbitals of molecular RHF, ROHF and UHF,
-        # which the orbitals of the initial guess show to be real
+        # OAO, density QN and S-GEK work on the real orbitals of molecular RHF, ROHF
+        # and UHF, which the orbitals of the initial guess show to be real, whereas
+        # rotation QN wraps the orbital update of every driver
         periodic = isinstance(mol, pbcgto.Cell)
-        extensions = self.oao or qn_method is not None or self.s_gek
+        extensions = self.oao or density_qn or self.s_gek
         if extensions and (periodic or not isinstance(self, (RHFOTR, ROHFOTR, UHFOTR))):
             raise NotImplementedError(
-                "OAO, the quasi-Newton methods and S-GEK are not currently "
-                "implemented for GHF, X2C and periodic systems."
+                "OAO, density QN and S-GEK are not currently implemented for GHF, X2C "
+                "and periodic systems."
             )
 
         # orthogonalize the AO basis for the eigensolver as PySCF's own kernel does,
@@ -1323,8 +1604,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         )
         if extensions and complex_orbitals:
             raise NotImplementedError(
-                "OAO, the quasi-Newton methods and S-GEK are not currently "
-                "implemented for complex orbitals."
+                "OAO, density QN and S-GEK are not currently implemented for complex "
+                "orbitals."
             )
 
         # the MO extension evaluates the density of the orbitals of a density guess
@@ -1508,37 +1789,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     self._approx_update_orbs = wrapped_approx_update_orbs
                     self._raw_approx_update_orbs = approx_update_orbs
                 elif rotation_qn:
-                    # the initial Hessian of the rotation QN settings is the static
-                    # part of the Hessian, whose level-shifted inverse is their
-                    # preconditioner, and their objective function also returns the
-                    # gradient at a trial point, from the potential its energy
-                    # evaluation left cached, so that rotation QN also learns from a
-                    # rejected step, while the identity, the default transport, is the
-                    # parallel transport of the occupied-virtual rotations
-                    mo_obj_func = self._func
-
-                    def obj_func_grad(kappa: np.ndarray, grad: np.ndarray) -> float:
-                        func = mo_obj_func(kappa)
-                        if np.isfinite(func):
-                            grad[:] = driver._trial_gradient(kappa)
-                        return func
-
-                    rotation_qn_settings = RotationQNSettings()
-                    assign_extension_settings(
-                        self, rotation_qn_settings, rotation_qn_setting_fields
-                    )
-                    rotation_qn_settings.init_hess = weak_method(self._static_hess_x)
-                    rotation_qn_settings.init_precond = weak_method(
-                        self._static_precond
-                    )
-                    rotation_qn_settings.obj_func_grad = obj_func_grad
-                    self._approx_update_orbs, obj_func = rotation_qn_factory(
-                        self.n_param,
-                        self._update_orbs,
-                        mo_obj_func,
-                        settings,
-                        state,
-                        rotation_qn_settings,
+                    self._approx_update_orbs, obj_func = self._rotation_qn(
+                        settings, state
                     )
                     self._adopt("_func", obj_func)
                     self._raw_approx_update_orbs = self._approx_update_orbs
@@ -1924,24 +2176,11 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         mo_coeff_virt = self.mo_coeff[:, self.virt_idx]
         return [
             (
-                mo_coeff_occ.T @ self.fock @ mo_coeff_occ,
-                mo_coeff_virt.T @ self.fock @ mo_coeff_virt,
+                mo_coeff_occ.conj().T @ self.fock @ mo_coeff_occ,
+                mo_coeff_virt.conj().T @ self.fock @ mo_coeff_virt,
                 4.0,
             )
         ]
-
-    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
-        """
-        this function returns the gradient 4 F_vo at the orbitals a step rotates the
-        current ones to, from the effective potential the evaluation of the energy
-        there left cached, for the rotation QN extension
-        """
-        dm, veff = self._last_potential.key[0], self._last_potential.value
-        u = self._exp_mat(self._unpack(self._rotation(kappa)))
-        mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        fock = self.get_fock(self.h1e, self.s1e, veff, dm)
-        grad_vo = mo_coeff[:, self.virt_idx].T @ fock @ mo_coeff[:, self.occ_idx]
-        return self._pack_vo(4 * grad_vo)
 
     def _change_reference(
         self,
@@ -2093,71 +2332,108 @@ class ROHFOTR(SecondOrderOTR, newton_ah._SecondOrderROHF):
     _exp_mat = RHFOTR._exp_mat
     _unpack = RHFOTR._unpack
 
+    def _static_blocks(self) -> Tuple[Tuple[np.ndarray, np.ndarray], List[Tuple]]:
+        """
+        this function returns the alpha and beta Fock matrices over the orbitals at the
+        current orbitals and, for the virtual-closed, virtual-open and open-closed
+        rotations, their rows and columns and the eigendecompositions of the blocks of
+        the Fock matrix the static part of the Hessian applies to these rotations
+        alone, the sum of the alpha and beta ones for the virtual-closed rotations,
+        which turn the orbitals of both spins, and that of the only spin whose orbitals
+        the others turn, computed once for every Fock matrix and orbitals
+        """
+        key = (self.fock, self.mo_coeff)
+        if not self._static_eigen.matches(key):
+            mo_coeff = self.mo_coeff
+            focka = mo_coeff.conj().T @ self.fock.focka @ mo_coeff
+            fockb = mo_coeff.conj().T @ self.fock.fockb @ mo_coeff
+            blocks = [
+                (
+                    rows,
+                    cols,
+                    *np.linalg.eigh(fock[np.ix_(rows, rows)]),
+                    *np.linalg.eigh(fock[np.ix_(cols, cols)]),
+                )
+                for rows, cols, fock in (
+                    (self.virt_idx, self.clos_idx, focka + fockb),
+                    (self.virt_idx, self.open_idx, focka),
+                    (self.open_idx, self.clos_idx, fockb),
+                )
+            ]
+            self._static_eigen = LastResult.of(key, ((focka, fockb), blocks))
+        return self._static_eigen.value
+
+    def _static_hess_x(self, x: np.ndarray, hess_x: np.ndarray) -> None:
+        """
+        this function applies the static part of the Hessian at the current orbitals,
+        which neglects the response of the effective potentials to the rotation and the
+        terms of the gradient, the sum over the spins of 2 (F_vv x - x F_oo) over the
+        virtual-occupied block of the shared rotation of each spin, whose occupied
+        orbitals are the closed and open ones for alpha and the closed ones for beta,
+        which the rotation QN extension takes as its initial Hessian
+        """
+        (focka, fockb), _ = self._static_blocks()
+        kappa = self._unpack(self._rotation(x))
+        hx = np.zeros_like(kappa)
+        for fock, occ_idx in ((focka, self.mo_occ > 0), (fockb, self.mo_occ == 2)):
+            block_idx = np.ix_(~occ_idx, occ_idx)
+            block = kappa[block_idx]
+            hx[block_idx] += (
+                fock[np.ix_(~occ_idx, ~occ_idx)] @ block
+                - block @ fock[np.ix_(occ_idx, occ_idx)]
+            )
+        hess_x[:] = 2 * self._parameters(hx[self.rot_matrix_mask])
+
+    def _static_precond(
+        self, residual: np.ndarray, mu: float, precond_residual: np.ndarray
+    ) -> None:
+        """
+        this function applies the inverse of the static part of the Hessian at the
+        current orbitals shifted by a level shift, without the coupling of the
+        virtual-closed rotations to the virtual-open ones through the alpha Fock matrix
+        between the closed and open orbitals and to the open-closed ones through the
+        beta Fock matrix between the open and virtual orbitals, which leaves the exact
+        inverse for each kind of rotation, whose divisors are floored as those of the
+        preconditioners of OpenTrustRegion, for the rotation QN extension
+        """
+        _, blocks = self._static_blocks()
+        kappa = self._unpack(self._rotation(residual))
+        result = np.zeros_like(kappa)
+        for rows, cols, eigval_rows, eigvec_rows, eigval_cols, eigvec_cols in blocks:
+            divisors = 2 * (eigval_rows[:, None] - eigval_cols[None, :]) - mu
+            divisors[np.abs(divisors) < precond_floor] = precond_floor
+            rotated = eigvec_rows.conj().T @ kappa[np.ix_(rows, cols)] @ eigvec_cols
+            result[np.ix_(rows, cols)] = (
+                eigvec_rows @ (rotated / divisors) @ eigvec_cols.conj().T
+            )
+        precond_residual[:] = self._parameters(result[self.rot_matrix_mask])
+
     def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
         """
-        this function transports tangent_vector from the tangent space at a starting
-        base to the tangent space at a new base along the geodesic. tangent_vector and
-        geodesic have the same base. In other words, the displacement described by
-        tangent_vector is defined in terms of the MO coefficients defined by
-        the starting base, and this function transforms it to the MO coefficients
-        defined by the new base. The geodesic describes the rotation from the starting
-        base to the new base.
+        this function transports a tangent vector along the geodesic of a rotation to
+        the orbitals the rotation reaches by the parallel transport of the flag
+        manifold of the closed, open and virtual orbitals, whose rotations within each
+        of these sets are redundant, for the rotation QN extension
         """
-        # unpack into full matrix
-        geodesic_full = self._unpack(geodesic)
-
-        # define tolerance for truncation of series expansion
-        tol = np.finfo(np.float64).eps
-
-        # k = 0
-        tangent_vector_full = self._unpack(tangent_vector)
-        # k = 1
-        k = 1
-        current_term = -(1 / 2) * self._remove_diag_blocks(
-            geodesic_full @ tangent_vector_full - tangent_vector_full @ geodesic_full
+        transported = transport_rotation(
+            self._unpack(self._rotation(geodesic)),
+            self._unpack(self._rotation(tangent_vector)),
+            self.rot_matrix_mask | self.rot_matrix_mask.T,
         )
-        tangent_vector_full = tangent_vector_full + current_term
-        # k > 1
-        while (np.linalg.norm(current_term) > tol) and (k < 200):
-            k += 1
-            current_term = (-1 / (2 * k)) * self._remove_diag_blocks(
-                geodesic_full @ current_term - current_term @ geodesic_full
-            )
-            tangent_vector_full = tangent_vector_full + current_term
-        current_term_norm = np.linalg.norm(current_term)
-        if current_term_norm > tol:
-            raise RuntimeError(
-                "Parallel transport truncated before tolerance is reached. Norm of "
-                f"the last term: {current_term_norm}."
-            )
+        tangent_vector[:] = self._parameters(transported[self.rot_matrix_mask])
 
-        # ensure the transported kappa and grad are in the tangent space of the new
-        # reference
-        tangent_vector_full = self._ensure_tangent(tangent_vector_full)
-
-        # pack back into non-redundant parameters
-        tangent_vector[:] = tangent_vector_full[self.rot_matrix_mask]
-
-        return
-
-    def _remove_diag_blocks(self, matrix: np.ndarray) -> np.ndarray:
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
         """
-        this function removes the redundant diagonal blocks of the matrix corresponding
-        to closed, open, and virtual orbitals, which ensures the output is in the
-        tangent space of the reference
+        this function returns the callback functions of the rotation QN settings of the
+        mean-field drivers and the parallel transport, which on the flag manifold of
+        ROHF differs from the identity, unless parallel_transport is unset
         """
-        matrix[np.ix_(self.clos_idx, self.clos_idx)] = 0.0
-        matrix[np.ix_(self.open_idx, self.open_idx)] = 0.0
-        matrix[np.ix_(self.virt_idx, self.virt_idx)] = 0.0
-        return matrix
-
-    def _ensure_tangent(self, tangent_vector: np.ndarray) -> np.ndarray:
-        """
-        this function ensures the input tangent vector is in the tangent space of the
-        reference by removing the redundant diagonal blocks and anti-symmetrizing the
-        matrix
-        """
-        return self._remove_diag_blocks(0.5 * (tangent_vector - tangent_vector.T))
+        callbacks = super()._rotation_qn_callbacks(obj_func)
+        if self.parallel_transport:
+            callbacks["transport"] = weak_method(self._transport)
+        return callbacks
 
     def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -2489,32 +2765,12 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
             mo_coeff_virt = self.mo_coeff[spin][:, self.virt_idx[spin]]
             channels.append(
                 (
-                    mo_coeff_occ.T @ self.fock[spin] @ mo_coeff_occ,
-                    mo_coeff_virt.T @ self.fock[spin] @ mo_coeff_virt,
+                    mo_coeff_occ.conj().T @ self.fock[spin] @ mo_coeff_occ,
+                    mo_coeff_virt.conj().T @ self.fock[spin] @ mo_coeff_virt,
                     2.0,
                 )
             )
         return channels
-
-    def _trial_gradient(self, kappa: np.ndarray) -> np.ndarray:
-        """
-        this function returns the gradient 2 F_vo of each spin at the orbitals a step
-        rotates the current ones to, from the effective potential the evaluation of
-        the energy there left cached, for the rotation QN extension
-        """
-        dm, vhf = self._last_potential.key[0], self._last_potential.value
-        u = self._exp_mat(self._unpack(self._rotation(kappa)))
-        mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        fock = self._scf.get_fock(self.h1e, self.s1e, vhf, dm)
-        return self._pack_vo(
-            [
-                2
-                * mo_coeff[spin][:, self.virt_idx[spin]].T
-                @ fock[spin]
-                @ mo_coeff[spin][:, self.occ_idx[spin]]
-                for spin in range(2)
-            ]
-        )
 
     def _get_orth_mo_coeff(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -2576,6 +2832,13 @@ class X2CRHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CRHF):
     """
 
     _exp_mat = RHFOTR._exp_mat
+
+    # every rotation turns both spinors of a Kramers pair
+    _static_metric = 2.0
+
+    # the gradient of the spinors is that of DHF, as gen_g_hop returns it, rather than
+    # twice that, which the get_grad of RHF the X2C classes inherit returns
+    get_grad = dhf.DHF.get_grad
 
     def _fix_phase(self) -> None:
         """
@@ -2684,6 +2947,7 @@ class X2CUHFOTR(SecondOrderOTR, x2c_newton_ah.SecondOrderX2CUHF):
     _fix_phase = RHFOTR._fix_phase
     _exp_mat = RHFOTR._exp_mat
     _unpack = RHFOTR._unpack
+    get_grad = X2CRHFOTR.get_grad
 
     def _get_indices(self) -> None:
         """
@@ -2865,15 +3129,16 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
     def _eigenstates(
         self, mo_coeff: np.ndarray, ci: Union[np.ndarray, List[np.ndarray]], eris: Any
-    ) -> Tuple[float, List[np.ndarray]]:
+    ) -> Tuple[float, List[np.ndarray], List[np.ndarray]]:
         """
-        this function returns the energy of given CI vectors in given orbitals and the
+        this function returns the energy of given CI vectors in given orbitals, the
         eigenstates of the active space Hamiltonian within the space the CI vectors of
-        every CI solver span, in increasing energy for every solver; the energy is that
-        of these eigenstates, weighted the way gen_g_hop weights its derivatives, whose
-        gradient at the eigenstates is the derivative of this energy, and which equals
-        the weighted energy of the CI vectors themselves for a single state of every
-        solver or equal weights
+        every CI solver span, in increasing energy for every solver, and for every
+        solver the rotation R that turns its CI vectors C into these, R^T C; the energy
+        is that of these eigenstates, weighted the way gen_g_hop weights its
+        derivatives, whose gradient at the eigenstates is the derivative of this
+        energy, and which equals the weighted energy of the CI vectors themselves for a
+        single state of every solver or equal weights
         """
         # the active space Hamiltonian, reusing the integrals already transformed for
         # these orbitals
@@ -2884,6 +3149,7 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         # the Hamiltonian within the space the CI vectors of every solver span
         energies: List[float] = []
         eigenstates: List[np.ndarray] = []
+        rotations: List[np.ndarray] = []
         for solver, nelec, states in self._state_groups(ci):
             op = solver.absorb_h1e(h1eff, h2eff, self.ncas, nelec, 0.5)
             h_states = np.array(
@@ -2892,9 +3158,56 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
             group_energies, rotation = np.linalg.eigh(states @ h_states.T)
             energies.extend(group_energies)
             eigenstates.extend(rotation.T @ states)
+            rotations.append(rotation)
 
         energy = energy_core + float(np.dot(getattr(self, "weights", [1.0]), energies))
-        return energy, eigenstates
+        return energy, eigenstates, rotations
+
+    # the last trial point the objective function evaluated, keyed by its step and the
+    # current orbitals and CI vectors: its energy, orbitals, eigenstates, integrals and
+    # the rotations of the eigenstates of every CI solver within the space its
+    # displaced CI vectors span
+    _last_trial = LastResult()
+
+    # the rotations of the eigenstates of the last orbital update, keyed by its step
+    _update_rotations = LastResult()
+
+    def _reset(self) -> None:
+        """
+        this function discards everything a previous kernel computed, including the
+        last trial point and the rotations of the eigenstates of the last orbital
+        update
+        """
+        super()._reset()
+        self._last_trial = LastResult()
+        self._update_rotations = LastResult()
+
+    def _trial_key(self, x: np.ndarray) -> Tuple[np.ndarray, ...]:
+        """
+        this function returns the arrays that define a trial point: the step and the
+        current orbitals and CI vectors it starts from
+        """
+        return (x, self.mo_coeff, *self._ci_vectors(self.ci))
+
+    def _trial_point(self, x: np.ndarray) -> Tuple[Any, ...]:
+        """
+        this function returns the energy, the orbitals, the eigenstates, the integrals
+        and the rotations of the eigenstates at a step from the current orbitals and CI
+        vectors, evaluated once for the last step, so that the gradient there reuses
+        the integrals the energy needed
+        """
+        key = self._trial_key(x)
+        if not self._last_trial.matches(key):
+            u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
+            rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
+            eris = self.ao2mo(rot_mo_coeff)
+            energy, states, rotations = self._eigenstates(
+                rot_mo_coeff, self._displaced_ci(x), eris
+            )
+            self._last_trial = LastResult.of(
+                key, (energy, rot_mo_coeff, states, eris, rotations)
+            )
+        return self._last_trial.value
 
     def _func(self, x: np.ndarray) -> float:
         """
@@ -2905,12 +3218,80 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         """
         if self._rotates_too_far(x[: self.n_param_orb]):
             return np.inf
-        u = ciah.expmat(self.unpack_uniq_var(x[: self.n_param_orb]))
+        return self._trial_point(x)[0]
 
-        rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
-        eris = self.ao2mo(rot_mo_coeff)
+    def _trial_gradient(self, x: np.ndarray) -> np.ndarray:
+        """
+        this function returns the gradient at a step from the current orbitals and CI
+        vectors, at the eigenstates the objective function evaluated there, with the
+        integrals it transformed, as gen_g_hop returns it, whose CI part is orthogonal
+        to all states of every CI solver
+        """
+        _, rot_mo_coeff, states, eris, _ = self._trial_point(x)
+        ci = states[0] if isinstance(self.ci, np.ndarray) else states
+        return self._restrict(newton_casscf.gen_g_hop(self, rot_mo_coeff, ci, eris)[0])
 
-        return self._eigenstates(rot_mo_coeff, self._displaced_ci(x), eris)[0]
+    def _transport(self, geodesic: np.ndarray, tangent_vector: np.ndarray) -> None:
+        """
+        this function transports a tangent vector along the geodesic of a step to the
+        point it reaches, which is the current point, since the rotation QN extension
+        transports its history after an orbital update and the gradient at a trial
+        point back along the reversed step: the orbital rotations by the parallel
+        transport of the manifold of orbitals whose rotations PySCF's second-order
+        CASSCF does not select are redundant, unless parallel_transport is unset,
+        which keeps them, as the frame of the rotations moves with the orbitals, and
+        the CI part by turning it as the states of every CI solver turned within the
+        space their displaced CI vectors span and projecting it onto the space
+        orthogonal to the states of that solver, its tangent space; the CI part needs
+        both also without the parallel transport, since the states are chosen anew
+        within their space at every point, which changes the coordinates the CI part
+        is expressed in, and since it holds displacements of the CI vectors rather than
+        coordinates in a frame that moves with them, so that kept as it is, it would
+        leave the tangent space
+        """
+        n_param_orb = self.n_param_orb
+        orbital_rotation = self.unpack_uniq_var(tangent_vector[:n_param_orb])
+        if self.parallel_transport:
+            uniq_var = self.uniq_var_indices(
+                self.mo_coeff.shape[1], self.ncore, self.ncas, self.frozen
+            )
+            orbital_rotation = transport_rotation(
+                self.unpack_uniq_var(geodesic[:n_param_orb]),
+                orbital_rotation,
+                uniq_var | uniq_var.T,
+            )
+
+        # the states turned as R^T C along the step of the last orbital update, and
+        # back from the eigenstates at the last trial point as R
+        rotations: Optional[List[np.ndarray]] = None
+        if self._update_rotations.matches((geodesic,)):
+            rotations = [
+                state_rotation.T for state_rotation in self._update_rotations.value
+            ]
+        elif self._last_trial.matches(self._trial_key(-geodesic)):
+            rotations = self._last_trial.value[4]
+
+        full = self._embed(tangent_vector)
+        parts, start = [self.pack_uniq_var(orbital_rotation)], n_param_orb
+        for i, (*_, states) in enumerate(self._state_groups(self.ci)):
+            block = full[start : start + states.size].reshape(states.shape)
+            if rotations is not None:
+                block = rotations[i] @ block
+            parts.append((block - (block @ states.T) @ states).ravel())
+            start += states.size
+        tangent_vector[:] = self._restrict(np.concatenate(parts))
+
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
+        """
+        this function returns the callback functions of the rotation QN settings: the
+        objective function with the gradient at a trial point and the transport, which
+        on the manifold of the orbitals and states differs from the identity
+        """
+        callbacks = super()._rotation_qn_callbacks(obj_func)
+        callbacks["transport"] = weak_method(self._transport)
+        return callbacks
 
     def _update_orbs(
         self, x: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
@@ -2926,8 +3307,11 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         # the states move on as the eigenstates within the space the displaced CI
         # vectors span, at which gen_g_hop's derivatives are those of the energy
-        energy, states = self._eigenstates(self.mo_coeff, self._displaced_ci(x), eris)
+        energy, states, rotations = self._eigenstates(
+            self.mo_coeff, self._displaced_ci(x), eris
+        )
         self.ci = states[0] if isinstance(self.ci, np.ndarray) else states
+        self._update_rotations = LastResult.of((x,), rotations)
 
         new_grad, _, hess_x, new_h_diag = newton_casscf.gen_g_hop(
             self, self.mo_coeff, self.ci, eris
@@ -2947,7 +3331,9 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
 
         self._raw_hess_x = raw_hess_x
 
-        return energy, self._count_hess_x
+        # the rotation QN objects keep the Hessian linear transformation the orbital
+        # update of their host returned last, so it refers to this object weakly
+        return energy, weak_method(self._count_hess_x)
 
     def kernel(
         self,
@@ -3017,8 +3403,14 @@ class CASSCFOTR(OTR, newton_casscf.CASSCF):
         # number of parameters
         self.n_param = self.n_param_orb + self.n_param_ci
 
-        # call solver
-        self._solve()
+        # call solver, with rotation QN if the object has a quasi-Newton method, after
+        # which the last trial point, whose integrals the kernel does not need anymore,
+        # is dropped
+        if self._qn_method() is None:
+            self._solve()
+        else:
+            self._solve_rotation_qn()
+        self._last_trial = LastResult()
         eris = self.ao2mo(self.mo_coeff)
         self.e_tot, self.e_cas, fcivec = self.casci(self.mo_coeff, self.ci, eris)
         if isinstance(fcivec, np.ndarray):
