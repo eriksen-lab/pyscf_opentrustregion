@@ -49,7 +49,7 @@ from pyopentrustregion.extensions.density_qn import (
     DensityQNSettings,
     density_qn_factory,
 )
-from pyopentrustregion.extensions.s_gek import SGEKSettings, s_gek_factory
+from pyopentrustregion.extensions.s_gek import SGEKSettings, s_gek_solver
 from pyopentrustregion.extensions.mo.python_interface import MOSettingsC
 from pyopentrustregion.extensions.oao.python_interface import OAOSettingsC
 from pyopentrustregion.extensions.density_qn.python_interface import DensityQNSettingsC
@@ -418,7 +418,7 @@ class OTR:
     def _approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         """
         this function performs the approximate Hessian linear transformation of the
-        quasi-Newton or S-GEK extension for a stability check and counts it
+        quasi-Newton extension for a stability check and counts it
         """
         self._raw_approx_update_orbs.hess_x(x, hx)
         self.n_hess_x_stability += 1
@@ -462,16 +462,12 @@ class OTR:
         """
         raise NotImplementedError
 
-    def _rotation_qn_callbacks(
+    def _obj_func_grad(
         self, obj_func: Callable[[np.ndarray], float]
-    ) -> Dict[str, Callable]:
+    ) -> Callable[[np.ndarray, np.ndarray], float]:
         """
-        this function returns the callback functions of the rotation QN settings that
-        this driver supplies for the objective function the rotation QN object wraps:
-        the objective function, which also returns the gradient at a trial point, so
-        that rotation QN also learns from a rejected step, while rotation QN starts
-        from the Hessian diagonal and keeps the components of its history in the
-        rotated orbitals unless a driver supplies these too
+        this function returns the objective function which also returns the gradient
+        at a trial point, so that rotation QN and S-GEK also learn from a rejected step
         """
         driver: Any = weakref.proxy(self)
 
@@ -481,7 +477,19 @@ class OTR:
                 grad[:] = driver._trial_gradient(kappa)
             return func
 
-        return {"obj_func_grad": obj_func_grad}
+        return obj_func_grad
+
+    def _rotation_qn_callbacks(
+        self, obj_func: Callable[[np.ndarray], float]
+    ) -> Dict[str, Callable]:
+        """
+        this function returns the callback functions of the rotation QN settings that
+        this driver supplies for the objective function the rotation QN object wraps:
+        the objective function, which also returns the gradient at a trial point, while
+        rotation QN starts from the Hessian diagonal and keeps the components of its
+        history in the rotated orbitals unless a driver supplies these too
+        """
+        return {"obj_func_grad": self._obj_func_grad(obj_func)}
 
     def _rotation_qn(
         self, settings: SolverSettings, state: SolverState
@@ -585,20 +593,35 @@ class OTR:
         """
         raise NotImplementedError
 
+    def _change_reference(
+        self,
+        new_ref: np.ndarray,
+        kappa: np.ndarray,
+        local_grad: np.ndarray,
+        grad: np.ndarray,
+    ) -> None:
+        """
+        this function is supplied by the drivers S-GEK supports, RHF and UHF; it
+        re-expresses the history of S-GEK in place in the chart of the point new_ref
+        """
+        raise NotImplementedError
+
     def _solve(
         self,
         settings: Optional[SolverSettings] = None,
         state: Optional[SolverState] = None,
         update_orbs: Optional[Callable[..., Tuple[float, OTRHessX]]] = None,
         obj_func: Optional[Callable[[np.ndarray], float]] = None,
+        s_gek_settings: Optional[SGEKSettings] = None,
     ) -> None:
         """
         this function runs the solver from the current point and records whether it
         converged, with the settings of this object, its orbital update and its
         objective function unless the kernel built the settings and a state for the
-        extensions and takes the functions of one; like PySCF's own solvers, it stops
-        at the last point without raising once the maximum number of macro iterations
-        is reached, which the solver reports itself
+        extensions and takes the functions of one, or S-GEK in its place with the
+        S-GEK settings the kernel built and the chart transformation of this object;
+        like PySCF's own solvers, it stops at the last point without raising once the
+        maximum number of macro iterations is reached, which the solver reports itself
         """
         if settings is None:
             settings = SolverSettings()
@@ -609,7 +632,18 @@ class OTR:
             obj_func = self._func
         self.converged = False
         try:
-            solver(update_orbs, obj_func, self.n_param, settings, state)
+            if s_gek_settings is None:
+                solver(update_orbs, obj_func, self.n_param, settings, state)
+            else:
+                s_gek_solver(
+                    update_orbs,
+                    obj_func,
+                    self._change_reference,
+                    self.n_param,
+                    settings,
+                    state,
+                    s_gek_settings,
+                )
             self.converged = True
         except RuntimeError as error:
             if f"(code {error_solver_max_iter})" not in str(error):
@@ -1185,8 +1219,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     def _approx_stability_hess_x(self, x: np.ndarray, hx: np.ndarray) -> None:
         """
         this function performs the approximate Hessian linear transformation of the
-        quasi-Newton or S-GEK extension for a stability check and counts it together
-        with the two-electron response builds it requires
+        quasi-Newton extension for a stability check and counts it together with the
+        two-electron response builds it requires
         """
         n_jk_response = self.n_jk_response
         super()._approx_stability_hess_x(x, hx)
@@ -1483,8 +1517,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         self._raw_hess_x = raw_hess_x
 
-        # the rotation QN and S-GEK objects keep the Hessian linear transformation the
-        # orbital update of their host returned last, so it refers to this object weakly
+        # the rotation QN object keeps the Hessian linear transformation the orbital
+        # update of its host returned last, so it refers to this object weakly
         return energy, weak_method(self._count_hess_x)
 
     def kernel(
@@ -1712,6 +1746,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             # the extensions replace or take over routines of this object, which are
             # recorded also if a factory or a check after one raises, so that the next
             # kernel drops them
+            s_gek_settings: Optional[SGEKSettings] = None
             try:
                 # get exact orbital updates from the MO or the OAO extension
                 if mo or self.oao:
@@ -1762,8 +1797,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                         settings.stability_settings.get_extra_trial_vectors
                     )
 
-                    # the rotation QN and S-GEK factories accept a wrapper of the
-                    # returned orbital updating function if it is marked as one
+                    # the rotation QN factory accepts a wrapper of the returned
+                    # orbital updating function if it is marked as one
                     @functools.wraps(exact_update_orbs)
                     def wrapped_update_orbs(
                         kappa: np.ndarray, grad: np.ndarray, h_diag: np.ndarray
@@ -1835,21 +1870,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                             "cannot be transformed consistently to make the redundant "
                             "blocks vanish on the flag manifold."
                         )
+                    # S-GEK takes the place of the solver, with the chart
+                    # transformation of this object, and its settings take the
+                    # objective function with the gradient at a trial point, with which
+                    # its trial acceptance keeps rejected trial points as data
                     s_gek_settings = SGEKSettings()
                     assign_extension_settings(
                         self, s_gek_settings, s_gek_setting_fields
                     )
-                    self._approx_update_orbs, obj_func = s_gek_factory(
-                        self.n_param,
-                        weak_method(self._update_orbs),
-                        weak_method(self._func),
-                        weak_method(self._change_reference),
-                        settings,
-                        state,
-                        s_gek_settings,
+                    s_gek_settings.obj_func_grad = self._obj_func_grad(
+                        weak_method(self._func)
                     )
-                    self._adopt("_func", obj_func)
-                    self._raw_approx_update_orbs = self._approx_update_orbs
             finally:
                 self._adopted_routines = tuple(
                     name
@@ -1881,6 +1912,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     if not hasattr(self, "_approx_update_orbs")
                     else self._count_approx_update_orbs(self._approx_update_orbs)
                 ),
+                s_gek_settings=s_gek_settings,
             )
 
             # the MO objects keep the orbitals they hold now
@@ -2251,11 +2283,14 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
 
             # get combined rotation matrix with vanishing oo and vv blocks
             scos = np.ones_like(s)
-            mask = np.abs(1 - s) > np.sqrt(np.finfo(float).eps)
+            mask = 1 - s > np.sqrt(np.finfo(float).eps)
             scos[mask] = np.arccos(s[mask]) / np.sqrt(1 - s[mask] ** 2)
             kappa[i, :] = self._pack_vo(combined_rot_vo @ (vh.T * scos) @ u.T)
 
-            # transform local gradients to new orbitals
+            # transform local gradients to new orbitals: the combined rotation is
+            # exp(K(kappa)) B with B = diag(rot_occ, rot_virt), so the orbitals of the
+            # point in the new chart are its previous ones times B^T, which turns a
+            # virtual-occupied gradient g into rot_virt g rot_occ^T
             n_occ = rot_occ.shape[0]
             n_virt = rot_virt.shape[0]
             occ_unit = np.allclose(rot_occ, np.eye(n_occ), atol=1.0e-10, rtol=0)
@@ -2263,9 +2298,9 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
             if not occ_unit or not virt_unit:
                 local_grad_2d = self._unpack_vo(local_grad[i, :])
                 if not occ_unit:
-                    local_grad_2d = local_grad_2d @ rot_occ
+                    local_grad_2d = local_grad_2d @ rot_occ.T
                 if not virt_unit:
-                    local_grad_2d = rot_virt.T @ local_grad_2d
+                    local_grad_2d = rot_virt @ local_grad_2d
                 local_grad[i, :] = self._pack_vo(local_grad_2d)
 
             # transform gradients to new reference
@@ -2739,20 +2774,23 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
 
                 # get combined rotation matrix with vanishing oo and vv blocks
                 scos = np.ones_like(s)
-                mask = np.abs(1 - s) > np.sqrt(np.finfo(float).eps)
+                mask = 1 - s > np.sqrt(np.finfo(float).eps)
                 scos[mask] = np.arccos(s[mask]) / np.sqrt(1 - s[mask] ** 2)
                 kappa_2d.append(combined_rot_vo @ (vh.T * scos) @ u.T)
 
-                # transform local gradients to new orbitals
+                # transform local gradients to new orbitals: the combined rotation is
+                # exp(K(kappa)) B with B = diag(rot_occ, rot_virt), so the orbitals of
+                # the point in the new chart are its previous ones times B^T, which
+                # turns a virtual-occupied gradient g into rot_virt g rot_occ^T
                 n_occ = rot_occ.shape[0]
                 n_virt = rot_virt.shape[0]
                 occ_unit = np.allclose(rot_occ, np.eye(n_occ), atol=1.0e-10, rtol=0)
                 virt_unit = np.allclose(rot_virt, np.eye(n_virt), atol=1.0e-10, rtol=0)
                 if not occ_unit or not virt_unit:
                     if not occ_unit:
-                        local_grad_2d[spin] = local_grad_2d[spin] @ rot_occ
+                        local_grad_2d[spin] = local_grad_2d[spin] @ rot_occ.T
                     if not virt_unit:
-                        local_grad_2d[spin] = rot_virt.T @ local_grad_2d[spin]
+                        local_grad_2d[spin] = rot_virt @ local_grad_2d[spin]
 
                 # transform gradients to new reference
                 u, s, vh = sc.linalg.svd(kappa_2d[spin], full_matrices=False)

@@ -58,6 +58,7 @@ from pyscf.opentrustregion.opentrustregion_interface import (
 from pyopentrustregion import SolverSettings, StabilitySettings
 from pyopentrustregion.extensions.mo import MOSettings
 from pyopentrustregion.extensions.rotation_qn import rotation_qn_factory
+from pyopentrustregion.extensions.s_gek import s_gek_solver
 
 # fixtures shared by every test, built once in setUpModule
 mol: gto.Mole
@@ -370,6 +371,20 @@ def check_transport_is_parallel(test: unittest.TestCase, obj: Any) -> None:
 
     test.assertLess(asymmetry(True), 1e-6)
     test.assertGreater(asymmetry(False), 1e-3)
+
+
+def occupied_projectors(obj: Any, mo_coeff: np.ndarray) -> List[np.ndarray]:
+    """
+    this function returns the projectors onto the occupied orbitals of every spin of
+    MO coefficients in the convention of a driver's orbitals
+    """
+    if isinstance(obj, UHFOTR):
+        return [
+            mo_coeff[spin][:, obj.occ_idx[spin]]
+            @ mo_coeff[spin][:, obj.occ_idx[spin]].T
+            for spin in range(2)
+        ]
+    return [mo_coeff[:, obj.occ_idx] @ mo_coeff[:, obj.occ_idx].T]
 
 
 def check_no_referrers(test: unittest.TestCase, obj: Any) -> None:
@@ -958,6 +973,52 @@ class SCFTests(unittest.TestCase):
                 parallel_transport=False,
             )
 
+    def test_s_gek(self) -> None:
+        # S-GEK takes the place of the solver for RHF and UHF, calls the chart
+        # transformation of its history and the objective function with the gradient
+        # at a trial point, reaches the minimum and, for this solve only, turns on the
+        # stability check of the solver
+        for name, make in (
+            ("RHF", lambda: scf.RHF(mol)),
+            ("UHF", lambda: scf.UHF(mol_open)),
+        ):
+            with self.subTest(case=name):
+                calls: List[str] = []
+
+                def recording_s_gek_solver(
+                    update_orbs: Callable,
+                    obj_func: Callable,
+                    change_reference: Callable,
+                    *args: Any,
+                ) -> None:
+                    s_gek_settings = args[-1]
+                    obj_func_grad = s_gek_settings.obj_func_grad
+
+                    def recording_obj_func_grad(
+                        kappa: np.ndarray, grad: np.ndarray
+                    ) -> float:
+                        calls.append("obj_func_grad")
+                        return obj_func_grad(kappa, grad)
+
+                    def recording_change_reference(*arrays: np.ndarray) -> None:
+                        calls.append("change_reference")
+                        change_reference(*arrays)
+
+                    s_gek_settings.obj_func_grad = recording_obj_func_grad
+                    s_gek_solver(
+                        update_orbs, obj_func, recording_change_reference, *args
+                    )
+
+                with mock.patch(
+                    "pyscf.opentrustregion.opentrustregion_interface.s_gek_solver",
+                    recording_s_gek_solver,
+                ):
+                    otr = self._check(make(), make(), s_gek=True)
+                self.assertIn("obj_func_grad", calls)
+                self.assertIn("change_reference", calls)
+                self.assertGreater(otr.n_hess_x_stability, 0)
+                self.assertNotIn("stability", vars(otr))
+
     def test_rotation_qn_callbacks(self) -> None:
         # the mean-field drivers supply the static part of the Hessian and its inverse
         # unless static_hess is unset, the objective function with the
@@ -1216,6 +1277,81 @@ class SCFTests(unittest.TestCase):
         np.testing.assert_allclose(
             transport_rotation(generator, tangent, non_redundant), tangent, atol=1e-15
         )
+
+    def test_change_reference(self) -> None:
+        # the history of S-GEK in the chart of the current point: after several steps,
+        # the position of every earlier point reproduces its occupied orbitals and its
+        # energy, and its gradient the finite differences of the objective function,
+        # which evaluates that chart; a single change leaves the previous reference
+        # without a gauge rotation, so only several changes test its direction
+        for name, mf_in in (("RHF", scf.RHF(mol)), ("UHF", scf.UHF(mol_open))):
+            with self.subTest(case=name):
+                otr = to_otr(mf_in)
+                checked: List[Tuple[float, float, float]] = []
+
+                def solver(
+                    update_orbs: Callable, obj_func: Callable, n_param: int, *args: Any
+                ) -> None:
+                    # within the kernel, where the orbitals of the driver are the ones
+                    # the orbital update rotates
+                    grad = np.empty(n_param)
+                    h_diag = np.empty(n_param)
+                    func, _ = update_orbs(np.zeros(n_param), grad, h_diag)
+                    kappa = np.zeros((1, n_param))
+                    local_grad, grad_hist = grad[None].copy(), grad[None].copy()
+                    energies = [func]
+                    projectors = [occupied_projectors(otr, otr.mo_coeff)]
+                    rng = np.random.default_rng(7)
+                    for _ in range(3):
+                        step = rng.standard_normal(n_param)
+                        step *= 0.15 / np.linalg.norm(step)
+                        func, _ = update_orbs(step, grad, h_diag)
+                        otr._change_reference(step, kappa, local_grad, grad_hist)
+                        kappa = np.vstack([kappa, np.zeros(n_param)])
+                        local_grad = np.vstack([local_grad, grad])
+                        grad_hist = np.vstack([grad_hist, grad])
+                        energies.append(func)
+                        projectors.append(occupied_projectors(otr, otr.mo_coeff))
+                    for i in range(len(energies) - 1):
+                        rotation = otr._exp_mat(otr._unpack(kappa[i]))
+                        rotated = (
+                            np.array([c @ r for c, r in zip(otr.mo_coeff, rotation)])
+                            if name == "UHF"
+                            else otr.mo_coeff @ rotation
+                        )
+                        fd_step = 1e-4
+                        differences = np.array(
+                            [
+                                (
+                                    obj_func(kappa[i] + fd_step * e)
+                                    - obj_func(kappa[i] - fd_step * e)
+                                )
+                                / (2 * fd_step)
+                                for e in np.eye(n_param)
+                            ]
+                        )
+                        checked.append(
+                            (
+                                max(
+                                    np.abs(projector - reference).max()
+                                    for projector, reference in zip(
+                                        occupied_projectors(otr, rotated), projectors[i]
+                                    )
+                                ),
+                                abs(obj_func(kappa[i]) - energies[i]),
+                                np.abs(grad_hist[i] - differences).max(),
+                            )
+                        )
+
+                with mock.patch(
+                    "pyscf.opentrustregion.opentrustregion_interface.solver", solver
+                ):
+                    otr.kernel()
+                self.assertEqual(len(checked), 3)
+                for projector_error, energy_error, gradient_error in checked:
+                    self.assertLess(projector_error, 1e-10)
+                    self.assertLess(energy_error, 1e-9)
+                    self.assertLess(gradient_error, 1e-6)
 
     def test_linear_dependencies(self) -> None:
         # PySCF removes the linear dependencies of a basis, here at a threshold raised
