@@ -111,26 +111,6 @@ A grid changed in place, as by `mf.grids.level = 4`, reaches both objects, since
 share it. To approximate the Hessian on purpose with a coarser grid, PySCF 2.15 and
 later provide `mf.set_second_grids()`, whose grid only the Hessian uses.
 
-### GPUs
-
-A [GPU4PySCF](https://github.com/pyscf/gpu4pyscf) object is converted the same way,
-into the counterpart of its PySCF object (as `to_cpu()` returns it). The solver runs
-on the CPU, while the GPU4PySCF object builds the effective potentials and the
-responses of the Hessian on the GPU:
-
-```python
-from gpu4pyscf import dft
-
-mf = to_otr(dft.RKS(mol, xc="B3LYP"))
-mf.kernel()
-```
-
-RHF, ROHF, UHF and GHF and their Kohn–Sham counterparts are supported, also with
-density fitting. GPU4PySCF's GKS is multi-collinear, which PySCF evaluates through
-[mcfun](https://github.com/Multi-collinear/MCfun). Objects whose effective potential an
-extension changes, such as those with a solvent model, and periodic objects raise a
-`TypeError`.
-
 ### Orbital localization
 
 The Boys, Pipek–Mezey and Edmiston–Ruedenberg localizers are converted the same way:
@@ -153,6 +133,26 @@ mc.kernel()
 
 State-averaged CASSCF, also over several CI solvers (`mcscf.state_average_` and
 `mcscf.state_average_mix_`), is converted the same way.
+
+### GPUs
+
+Objects of [GPU4PySCF](https://github.com/pyscf/gpu4pyscf) are converted the same way.
+The solver runs on the CPU, while GPU4PySCF builds the effective potentials and the
+responses of the Hessian on the GPU:
+
+```python
+from gpu4pyscf import dft
+
+mf = to_otr(dft.RKS(mol, xc="B3LYP"))
+mf.kernel()
+```
+
+GPU4PySCF's RHF, ROHF, UHF and GHF and their Kohn–Sham counterparts are supported, also
+with density fitting, and are converted into the counterpart of their PySCF object (as
+`to_cpu()` returns it). GPU4PySCF's GKS is multi-collinear, which PySCF evaluates
+through [mcfun](https://github.com/Multi-collinear/MCfun). Objects whose effective
+potential an extension changes, such as those with a solvent model, and periodic
+objects raise a `TypeError`.
 
 Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) directory.
 

@@ -1397,10 +1397,6 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         view._drop_hess_x()
         for name in self._factory_routines:
             view.__dict__.pop(name, None)
-        # sgX's get_jk counts the builds between its full rebuilds in a counter that
-        # only the build of the wrapped object sets, so the view starts one of its own
-        if isinstance(view, sgx.sgx._SGXHF):
-            view._nsteps_direct = 0
         gen_response = view.gen_response(dm0=scale * dm0, hermi=1)
         driver: Any = weakref.proxy(self)
 
@@ -1424,12 +1420,12 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         driver made from a GPU4PySCF object, that of GPU4PySCF
         """
         if self._gpu_scf is not None:
-            return self._gpu_response(mo_coeff, mo_occ, dm0, **kwargs)
+            return self._gpu_gen_response(mo_coeff, mo_occ, dm0, **kwargs)
         if dm0 is not None:
             kwargs["dm0"] = dm0
         return super().gen_response(mo_coeff, mo_occ, **kwargs)
 
-    def _gpu_response(
+    def _gpu_gen_response(
         self,
         mo_coeff: Optional[np.ndarray],
         mo_occ: Optional[np.ndarray],
@@ -3378,6 +3374,12 @@ def _mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     mf_otr = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
     mf_otr._record_inherited_settings()
+
+    # sgX's get_jk, which the responses of the Hessian call on the driver, counts the
+    # builds between its full rebuilds in a counter that only the build of the wrapped
+    # object sets, so the driver starts one of its own
+    if isinstance(mf_otr, sgx.sgx._SGXHF):
+        mf_otr._nsteps_direct = 0
 
     return mf_otr
 
