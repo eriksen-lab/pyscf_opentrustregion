@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import weakref
 import numpy as np
 from dataclasses import dataclass
 import scipy as sc
-from pyscf import gto, scf, lo, lib
+from pyscf import gto, scf, dft, lo, lib, sgx
 from pyscf.pbc import gto as pbcgto
 from pyscf.tools import mo_mapping
 from pyscf.scf import hf_symm, uhf_symm, ghf_symm, dhf
@@ -61,7 +62,17 @@ from ctypes import Structure
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Tuple, Callable, Dict, List, Optional, Type, Union
+    from typing import (
+        Any,
+        Tuple,
+        Callable,
+        Dict,
+        Generator,
+        List,
+        Optional,
+        Type,
+        Union,
+    )
 
     PySCFHessX = Callable[[np.ndarray], np.ndarray]
     OTRHessX = Callable[[np.ndarray, np.ndarray], None]
@@ -1057,6 +1068,11 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     _last_potential = LastResult()
     _adopted_potential = None
 
+    # the GPU4PySCF object from which the driver was made, whose GPU builds the
+    # effective potentials, Coulomb and exchange matrices and responses, and None for a
+    # driver made from a PySCF object
+    _gpu_scf: Any = None
+
     def _check_exchange_kernel(self) -> None:
         """
         this function raises if the exact exchange of the functional is not a positive
@@ -1080,9 +1096,203 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
     def _build_potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
         """
-        this function builds the effective potential at a density
+        this function builds the effective potential at a density with PySCF, handing
+        it the last density and potential built, from which PySCF builds the Coulomb
+        and exchange parts from the density difference wherever its own SCF does, in
+        direct SCF without in-core integrals, where screening makes the difference
+        cheap; molecular UKS, whose get_veff does not keep the Coulomb potential of
+        each spin, which density QN needs, is built by the driver itself, and, for a
+        driver made from a GPU4PySCF object, the Kohn-Sham potentials of restricted and
+        unrestricted objects, of which density QN needs the Coulomb and exchange parts,
+        are built by the driver itself on the GPU and the others by GPU4PySCF
         """
-        return self._scf.get_veff(self._scf.mol, dm)
+        if self._gpu_scf is not None:
+            if isinstance(self, (RHFOTR, UHFOTR)):
+                return self._kohn_sham_potential(dm)
+            return self._gpu_potential(dm)
+        if self._plain_unrestricted_kohn_sham():
+            return self._kohn_sham_potential(dm)
+        dm_last, vhf_last = self._last_built_potential(dm)
+        return self._scf.get_veff(self._scf.mol, dm, dm_last=dm_last, vhf_last=vhf_last)
+
+    def _last_built_potential(
+        self, dm: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[lib.NPArrayWithTag]]:
+        """
+        this function returns the density and the effective potential of the last
+        build, which may be at a trial point that was not taken, if it is of the shape
+        of the density at which the next one is built, and None for both otherwise
+        """
+        if not self._last_potential.key:
+            return None, None
+        dm_last = self._last_potential.key[0]
+        if dm_last.shape != np.shape(dm):
+            return None, None
+        return dm_last, self._last_potential.value
+
+    def _coulomb_exchange(self, dm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the Coulomb and exchange matrices at a density, built
+        from the difference to the density of the last build and added to its
+        matrices where PySCF builds incrementally, and, for a driver made from a
+        GPU4PySCF object, built in full on the GPU
+        """
+        if self._gpu_scf is not None:
+            return self._gpu_coulomb_exchange(dm)
+        with self._incremental_base(dm, ("vj", "vk")) as (dm_last, vhf_last):
+            if dm_last is None:
+                return self._scf.get_jk(self._scf.mol, dm)
+            vj, vk = self._scf.get_jk(self._scf.mol, np.asarray(dm) - dm_last)
+        return vj + vhf_last.vj, vk + vhf_last.vk
+
+    @contextlib.contextmanager
+    def _incremental_base(
+        self, dm: np.ndarray, tags: Tuple[str, ...]
+    ) -> Generator[Tuple[Optional[np.ndarray], Any], None, None]:
+        """
+        this context manager yields the density and the effective potential of the
+        last build, from which the Coulomb and exchange parts at a density are built
+        from the density difference, under the condition under which PySCF's get_veff
+        builds incrementally (direct SCF without in-core integrals) and if the last
+        build carries the tags the parts are added to, and None for both otherwise;
+        the parts are built within it, since it holds the context in which sgX's
+        get_veff builds, which hands sgX the full density for its screening and
+        rebuilds from scratch every rebuild_nsteps builds
+        """
+        dm_last, vhf_last = self._last_built_potential(dm)
+        incremental = (
+            dm_last is not None
+            and self._scf._eri is None
+            and self._scf.direct_scf
+            and all(getattr(vhf_last, tag, None) is not None for tag in tags)
+        )
+        with_full_dm = getattr(self._scf, "with_full_dm", None)
+        context = (
+            with_full_dm(dm, dm_last if incremental else None)
+            if with_full_dm is not None
+            else contextlib.nullcontext(False)
+        )
+        with context as rebuild:
+            if incremental and not rebuild:
+                yield dm_last, vhf_last
+            else:
+                yield None, None
+
+    def _plain_unrestricted_kohn_sham(self) -> bool:
+        """
+        this function returns whether the wrapped object is molecular UKS whose
+        get_veff is PySCF's own, also behind the wrapper of sgX, whose potential the
+        driver can therefore build itself without losing what an extension of PySCF,
+        such as a solvent model or a periodic system, adds through get_veff
+        """
+        for cls in type(self._scf).__mro__:
+            if cls is sgx.sgx._SGXHF:
+                continue
+            if "get_veff" in vars(cls):
+                return cls is dft.uks.UKS
+        return False
+
+    def _kohn_sham_potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
+        """
+        this function builds the Kohn-Sham effective potential at a density as PySCF's
+        RKS and UKS get_veff do, with the Coulomb and exchange parts from the density
+        difference to the last build where they build incrementally, and tags it as
+        they do, with the Coulomb potential of the total density, the exact exchange
+        weighted by the fractions of the functional (per spin for UKS), the Coulomb
+        energy and the exchange-correlation energy including exact exchange, and, for
+        UKS, also with the Coulomb potential of each spin (vj_spin), which density QN
+        needs and their get_veff do not keep; for a driver made from a GPU4PySCF
+        object, it builds on the GPU, always in full, and returns arrays in host memory
+        """
+        if self._gpu_scf is not None:
+            import cupy as xp
+            from gpu4pyscf.dft.rks import initialize_grids
+
+            ks = self._gpu_scf
+            xc_options: Dict[str, Any] = {}
+            to_host = xp.asnumpy
+        else:
+            xp = np
+            ks = self._scf
+            initialize_grids = type(ks).initialize_grids
+            xc_options = {"max_memory": ks.max_memory - lib.current_memory()[0]}
+            to_host = np.asarray
+        mol = ks.mol
+        ni = ks._numint
+        dms = xp.asarray(dm)
+        unrestricted = dms.ndim == 3
+        dm_total = dms[0] + dms[1] if unrestricted else dms
+
+        # exchange-correlation and, for non-local functionals, its non-local part
+        initialize_grids(ks, mol, dms)
+        nr_xc = ni.nr_uks if unrestricted else ni.nr_rks
+        _, exc, vxc = nr_xc(mol, ks.grids, ks.xc, dms, **xc_options)
+        if ks.do_nlc():
+            xc = ks.xc if ni.libxc.is_nlc(ks.xc) else ks.nlc
+            _, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm_total, **xc_options)
+            exc += enlc
+            vxc += vnlc
+
+        # the Coulomb potential, of each spin for UKS, and the exact exchange weighted
+        # as PySCF's get_veff weights it, from the density difference to the last
+        # build where PySCF builds incrementally
+        hybrid = ni.libxc.is_hybrid_xc(ks.xc)
+        vj_tag = "vj_spin" if unrestricted else "vj"
+        base: contextlib.AbstractContextManager[Tuple[Any, Any]] = (
+            self._incremental_base(dm, (vj_tag, "vk") if hybrid else (vj_tag,))
+            if self._gpu_scf is None
+            else contextlib.nullcontext((None, None))
+        )
+        with base as (dm_last, vhf_last):
+            ddm = dms if dm_last is None else dms - xp.asarray(dm_last)
+            vk = None
+            if not hybrid:
+                vj = ks.get_j(mol, ddm, 1)
+            else:
+                omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+                if omega == 0:
+                    vj, vk = ks.get_jk(mol, ddm, 1)
+                    vk = hyb * vk
+                elif alpha == 0:
+                    vj = ks.get_j(mol, ddm, 1)
+                    vk = hyb * ks.get_k(mol, ddm, 1, omega=-omega)
+                elif hyb == 0:
+                    vj = ks.get_j(mol, ddm, 1)
+                    vk = alpha * ks.get_k(mol, ddm, 1, omega=omega)
+                else:
+                    vj, vk = ks.get_jk(mol, ddm, 1)
+                    vk = hyb * vk + (alpha - hyb) * ks.get_k(mol, ddm, 1, omega=omega)
+        if dm_last is not None:
+            vj = vj + xp.asarray(getattr(vhf_last, vj_tag))
+            if vk is not None:
+                vk = vk + xp.asarray(vhf_last.vk)
+
+        # the potential and the energies as PySCF's get_veff assembles them
+        vj_total = vj[0] + vj[1] if unrestricted else vj
+        veff = vxc + vj_total
+        ecoul = float(xp.einsum("ij,ji", dm_total, vj_total).real) * 0.5
+        if vk is not None:
+            if unrestricted:
+                veff = veff - vk
+                exc -= 0.5 * float(
+                    (
+                        xp.einsum("ij,ji", dms[0], vk[0])
+                        + xp.einsum("ij,ji", dms[1], vk[1])
+                    ).real
+                )
+            else:
+                veff = veff - 0.5 * vk
+                exc -= 0.25 * float(xp.einsum("ij,ji", dms, vk).real)
+
+        tags = {
+            "ecoul": ecoul,
+            "exc": float(exc),
+            "vj": to_host(vj_total),
+            "vk": None if vk is None else to_host(vk),
+        }
+        if unrestricted:
+            tags["vj_spin"] = to_host(vj)
+        return lib.tag_array(to_host(veff), **tags)
 
     def _potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
         """
@@ -1107,6 +1317,36 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             self._adopted_potential = self._last_potential
             self.n_jk_energy -= 1
             self.n_jk_update += 1
+
+    def _gpu_potential(self, dm: np.ndarray) -> lib.NPArrayWithTag:
+        """
+        this function returns the effective potential at a density that GPU4PySCF's
+        get_veff builds, in host memory and tagged with the Coulomb and
+        exchange-correlation energies it carries, which PySCF's energy of Kohn-Sham
+        objects reads; GPU4PySCF tags its Coulomb and exchange potentials differently
+        from PySCF, so these are left out
+        """
+        import cupy
+
+        gmf = self._gpu_scf
+        veff = gmf.get_veff(gmf.mol, cupy.asarray(dm))
+        tags = {
+            name: float(getattr(veff, name))
+            for name in ("ecoul", "exc")
+            if getattr(veff, name, None) is not None
+        }
+        return lib.tag_array(cupy.asnumpy(veff), **tags)
+
+    def _gpu_coulomb_exchange(self, dm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the Coulomb and exchange matrices at one or several
+        density matrices, built with the GPU4PySCF object
+        """
+        import cupy
+
+        gmf = self._gpu_scf
+        vj, vk = gmf.get_jk(gmf.mol, cupy.asarray(dm), 1)
+        return cupy.asnumpy(vj), cupy.asnumpy(vk)
 
     # routines a kernel can replace or take over from the extension factories, and
     # those the last kernel did, which refer to the extension objects of that kernel
@@ -1157,6 +1397,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         view._drop_hess_x()
         for name in self._factory_routines:
             view.__dict__.pop(name, None)
+        # sgX's get_jk counts the builds between its full rebuilds in a counter that
+        # only the build of the wrapped object sets, so the view starts one of its own
+        if isinstance(view, sgx.sgx._SGXHF):
+            view._nsteps_direct = 0
         gen_response = view.gen_response(dm0=scale * dm0, hermi=1)
         driver: Any = weakref.proxy(self)
 
@@ -1165,6 +1409,78 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
             response[...] = gen_response(scale * dm)
 
         return get_response
+
+    def gen_response(
+        self,
+        mo_coeff: Optional[np.ndarray] = None,
+        mo_occ: Optional[np.ndarray] = None,
+        *,
+        dm0: Optional[np.ndarray] = None,
+        **kwargs: Any,
+    ) -> Callable[[np.ndarray], np.ndarray]:
+        """
+        this function returns the response function of PySCF, to which a density dm0
+        is handed on only if given, since not every PySCF object takes one, or, for a
+        driver made from a GPU4PySCF object, that of GPU4PySCF
+        """
+        if self._gpu_scf is not None:
+            return self._gpu_response(mo_coeff, mo_occ, dm0, **kwargs)
+        if dm0 is not None:
+            kwargs["dm0"] = dm0
+        return super().gen_response(mo_coeff, mo_occ, **kwargs)
+
+    def _gpu_response(
+        self,
+        mo_coeff: Optional[np.ndarray],
+        mo_occ: Optional[np.ndarray],
+        dm0: Optional[np.ndarray],
+        **kwargs: Any,
+    ) -> Callable[[np.ndarray], np.ndarray]:
+        """
+        this function returns the response function of GPU4PySCF, which takes and
+        returns arrays in host memory; GPU4PySCF builds it from orbitals only, so a
+        density dm0 (the total density for restricted, those of either spin for
+        unrestricted objects) is handed over as its natural orbitals, whose occupations
+        are those of orbitals, since the density is idempotent
+        """
+        import cupy
+
+        if dm0 is not None:
+            mo_coeff, mo_occ = self._natural_orbitals(dm0)
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        if mo_occ is None:
+            mo_occ = self.mo_occ
+        # the grids of the host object do not live on the GPU, and GPU4PySCF's response
+        # functions take fewer options than PySCF's
+        kwargs.pop("grids", None)
+        accepted = inspect.signature(self._gpu_scf.gen_response).parameters
+        kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+        vind = self._gpu_scf.gen_response(
+            cupy.asarray(mo_coeff), cupy.asarray(mo_occ), **kwargs
+        )
+
+        def response(dm1: np.ndarray) -> np.ndarray:
+            return cupy.asnumpy(vind(cupy.asarray(dm1)))
+
+        return response
+
+    def _natural_orbitals(self, dm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        this function returns the natural orbitals of an idempotent density, of either
+        spin for a stack of densities, ordered by decreasing occupation, and their
+        occupations rounded to those of orbitals
+        """
+        s = self._scf.get_ovlp()
+
+        def of_one(d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            occ, coeff = sc.linalg.eigh(s @ d @ s, s)
+            return coeff[:, ::-1], np.rint(occ[::-1])
+
+        if np.ndim(dm) == 3:
+            pairs = [of_one(d) for d in dm]
+            return np.stack([c for c, _ in pairs]), np.stack([o for _, o in pairs])
+        return of_one(dm)
 
     def _drop_adopted_routines(self) -> None:
         """
@@ -2085,7 +2401,7 @@ class RHFOTR(SecondOrderOTR, newton_ah._SecondOrderRHF):
         """
         if isinstance(self, scf.hf.KohnShamDFT):
             return super()._build_potential(dm)
-        vj, vk = self._scf.get_jk(self._scf.mol, dm)
+        vj, vk = self._coulomb_exchange(dm)
 
         return lib.tag_array(vj - 0.5 * vk, vj=vj, vk=vk)
 
@@ -2550,19 +2866,24 @@ class UHFOTR(SecondOrderOTR, newton_ah._SecondOrderUHF):
         """
         if isinstance(self, scf.hf.KohnShamDFT):
             return super()._build_potential(dm)
-        vj, vk = self._scf.get_jk(self._scf.mol, dm)
+        vj, vk = self._coulomb_exchange(dm)
 
         return lib.tag_array(vj[0] + vj[1] - vk, vj=vj, vk=vk)
 
     def _spin_coulomb(self, dm: np.ndarray, veff: lib.NPArrayWithTag) -> np.ndarray:
         """
-        this function returns the Coulomb potential of each spin separately; get_veff
-        tags the potential of the total density onto its result, so only one spin has
-        to be built and the other follows from it by linearity, which halves the
-        Coulomb work this costs; the build is not counted: the potential at this
-        density has been counted already, and this second pass exists only because
-        get_veff hands back the total rather than the per-spin potentials
+        this function returns the Coulomb potential of each spin separately, which the
+        driver's own Kohn-Sham build tags onto the potential; PySCF's get_veff, which
+        builds the potentials of extensions such as solvent models, tags only the
+        potential of the total density onto its result, so for these only one spin has
+        to be built and the other follows from it by linearity; that build is not
+        counted: the potential at this density has been counted already, and this
+        second pass exists only because get_veff hands back the total rather than the
+        per-spin potentials
         """
+        vj_spin = getattr(veff, "vj_spin", None)
+        if vj_spin is not None:
+            return np.asarray(vj_spin)
         vj_alpha = self._scf.get_j(self._scf.mol, dm[0])
 
         return np.stack((vj_alpha, np.asarray(veff.vj) - vj_alpha))
@@ -3556,7 +3877,8 @@ def to_otr(obj: Any) -> Any:
     """
     this function converts a PySCF mean-field, localizer or CASSCF object into its
     OpenTrustRegion counterpart, which takes over its attributes and remains usable as
-    the PySCF object
+    the PySCF object, and a GPU4PySCF mean-field object into the counterpart of its
+    PySCF object, whose two-electron builds it performs on the GPU
     """
     if isinstance(obj, OTR):
         return obj
@@ -3567,7 +3889,67 @@ def to_otr(obj: Any) -> Any:
         return _localizer_to_otr(obj)
     if isinstance(obj, mc1step.CASSCF):
         return _casscf_to_otr(obj)
+    if _is_gpu4pyscf(obj):
+        return _gpu_mf_to_otr(obj)
     raise _unsupported(obj)
+
+
+def _is_gpu4pyscf(obj: Any) -> bool:
+    """
+    this function returns whether an object is a GPU4PySCF object
+    """
+    return type(obj).__module__.split(".")[0] == "gpu4pyscf" and hasattr(obj, "to_cpu")
+
+
+def _gpu_mf_to_otr(gpu_mf: Any) -> SecondOrderOTR:
+    """
+    this function converts a GPU4PySCF mean-field object into the driver of its PySCF
+    counterpart, whose two-electron builds and responses it performs on the GPU,
+    unless the object is not supported, as those whose effective potential an
+    extension such as a solvent model changes
+    """
+    from gpu4pyscf.scf import hf as gpu_hf, uhf as gpu_uhf, rohf as gpu_rohf
+    from gpu4pyscf.scf import ghf as gpu_ghf
+    from gpu4pyscf.dft import rks as gpu_rks, uks as gpu_uks, roks as gpu_roks
+    from gpu4pyscf.dft import gks as gpu_gks
+    from gpu4pyscf.df import df_jk as gpu_df_jk
+
+    # the classes of these modules build the effective potential of the plain
+    # mean-field methods, with or without density fitting
+    plain = {
+        cls
+        for module in (
+            gpu_hf,
+            gpu_uhf,
+            gpu_rohf,
+            gpu_ghf,
+            gpu_rks,
+            gpu_uks,
+            gpu_roks,
+            gpu_gks,
+            gpu_df_jk,
+        )
+        for cls in vars(module).values()
+        if isinstance(cls, type)
+        and cls.__module__ == module.__name__
+        and "get_veff" in vars(cls)
+    }
+    get_veff_owner = next(
+        (cls for cls in type(gpu_mf).__mro__ if "get_veff" in vars(cls)), None
+    )
+    if (
+        not isinstance(gpu_mf, (gpu_hf.RHF, gpu_uhf.UHF, gpu_ghf.GHF))
+        or get_veff_owner not in plain
+    ):
+        raise TypeError(
+            "to_otr supports GPU4PySCF's RHF, ROHF, UHF and GHF and their Kohn-Sham "
+            "counterparts, also with density fitting, but not "
+            f"{type(gpu_mf).__module__}.{type(gpu_mf).__name__}."
+        )
+    otr = _mf_to_otr(gpu_mf.to_cpu())
+    otr._gpu_scf = gpu_mf
+
+    return otr
 
 
 def _unsupported(obj: Any) -> TypeError:
@@ -3577,6 +3959,7 @@ def _unsupported(obj: Any) -> TypeError:
     return TypeError(
         "to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham counterparts, also "
         "at the Gamma point of periodic systems, spinor X2C, the Boys, Pipek-Mezey and "
-        "Edmiston-Ruedenberg localizers and CASSCF, but not "
+        "Edmiston-Ruedenberg localizers and CASSCF, and GPU4PySCF's RHF, ROHF, UHF "
+        "and GHF and their Kohn-Sham counterparts, but not "
         f"{type(obj).__module__}.{type(obj).__name__}."
     )
