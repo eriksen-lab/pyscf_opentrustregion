@@ -8,17 +8,18 @@
 Tests for the PySCF interface to OpenTrustRegion
 """
 
+import importlib.util
 import io
 import unittest
 from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 from itertools import product
-from typing import Any, Generator, List, Tuple
+from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import numpy as np
 import scipy.linalg
 
-from pyscf import gto, scf, dft, fci, lo, mcscf, lib
+from pyscf import gto, scf, dft, fci, lo, mcscf, lib, sgx
 from pyscf.pbc import gto as pbcgto, scf as pbcscf
 from pyscf.scf import dhf
 from pyscf.tools import mo_mapping
@@ -800,6 +801,65 @@ class SCFTests(unittest.TestCase):
                 stable, _ = check_stability_shape(self, otr)
                 self.assertTrue(stable)
 
+    def test_potential_is_built_incrementally(self) -> None:
+        # in direct SCF without in-core integrals, where PySCF's own SCF builds the
+        # Coulomb and exchange matrices from the density difference, the driver hands
+        # PySCF the density and the potential of its last build, which gives the
+        # potential of a full build
+        for name, make_mf, molecule in (
+            ("RHF", scf.RHF, mol),
+            ("RKS", lambda m: dft.RKS(m, xc="b3lyp"), mol),
+            ("UHF", scf.UHF, mol_open),
+        ):
+            with self.subTest(name):
+                mf = make_mf(molecule)
+                mf._is_mem_enough = lambda: False
+                otr = to_otr(mf)
+                dm_first = mf.get_init_guess()
+                dm_second = 1.01 * dm_first
+
+                received = []
+                get_jk = otr._scf.get_jk
+
+                def recording_get_jk(
+                    mol: Optional[gto.Mole] = None,
+                    dm: Optional[np.ndarray] = None,
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    received.append(np.array(dm))
+                    return get_jk(mol, dm, *args, **kwargs)
+
+                otr._scf.get_jk = recording_get_jk
+                otr._build_potential(dm_first)
+                vhf = otr._build_potential(dm_second)
+                del otr._scf.get_jk
+
+                self.assertIsNone(otr._scf._eri)
+                np.testing.assert_allclose(received[-1], dm_second - dm_first)
+                ref = make_mf(molecule)
+                ref._is_mem_enough = lambda: False
+                ref_vhf = ref.get_veff(molecule, dm_second)
+                np.testing.assert_allclose(vhf, ref_vhf, atol=1e-10)
+
+    def test_sgx(self) -> None:
+        # with sgX, whose screening and periodic full rebuilds PySCF's get_veff keeps
+        # for the incremental potential builds, the Hartree-Fock and Kohn-Sham drivers
+        # reach the energy of PySCF's sgX SCF with the exact Hessian, whose responses
+        # go through sgX's get_jk on the driver, and the stability check confirms the
+        # minimum
+        for name, make_mf, molecule in (
+            ("sgX RHF", scf.RHF, mol),
+            ("sgX RKS", lambda m: dft.RKS(m, xc="b3lyp"), mol),
+            ("sgX UKS", lambda m: dft.UKS(m, xc="b3lyp"), mol_open),
+        ):
+            with self.subTest(name):
+                ref = sgx.sgx_fit(make_mf(molecule), pjs=True).run()
+                otr = to_otr(sgx.sgx_fit(make_mf(molecule), pjs=True))
+                self.assertAlmostEqual(otr.kernel(), ref.e_tot, 6)
+                stable, _ = otr.stability_check()
+                self.assertTrue(stable)
+
     def test_counters_record_the_work_done(self) -> None:
         otr = to_otr(scf.RHF(mol))
         self.assertEqual(otr.n_update_orbs, 0)
@@ -1238,3 +1298,118 @@ class CASSCFTests(unittest.TestCase):
         mc = to_otr(mcscf.CASSCF(mf, 4, 4))
         mc.kernel()
         check_stability_shape(self, mc)
+
+
+def gpu_available() -> bool:
+    """
+    this function returns whether CuPy, GPU4PySCF and a GPU are available
+    """
+    try:
+        import cupy
+        import gpu4pyscf  # noqa: F401
+
+        return cupy.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(gpu_available(), "needs CuPy, GPU4PySCF and a GPU")
+class GPUTests(unittest.TestCase):
+    """
+    tests for drivers made from GPU4PySCF objects, whose effective potentials and
+    responses GPU4PySCF builds on the GPU
+    """
+
+    def test_gpu4pyscf_objects(self) -> None:
+        # the driver takes over the GPU4PySCF object, hands its get_veff the density
+        # and the potential of the last build, from which GPU4PySCF builds from the
+        # density difference where its own SCF does, and its potential equals that of
+        # the driver of the PySCF object, with the energy tags PySCF's energy of
+        # Kohn-Sham objects reads, so that the exact Hessian and the stability check,
+        # which use the responses, reach the minimum of PySCF's SCF
+        from gpu4pyscf import scf as gpu_scf, dft as gpu_dft
+
+        def ks(gpu: Any, cpu: Any, xc: str) -> Tuple[Callable, Callable]:
+            return lambda m: gpu(m, xc=xc), lambda m: cpu(m, xc=xc)
+
+        cases = [
+            ("RHF", gpu_scf.RHF, scf.RHF, mol),
+            ("UHF", gpu_scf.UHF, scf.UHF, mol_open),
+            ("RKS", *ks(gpu_dft.RKS, dft.RKS, "b3lyp"), mol),
+            ("UKS", *ks(gpu_dft.UKS, dft.UKS, "b3lyp"), mol_open),
+            ("RKS wB97X", *ks(gpu_dft.RKS, dft.RKS, "wb97x"), mol),
+            (
+                "RKS with density fitting",
+                lambda m: gpu_dft.RKS(m, xc="b3lyp").density_fit(),
+                lambda m: dft.RKS(m, xc="b3lyp").density_fit(),
+                mol,
+            ),
+            (
+                "spin-free X2C RHF",
+                lambda m: gpu_scf.RHF(m).sfx2c1e(),
+                lambda m: scf.RHF(m).sfx2c1e(),
+                mol,
+            ),
+            ("RHF with symmetry", gpu_scf.RHF, scf.RHF, mol_sym),
+            ("ROHF", gpu_scf.ROHF, scf.ROHF, mol_open),
+            ("ROKS", *ks(gpu_dft.ROKS, dft.ROKS, "b3lyp"), mol_open),
+            ("GHF", gpu_scf.GHF, scf.GHF, mol),
+        ]
+        # GPU4PySCF implements multi-collinear GKS only, for which PySCF needs mcfun
+        if importlib.util.find_spec("mcfun") is not None:
+
+            def mcol(make: Callable) -> Callable:
+                def make_mcol(m: gto.Mole) -> Any:
+                    obj = make(m, xc="b3lyp")
+                    obj.collinear = "mcol"
+                    return obj
+
+                return make_mcol
+
+            cases.append(("GKS", mcol(gpu_dft.GKS), mcol(dft.GKS), mol))
+        for name, make_gpu, make_cpu, molecule in cases:
+            with self.subTest(name):
+                ref = make_cpu(molecule).run()
+                otr = to_otr(make_gpu(molecule))
+                gmf = otr._gpu_scf
+                self.assertIsNotNone(gmf)
+
+                received = []
+                get_veff = gmf.get_veff
+
+                def recording_get_veff(*args: Any, **kwargs: Any) -> Any:
+                    veff = get_veff(*args, **kwargs)
+                    received.append((kwargs["dm_last"], kwargs["vhf_last"], veff))
+                    return veff
+
+                gmf.get_veff = recording_get_veff
+                dm_first = ref.get_init_guess()
+                dm_second = 1.01 * dm_first
+                otr._build_potential(dm_first)
+                vhf = otr._build_potential(dm_second)
+                del gmf.get_veff
+
+                self.assertIsNone(received[0][0])
+                self.assertIsNone(received[0][1])
+                np.testing.assert_array_equal(received[1][0], dm_first)
+                self.assertIs(received[1][1], received[0][2])
+                ref_vhf = to_otr(make_cpu(molecule))._build_potential(dm_second)
+                np.testing.assert_allclose(vhf, ref_vhf, atol=1e-8)
+                for tag in ("ecoul", "exc"):
+                    self.assertEqual(
+                        getattr(vhf, tag, None) is None,
+                        getattr(ref_vhf, tag, None) is None,
+                    )
+                    if getattr(ref_vhf, tag, None) is not None:
+                        np.testing.assert_allclose(
+                            getattr(vhf, tag), getattr(ref_vhf, tag), atol=1e-8
+                        )
+
+                self.assertAlmostEqual(otr.kernel(), ref.e_tot, 7)
+                stable, _ = otr.stability_check()
+                self.assertTrue(stable)
+
+        # an object whose effective potential an extension changes, here a solvent
+        # model, is not supported
+        with self.assertRaises(TypeError):
+            to_otr(gpu_dft.RKS(mol, xc="b3lyp").PCM())

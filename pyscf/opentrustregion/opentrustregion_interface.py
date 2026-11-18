@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+import inspect
 import numpy as np
-from pyscf import gto, scf, lo, lib
+from pyscf import gto, scf, lo, lib, sgx
 from pyscf.tools import mo_mapping
 from pyscf.scf import hf_symm, uhf_symm, ghf_symm
 from pyscf.soscf import ciah, newton_ah
@@ -498,6 +499,15 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
     mask_symm: np.ndarray
     complex_orbitals: bool
 
+    # the density and the effective potential of the last build within the running
+    # kernel or stability check, which may be at a trial point that was not taken
+    _last_build: Optional[Tuple[np.ndarray, Any]] = None
+
+    # the GPU4PySCF object from which the driver was made, whose GPU builds the
+    # effective potentials and responses, and None for a driver made from a PySCF
+    # object
+    _gpu_scf: Any = None
+
     def __init__(self, mf: scf.SCF) -> None:
         self.__dict__.update(mf.__dict__)
         self._scf = mf
@@ -527,6 +537,94 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                 "solver optimizes the energy for the original value and the stability "
                 "check can report instabilities that this energy does not have.",
             )
+
+    def _build_potential(self, dm: np.ndarray) -> np.ndarray:
+        """
+        this function builds the effective potential at a density with PySCF or, for a
+        driver made from a GPU4PySCF object, with GPU4PySCF, handing it the density and
+        the potential of the last build, from which it builds the Coulomb and exchange
+        parts from the density difference wherever its own SCF does, as in direct SCF
+        without in-core integrals, where screening makes the difference cheap
+        """
+        dm_last, vhf_last = self._last_built_potential(dm)
+        if self._gpu_scf is not None:
+            import cupy
+
+            gmf = self._gpu_scf
+            gpu_vhf = gmf.get_veff(
+                gmf.mol, cupy.asarray(dm), dm_last=dm_last, vhf_last=vhf_last
+            )
+            self._last_build = (dm, gpu_vhf)
+            return self._host_potential(gpu_vhf)
+        vhf = self._scf.get_veff(self._scf.mol, dm, dm_last=dm_last, vhf_last=vhf_last)
+        self._last_build = (dm, vhf)
+
+        return vhf
+
+    def _last_built_potential(self, dm: np.ndarray) -> Tuple[Optional[np.ndarray], Any]:
+        """
+        this function returns the density and the effective potential of the last
+        build if it is of the shape of the density at which the next one is built, and
+        None for both otherwise
+        """
+        if self._last_build is None or self._last_build[0].shape != np.shape(dm):
+            return None, None
+        return self._last_build
+
+    def _host_potential(self, veff: Any) -> lib.NPArrayWithTag:
+        """
+        this function returns an effective potential GPU4PySCF built in host memory,
+        tagged with the Coulomb and exchange-correlation energies it carries, which
+        PySCF's energy of Kohn-Sham objects reads; GPU4PySCF tags its Coulomb and
+        exchange potentials differently from PySCF, so these are left out
+        """
+        import cupy
+
+        tags = {
+            name: float(getattr(veff, name))
+            for name in ("ecoul", "exc")
+            if getattr(veff, name, None) is not None
+        }
+        return lib.tag_array(cupy.asnumpy(veff), **tags)
+
+    def gen_response(self, *args: Any, **kwargs: Any) -> PySCFHessX:
+        """
+        this function returns the response function of PySCF or, for a driver made
+        from a GPU4PySCF object, that of GPU4PySCF
+        """
+        if self._gpu_scf is not None:
+            return self._gpu_gen_response(*args, **kwargs)
+        return super().gen_response(*args, **kwargs)
+
+    def _gpu_gen_response(
+        self,
+        mo_coeff: Optional[np.ndarray] = None,
+        mo_occ: Optional[np.ndarray] = None,
+        **kwargs: Any,
+    ) -> PySCFHessX:
+        """
+        this function returns the response function of GPU4PySCF at the orbitals, which
+        takes and returns arrays in host memory
+        """
+        import cupy
+
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        if mo_occ is None:
+            mo_occ = self.mo_occ
+        # the grids of the host object do not live on the GPU, and GPU4PySCF's response
+        # functions take fewer options than PySCF's
+        kwargs.pop("grids", None)
+        accepted = inspect.signature(self._gpu_scf.gen_response).parameters
+        kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+        vind = self._gpu_scf.gen_response(
+            cupy.asarray(mo_coeff), cupy.asarray(mo_occ), **kwargs
+        )
+
+        def response(dm1: np.ndarray) -> np.ndarray:
+            return cupy.asnumpy(vind(cupy.asarray(dm1)))
+
+        return response
 
     def _set_parameters(self) -> None:
         """
@@ -601,7 +699,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         u = self._exp_mat(self._unpack(rotation))
         rot_mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(rot_mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, dm)
+        vhf = self._build_potential(dm)
         return self._scf.energy_tot(dm, self.h1e, vhf)
 
     def _update_orbs(
@@ -614,7 +712,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         u = self._exp_mat(self._unpack(self._rotation(kappa)))
         self.mo_coeff = self.rotate_mo(self.mo_coeff, u)
         dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, dm)
+        vhf = self._build_potential(dm)
         self.dm, self.vhf = dm, vhf
         fock = self.get_fock(self.h1e, self.s1e, vhf, dm)
         new_grad, h_op, new_h_diag = self.gen_g_hop(self.mo_coeff, self.mo_occ, fock)
@@ -673,6 +771,10 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
 
         self.build(self.mol)
 
+        # the potentials are built from the density differences only within a kernel,
+        # since the molecule or the options may have changed since the last one
+        self._last_build = None
+
         # the energy and the gradient are evaluated with the options of the wrapped
         # object, whereas the Hessian is evaluated with those of this object
         self._warn_on_differing_energy_options()
@@ -691,7 +793,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # get initial guess
         if mo_coeff is not None and mo_occ is not None:
             dm = self.make_rdm1(mo_coeff, mo_occ)
-            vhf = self._scf.get_veff(mol, dm)
+            vhf = self._build_potential(dm)
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
             mo_energy, mo_tmp = self.eig(fock, self.s1e)
@@ -707,13 +809,13 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
                     f"guess from {self.init_guess}",
                 )
                 dm = self.get_init_guess(self._scf.mol, self.init_guess)
-            vhf = self._scf.get_veff(mol, dm)
+            vhf = self._build_potential(dm)
             self.dm, self.vhf = dm, vhf
             fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
             mo_energy, mo_coeff = self.eig(fock, self.s1e, x=x_orth)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
             dm = self.make_rdm1(mo_coeff, mo_occ)
-            vhf = self._scf.get_veff(mol, dm, dm_last=self.dm, vhf_last=self.vhf)
+            vhf = self._build_potential(dm)
             self.dm, self.vhf = dm, vhf
 
         self.mo_coeff, self.mo_occ = np.array(mo_coeff), mo_occ
@@ -735,7 +837,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # get canonical orbitals
         self.e_tot = self._func(np.zeros(self.n_param, dtype=np.float64))
         dm = self.make_rdm1(self.mo_coeff, self.mo_occ)
-        vhf = self._scf.get_veff(self._scf.mol, dm)
+        vhf = self._build_potential(dm)
         self.dm, self.vhf = dm, vhf
         fock = self.get_fock(self.h1e, self.s1e, vhf, dm, level_shift_factor=0)
         self.mo_energy, self.mo_coeff = self._canonicalize(fock)
@@ -766,6 +868,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         mol = self._scf.mol
         self.h1e = self._scf.get_hcore(mol)
         self.s1e = self._scf.get_ovlp(mol)
+        self._last_build = None
 
         # the parameters are the occupied-virtual rotations of the current orbitals,
         # which canonicalization reorders and which orbitals or occupations assigned
@@ -1116,6 +1219,12 @@ def _mf_to_otr(mf: scf.hf.SCF) -> SecondOrderOTR:
 
     mf_otr = lib.set_class(cls(mf), (cls, mf.__class__), cls.__name__)
     mf_otr._record_inherited_settings()
+
+    # sgX's get_jk, which the responses of the Hessian call on the driver, counts the
+    # builds between its full rebuilds in a counter that only the build of the wrapped
+    # object sets, so the driver starts one of its own
+    if isinstance(mf_otr, sgx.sgx._SGXHF):
+        mf_otr._nsteps_direct = 0
 
     return mf_otr
 
@@ -1473,7 +1582,8 @@ def to_otr(obj: Any) -> Any:
     """
     this function converts a PySCF mean-field, localizer or CASSCF object into its
     OpenTrustRegion counterpart, which takes over its attributes and remains usable as
-    the PySCF object
+    the PySCF object, and a GPU4PySCF mean-field object into the counterpart of its
+    PySCF object, whose two-electron builds it performs on the GPU
     """
     if isinstance(obj, OTR):
         return obj
@@ -1484,7 +1594,67 @@ def to_otr(obj: Any) -> Any:
         return _localizer_to_otr(obj)
     if isinstance(obj, mc1step.CASSCF):
         return _casscf_to_otr(obj)
+    if _is_gpu4pyscf(obj):
+        return _gpu_mf_to_otr(obj)
     raise _unsupported(obj)
+
+
+def _is_gpu4pyscf(obj: Any) -> bool:
+    """
+    this function returns whether an object is a GPU4PySCF object
+    """
+    return type(obj).__module__.split(".")[0] == "gpu4pyscf" and hasattr(obj, "to_cpu")
+
+
+def _gpu_mf_to_otr(gpu_mf: Any) -> SecondOrderOTR:
+    """
+    this function converts a GPU4PySCF mean-field object into the driver of its PySCF
+    counterpart, whose two-electron builds and responses it performs on the GPU,
+    unless the object is not supported, as those whose effective potential an
+    extension such as a solvent model changes
+    """
+    from gpu4pyscf.scf import hf as gpu_hf, uhf as gpu_uhf, rohf as gpu_rohf
+    from gpu4pyscf.scf import ghf as gpu_ghf
+    from gpu4pyscf.dft import rks as gpu_rks, uks as gpu_uks, roks as gpu_roks
+    from gpu4pyscf.dft import gks as gpu_gks
+    from gpu4pyscf.df import df_jk as gpu_df_jk
+
+    # the classes of these modules build the effective potential of the plain
+    # mean-field methods, with or without density fitting
+    plain = {
+        cls
+        for module in (
+            gpu_hf,
+            gpu_uhf,
+            gpu_rohf,
+            gpu_ghf,
+            gpu_rks,
+            gpu_uks,
+            gpu_roks,
+            gpu_gks,
+            gpu_df_jk,
+        )
+        for cls in vars(module).values()
+        if isinstance(cls, type)
+        and cls.__module__ == module.__name__
+        and "get_veff" in vars(cls)
+    }
+    get_veff_owner = next(
+        (cls for cls in type(gpu_mf).__mro__ if "get_veff" in vars(cls)), None
+    )
+    if (
+        not isinstance(gpu_mf, (gpu_hf.RHF, gpu_uhf.UHF, gpu_ghf.GHF))
+        or get_veff_owner not in plain
+    ):
+        raise TypeError(
+            "to_otr supports GPU4PySCF's RHF, ROHF, UHF and GHF and their Kohn-Sham "
+            "counterparts, also with density fitting, but not "
+            f"{type(gpu_mf).__module__}.{type(gpu_mf).__name__}."
+        )
+    otr = _mf_to_otr(gpu_mf.to_cpu())
+    otr._gpu_scf = gpu_mf
+
+    return otr
 
 
 def _unsupported(obj: Any) -> TypeError:
@@ -1494,6 +1664,7 @@ def _unsupported(obj: Any) -> TypeError:
     return TypeError(
         "to_otr supports RHF, ROHF, UHF and GHF and their Kohn-Sham counterparts, also "
         "at the Gamma point of periodic systems, spinor X2C, the Boys, Pipek-Mezey and "
-        "Edmiston-Ruedenberg localizers and CASSCF, but not "
+        "Edmiston-Ruedenberg localizers and CASSCF, and GPU4PySCF's RHF, ROHF, UHF "
+        "and GHF and their Kohn-Sham counterparts, but not "
         f"{type(obj).__module__}.{type(obj).__name__}."
     )

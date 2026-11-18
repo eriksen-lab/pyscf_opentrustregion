@@ -81,7 +81,8 @@ RHF, ROHF, UHF and GHF are supported, along with their KS counterparts and spino
 from the object that is passed in. Complex orbitals, as from a complex initial guess or
 with spin–orbit coupling (`scf.GHF(mol).x2c()`), are optimized through the real and
 imaginary parts of their rotations. Objects with a solvent model, such as
-`scf.RHF(mol).ddCOSMO()`, and periodic calculations at the Γ point are supported as
+`scf.RHF(mol).ddCOSMO()`, with seminumerical exchange, such as
+`sgx.sgx_fit(scf.RHF(mol))`, and periodic calculations at the Γ point are supported as
 well. The converted object also works in PySCF's scanners, which geometry optimizations
 and scans run, e.g. with geomeTRIC:
 
@@ -132,6 +133,26 @@ mc.kernel()
 
 State-averaged CASSCF, also over several CI solvers (`mcscf.state_average_` and
 `mcscf.state_average_mix_`), is converted the same way.
+
+### GPUs
+
+Objects of [GPU4PySCF](https://github.com/pyscf/gpu4pyscf) are converted the same way.
+The solver runs on the CPU, while GPU4PySCF builds the effective potentials and the
+responses of the Hessian on the GPU:
+
+```python
+from gpu4pyscf import dft
+
+mf = to_otr(dft.RKS(mol, xc="B3LYP"))
+mf.kernel()
+```
+
+GPU4PySCF's RHF, ROHF, UHF and GHF and their Kohn–Sham counterparts are supported, also
+with density fitting, and are converted into the counterpart of their PySCF object (as
+`to_cpu()` returns it). GPU4PySCF's GKS is multi-collinear, which PySCF evaluates
+through [mcfun](https://github.com/Multi-collinear/MCfun). Objects whose effective
+potential an extension changes, such as those with a solvent model, and periodic
+objects raise a `TypeError`.
 
 Further examples are in the [`examples`](https://github.com/eriksen-lab/pyscf_opentrustregion/tree/main/examples) directory.
 
@@ -244,5 +265,6 @@ python3 -m unittest pyscf.opentrustregion.test.test_opentrustregion_interface
 ```
 
 It compares converged energies against the PySCF solvers this interface replaces and
-checks the settings translation, the derivatives and the stability check. The solver
-itself is covered by the OpenTrustRegion testsuite.
+checks the settings translation, the derivatives and the stability check. The tests of
+GPU4PySCF objects run only where GPU4PySCF and a GPU are available and are skipped
+otherwise. The solver itself is covered by the OpenTrustRegion testsuite.
