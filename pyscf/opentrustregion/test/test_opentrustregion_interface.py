@@ -2356,6 +2356,7 @@ class GPUTests(unittest.TestCase):
         # every tag, so that multisecant SR1, which builds its Hessian from the tags,
         # and the exact Hessian and the stability check, which use the responses, reach
         # the minimum of PySCF's SCF, and for the others with the energy tags
+        import cupy
         from gpu4pyscf import scf as gpu_scf, dft as gpu_dft
 
         def ks(gpu: Any, cpu: Any, xc: str) -> Tuple[Callable, Callable]:
@@ -2402,11 +2403,42 @@ class GPUTests(unittest.TestCase):
             with self.subTest(name):
                 ref = make_cpu(molecule).run()
                 otr = to_otr(make_gpu(molecule))
-                self.assertIsNotNone(otr._gpu_scf)
+                gmf = otr._gpu_scf
+                self.assertIsNotNone(gmf)
+                self.assertEqual(gmf.direct_scf, "density fitting" not in name)
 
-                dm = ref.get_init_guess()
-                vhf = otr._build_potential(dm)
-                ref_vhf = to_otr(make_cpu(molecule))._build_potential(dm)
+                dm_first = ref.get_init_guess()
+                dm_second = 1.01 * dm_first
+                otr._potential(dm_first)
+
+                # the Coulomb and exchange builds of the second potential receive the
+                # density difference in direct SCF and the density otherwise
+                received = []
+                for build_name in ("get_j", "get_k", "get_jk"):
+
+                    def recording(
+                        mol: Optional[gto.Mole] = None,
+                        dm: Optional[Any] = None,
+                        *args: Any,
+                        build: Callable = getattr(gmf, build_name),
+                        **kwargs: Any,
+                    ) -> Any:
+                        received.append(cupy.asnumpy(dm))
+                        return build(mol, dm, *args, **kwargs)
+
+                    setattr(gmf, build_name, recording)
+                vhf = otr._potential(dm_second)
+                for build_name in ("get_j", "get_k", "get_jk"):
+                    delattr(gmf, build_name)
+                if density_qn:
+                    self.assertGreater(len(received), 0)
+                    for dm in received:
+                        np.testing.assert_allclose(
+                            dm,
+                            dm_second - dm_first if gmf.direct_scf else dm_second,
+                            atol=1e-14,
+                        )
+                ref_vhf = to_otr(make_cpu(molecule))._build_potential(dm_second)
                 np.testing.assert_allclose(vhf, ref_vhf, atol=1e-8)
                 tags = ("vj", "vk", "ecoul", "exc", "vj_spin")
                 for tag in tags if density_qn else ("ecoul", "exc"):

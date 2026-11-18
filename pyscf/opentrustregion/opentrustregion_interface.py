@@ -1135,14 +1135,17 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         this function returns the Coulomb and exchange matrices at a density, built
         from the difference to the density of the last build and added to its
         matrices where PySCF builds incrementally, and, for a driver made from a
-        GPU4PySCF object, built in full on the GPU
+        GPU4PySCF object, built on the GPU
         """
-        if self._gpu_scf is not None:
-            return self._gpu_coulomb_exchange(dm)
         with self._incremental_base(dm, ("vj", "vk")) as (dm_last, vhf_last):
-            if dm_last is None:
-                return self._scf.get_jk(self._scf.mol, dm)
-            vj, vk = self._scf.get_jk(self._scf.mol, np.asarray(dm) - dm_last)
+            ddm = dm if dm_last is None else np.asarray(dm) - dm_last
+            vj, vk = (
+                self._scf.get_jk(self._scf.mol, ddm)
+                if self._gpu_scf is None
+                else self._gpu_coulomb_exchange(ddm)
+            )
+        if dm_last is None:
+            return vj, vk
         return vj + vhf_last.vj, vk + vhf_last.vk
 
     @contextlib.contextmanager
@@ -1153,20 +1156,21 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         this context manager yields the density and the effective potential of the
         last build, from which the Coulomb and exchange parts at a density are built
         from the density difference, under the condition under which PySCF's get_veff
-        builds incrementally (direct SCF without in-core integrals) and if the last
-        build carries the tags the parts are added to, and None for both otherwise;
-        the parts are built within it, since it holds the context in which sgX's
-        get_veff builds, which hands sgX the full density for its screening and
-        rebuilds from scratch every rebuild_nsteps builds
+        builds incrementally (direct SCF without in-core integrals), applied to the
+        object that builds the parts, and if the last build carries the tags the parts
+        are added to, and None for both otherwise; the parts are built within it, since
+        it holds the context in which sgX's get_veff builds, which hands sgX the full
+        density for its screening and rebuilds from scratch every rebuild_nsteps builds
         """
+        builder = self._scf if self._gpu_scf is None else self._gpu_scf
         dm_last, vhf_last = self._last_built_potential(dm)
         incremental = (
             dm_last is not None
-            and self._scf._eri is None
-            and self._scf.direct_scf
+            and getattr(builder, "_eri", None) is None
+            and builder.direct_scf
             and all(getattr(vhf_last, tag, None) is not None for tag in tags)
         )
-        with_full_dm = getattr(self._scf, "with_full_dm", None)
+        with_full_dm = getattr(builder, "with_full_dm", None)
         context = (
             with_full_dm(dm, dm_last if incremental else None)
             if with_full_dm is not None
@@ -1202,7 +1206,7 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         energy and the exchange-correlation energy including exact exchange, and, for
         UKS, also with the Coulomb potential of each spin (vj_spin), which density QN
         needs and their get_veff do not keep; for a driver made from a GPU4PySCF
-        object, it builds on the GPU, always in full, and returns arrays in host memory
+        object, it builds on the GPU and returns arrays in host memory
         """
         if self._gpu_scf is not None:
             import cupy as xp
@@ -1238,12 +1242,8 @@ class SecondOrderOTR(OTR, newton_ah._CIAH_SOSCF):
         # build where PySCF builds incrementally
         hybrid = ni.libxc.is_hybrid_xc(ks.xc)
         vj_tag = "vj_spin" if unrestricted else "vj"
-        base: contextlib.AbstractContextManager[Tuple[Any, Any]] = (
-            self._incremental_base(dm, (vj_tag, "vk") if hybrid else (vj_tag,))
-            if self._gpu_scf is None
-            else contextlib.nullcontext((None, None))
-        )
-        with base as (dm_last, vhf_last):
+        parts = (vj_tag, "vk") if hybrid else (vj_tag,)
+        with self._incremental_base(dm, parts) as (dm_last, vhf_last):
             ddm = dms if dm_last is None else dms - xp.asarray(dm_last)
             vk = None
             if not hybrid:
